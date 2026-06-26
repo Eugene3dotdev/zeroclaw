@@ -13,15 +13,29 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-8";
+const DEFAULT_CLAUDE_EFFORT: &str = "xhigh";
+const FORBIDDEN_PROVIDER_API_ENV_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "VERTEX_PROJECT",
+    "VERTEXAI_PROJECT",
+];
+
 /// Delegates coding tasks to the Claude Code CLI (`claude -p`).
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
 /// tasks and delegates complex coding work to Claude Code, which has its own
 /// agent loop with Read/Edit/Bash tools.
 ///
-/// Authentication uses the `claude` binary's own OAuth session (Max subscription)
-/// by default. No API key is needed unless `env_passthrough` includes
-/// `ANTHROPIC_API_KEY` for API-key billing.
+/// Authentication uses the `claude` binary's own OAuth session. Direct
+/// provider API credentials are not forwarded to the subprocess even if they
+/// are present in `env_passthrough`.
 pub struct ClaudeCodeTool {
     security: Arc<SecurityPolicy>,
     config: ClaudeCodeConfig,
@@ -183,6 +197,8 @@ impl Tool for ClaudeCodeTool {
         };
         let mut cmd = Command::new(claude_bin);
         cmd.arg("-p").arg(prompt);
+        cmd.arg("--model").arg(DEFAULT_CLAUDE_MODEL);
+        cmd.arg("--effort").arg(DEFAULT_CLAUDE_EFFORT);
         cmd.arg("--output-format").arg("json");
 
         if !allowed_tools.is_empty() {
@@ -214,6 +230,9 @@ impl Tool for ClaudeCodeTool {
         }
         for var in &self.config.env_passthrough {
             let trimmed = var.trim();
+            if is_forbidden_provider_api_env_var(trimmed) {
+                continue;
+            }
             if !trimmed.is_empty()
                 && let Ok(val) = std::env::var(trimmed)
             {
@@ -320,6 +339,10 @@ impl Tool for ClaudeCodeTool {
             }
         }
     }
+}
+
+fn is_forbidden_provider_api_env_var(name: &str) -> bool {
+    FORBIDDEN_PROVIDER_API_ENV_VARS.contains(&name)
 }
 
 #[cfg(test)]
@@ -445,5 +468,20 @@ mod tests {
         assert_eq!(config.max_output_bytes, 2_097_152);
         assert!(config.system_prompt.is_none());
         assert_eq!(config.allowed_tools, vec!["Read", "Edit", "Bash", "Write"]);
+    }
+
+    #[test]
+    fn claude_code_runtime_policy_defaults() {
+        assert_eq!(DEFAULT_CLAUDE_MODEL, "claude-opus-4-8");
+        assert_eq!(DEFAULT_CLAUDE_EFFORT, "xhigh");
+    }
+
+    #[test]
+    fn claude_code_blocks_direct_provider_api_env_passthrough() {
+        assert!(is_forbidden_provider_api_env_var("ANTHROPIC_API_KEY"));
+        assert!(is_forbidden_provider_api_env_var(
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        ));
+        assert!(!is_forbidden_provider_api_env_var("HOME"));
     }
 }

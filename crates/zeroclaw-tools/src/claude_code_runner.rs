@@ -13,6 +13,9 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-8";
+const DEFAULT_CLAUDE_EFFORT: &str = "xhigh";
+
 /// Event payload received from Claude Code HTTP hooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCodeHookEvent {
@@ -195,6 +198,10 @@ impl Tool for ClaudeCodeRunnerTool {
             "claude".to_string(),
             "-p".to_string(),
             prompt.to_string(),
+            "--model".to_string(),
+            DEFAULT_CLAUDE_MODEL.to_string(),
+            "--effort".to_string(),
+            DEFAULT_CLAUDE_EFFORT.to_string(),
             "--output-format".to_string(),
             "json".to_string(),
         ];
@@ -502,6 +509,12 @@ mod tests {
         assert_eq!(shell_escape("hello"), "hello");
         assert_eq!(shell_escape("hello world"), "'hello world'");
         assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn runner_runtime_policy_defaults() {
+        assert_eq!(DEFAULT_CLAUDE_MODEL, "claude-opus-4-8");
+        assert_eq!(DEFAULT_CLAUDE_EFFORT, "xhigh");
     }
 
     #[test]
