@@ -7630,8 +7630,8 @@ impl Default for FileDownloadConfig {
 /// Claude Code CLI tool configuration (`[claude_code]` section).
 ///
 /// Delegates coding tasks to the `claude -p` CLI. Authentication uses the
-/// binary's own OAuth session (Max subscription) by default — no API key
-/// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
+/// binary's own OAuth session. Direct provider API-key env vars are ignored
+/// by the runtime adapter even if listed in `env_passthrough`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "claude_code"]
@@ -7651,7 +7651,8 @@ pub struct ClaudeCodeConfig {
     /// Maximum output size in bytes (2MB default)
     #[serde(default = "default_claude_code_max_output_bytes")]
     pub max_output_bytes: usize,
-    /// Extra env vars passed to the claude subprocess (e.g. ANTHROPIC_API_KEY for API-key billing)
+    /// Extra non-provider env vars passed to the claude subprocess. Direct
+    /// provider API-key env vars are blocked by the runtime adapter.
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
@@ -7731,8 +7732,8 @@ impl Default for ClaudeCodeRunnerConfig {
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
 /// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes `OPENAI_API_KEY`.
+/// binary's own session. Direct provider API-key env vars are ignored by the
+/// runtime adapter even if listed in `env_passthrough`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "codex_cli"]
@@ -7746,7 +7747,8 @@ pub struct CodexCliConfig {
     /// Maximum output size in bytes (2MB default)
     #[serde(default = "default_codex_cli_max_output_bytes")]
     pub max_output_bytes: usize,
-    /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
+    /// Extra non-provider env vars passed to the codex subprocess. Direct
+    /// provider API-key env vars are blocked by the runtime adapter.
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
@@ -7785,13 +7787,14 @@ impl Default for CodexCliConfig {
     }
 }
 
-// ── Gemini CLI ──────────────────────────────────────────────────
+// ── Antigravity CLI compatibility adapter ───────────────────────
 
-/// Gemini CLI tool configuration (`[gemini_cli]` section).
+/// Antigravity CLI compatibility configuration (`[gemini_cli]` section).
 ///
-/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes `GOOGLE_API_KEY`.
+/// Keeps the historical `gemini_cli` config name but delegates coding tasks
+/// to `agy -p` with Gemini 3.5 Flash. Direct Google AI Studio, Gemini API,
+/// and Vertex credential env vars are ignored by the runtime adapter even if
+/// listed in `env_passthrough`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gemini_cli"]
@@ -7805,7 +7808,9 @@ pub struct GeminiCliConfig {
     /// Maximum output size in bytes (2MB default)
     #[serde(default = "default_gemini_cli_max_output_bytes")]
     pub max_output_bytes: usize,
-    /// Extra env vars passed to the gemini subprocess (e.g. GOOGLE_API_KEY)
+    /// Extra non-provider env vars passed to the agy subprocess. Direct
+    /// Google AI Studio, Gemini API, and Vertex env vars are blocked by the
+    /// runtime adapter.
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,

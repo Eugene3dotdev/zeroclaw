@@ -25,7 +25,7 @@ let
     attrs:
     {
       package = stubPackage;
-      settings.default_provider = "anthropic";
+      settings.codex_cli.enabled = true;
     }
     // attrs;
 

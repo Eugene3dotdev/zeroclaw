@@ -13,14 +13,29 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_CODEX_REASONING: &str = "medium";
+const FORBIDDEN_PROVIDER_API_ENV_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "VERTEX_PROJECT",
+    "VERTEXAI_PROJECT",
+];
+
 /// Delegates coding tasks to the Codex CLI (`codex exec`).
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
 /// tasks and delegates complex coding work to Codex, which has its own
 /// agent loop with file editing and shell tools.
 ///
-/// Authentication uses the `codex` binary's own session by default. No API key
-/// is needed unless `env_passthrough` includes `OPENAI_API_KEY`.
+/// Authentication uses the `codex` binary's own session. Direct provider API
+/// credentials are not forwarded to the subprocess even if they are present in
+/// `env_passthrough`.
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
     config: CodexCliConfig,
@@ -136,7 +151,9 @@ impl Tool for CodexCliTool {
             self.security.workspace_dir.clone()
         };
 
-        // Build CLI command: `codex exec [extra_args...] <prompt>`
+        // Build CLI command: `codex exec -m gpt-5.5 [extra_args...] <prompt>`.
+        // The intended reasoning level is medium; current Codex CLI builds
+        // use profile/config defaults for that knob.
         let codex_bin = if cfg!(target_os = "windows") {
             "codex.cmd"
         } else {
@@ -144,6 +161,10 @@ impl Tool for CodexCliTool {
         };
         let mut cmd = Command::new(codex_bin);
         cmd.arg("exec");
+        cmd.arg("-m").arg(DEFAULT_CODEX_MODEL);
+        cmd.arg("-c").arg(format!(
+            "model_reasoning_effort=\"{DEFAULT_CODEX_REASONING}\""
+        ));
 
         // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
         for arg in &self.config.extra_args {
@@ -164,6 +185,9 @@ impl Tool for CodexCliTool {
         }
         for var in &self.config.env_passthrough {
             let trimmed = var.trim();
+            if is_forbidden_provider_api_env_var(trimmed) {
+                continue;
+            }
             if !trimmed.is_empty()
                 && let Ok(val) = std::env::var(trimmed)
             {
@@ -235,6 +259,10 @@ impl Tool for CodexCliTool {
             }
         }
     }
+}
+
+fn is_forbidden_provider_api_env_var(name: &str) -> bool {
+    FORBIDDEN_PROVIDER_API_ENV_VARS.contains(&name)
 }
 
 #[cfg(test)]
@@ -362,5 +390,20 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.timeout_secs, 600);
         assert_eq!(config.max_output_bytes, 2_097_152);
+    }
+
+    #[test]
+    fn codex_cli_runtime_policy_defaults() {
+        assert_eq!(DEFAULT_CODEX_MODEL, "gpt-5.5");
+        assert_eq!(DEFAULT_CODEX_REASONING, "medium");
+    }
+
+    #[test]
+    fn codex_cli_blocks_direct_provider_api_env_passthrough() {
+        assert!(is_forbidden_provider_api_env_var("OPENAI_API_KEY"));
+        assert!(is_forbidden_provider_api_env_var(
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        ));
+        assert!(!is_forbidden_provider_api_env_var("PATH"));
     }
 }

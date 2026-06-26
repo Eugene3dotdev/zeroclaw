@@ -24,7 +24,9 @@ Default to a middle ground — brief explanation of what you're about to do, the
 Before running any ZeroClaw operation, make sure you know where things are:
 
 1. **Find the binary.** Search in this order:
+   - `which zrc` (PATH short alias from source builds, useful when `zeroclaw` collides with an external package)
    - `which zeroclaw` (PATH)
+   - The current project's build output: `./target/release/zrc` or `./target/debug/zrc`
    - The current project's build output: `./target/release/zeroclaw` or `./target/debug/zeroclaw` — this is the right choice when the user is working inside the ZeroClaw source tree and may have local changes
    - Common install locations: `~/.cargo/bin/zeroclaw`, `~/Downloads/zeroclaw-bin/zeroclaw`
 
@@ -54,6 +56,7 @@ If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), gu
 
 ```bash
 zeroclaw quickstart                                              # Interactive — picks a provider + agent
+zrc quickstart                                                   # Same CLI through the source-build short alias
 zeroclaw quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
 zeroclaw config set channels.<name>.<field>=<value>              # Configure a channel after quickstart
 ```
