@@ -34,20 +34,11 @@ instance:
     # `settings` mirrors `~/.zeroclaw/config.toml` as a Nix attrset. The
     # config schema (section headers, type/alias convention, required
     # fields) is documented at
-    # https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/providers/configuration.md
+    # https://github.com/EugOT/zeroclaw/blob/master/docs/book/src/providers/configuration.md
     settings = {
-      providers.models.anthropic.home = {           # type = anthropic; alias = home (you choose)
-        model = "claude-sonnet-4-6";
-        api_key = "sk-ant-...";                     # or inject via env (see "Secrets pattern" below)
-      };
-
-      agents.assistant = {                          # alias = assistant (you choose)
-        model_provider = "anthropic.home";          # <type>.<alias> reference
-        risk_profile = "assistant";
-        channels = [ "telegram.home" ];             # <type>.<alias> reference
-      };
-
-      risk_profiles.assistant = { };                # must match agents.assistant.risk_profile
+      codex_cli.enabled = true;                     # primary: codex exec -m gpt-5.5
+      claude_code.enabled = true;                   # fallback: claude -p Opus 4.8 xhigh
+      gemini_cli.enabled = true;                    # compatibility adapter: agy Gemini 3.5 Flash
 
       channels.telegram.home = {                    # type = telegram; alias = home (you choose)
         enabled = true;
@@ -134,12 +125,13 @@ Nix store:
    `bot_token = "$BOT_TOKEN"` into a working configuration regardless
    of whether ZeroClaw has a native env-var fallback for that field.
 
-2. **`environmentFile` + ZeroClaw-native env-var lookups** for any config
-   keys ZeroClaw natively resolves from the environment (e.g.
-   `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ZEROCLAW_PROVIDER`,
-   `ZEROCLAW_MODEL` — see `crates/zeroclaw-config/src/schema.rs`
-   upstream for the full list). Same end result — no secret in the
-   rendered TOML — and you can omit the field from `settings` entirely.
+2. **`environmentFile` + ZeroClaw-native env-var lookups** for non-provider
+   runtime toggles ZeroClaw natively resolves from the environment (e.g.
+   `ZEROCLAW_PROVIDER`, `ZEROCLAW_MODEL` — see
+   `crates/zeroclaw-config/src/schema.rs` upstream for the full list). Do
+   not use direct provider API-key environment variables for active
+   autonomous runtime paths; Codex, Claude, and Gemini-family execution
+   should go through the approved CLI runtimes.
 
 What the module **never** does: render an interpolated string from a
 secret-bearing Nix expression into `settings`. That would put the secret

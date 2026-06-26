@@ -31,8 +31,9 @@
 #   services.zeroclaw.instances.me = {
 #     environmentFile = "/run/agenix/zeroclaw-bot-token";
 #     settings = {
-#       default_provider = "anthropic";
-#       default_model = "claude-sonnet-4-6";
+#       codex_cli.enabled = true;       # primary: codex exec -m gpt-5.5
+#       claude_code.enabled = true;     # fallback: claude -p Opus 4.8 xhigh
+#       gemini_cli.enabled = true;      # compatibility adapter: agy Gemini 3.5 Flash
 #       channels.telegram = {
 #         enabled = true;
 #         bot_token = "$BOT_TOKEN";   # systemd $VAR — substituted at load
@@ -144,8 +145,9 @@ let
           default = { };
           example = literalExpression ''
             {
-              default_provider = "anthropic";
-              default_model = "claude-sonnet-4-6";
+              codex_cli.enabled = true;
+              claude_code.enabled = true;
+              gemini_cli.enabled = true;
               channels.telegram = {
                 enabled = true;
                 bot_token = "$BOT_TOKEN";
@@ -170,8 +172,9 @@ let
             The substitution is performed by this module, not by ZeroClaw.
             ZeroClaw reads `config.toml` verbatim and overlays a handful of
             named environment-variable overrides on top (e.g.
-            `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ZEROCLAW_PROVIDER`,
-            `ZEROCLAW_MODEL`); any other secret-bearing field — Telegram
+            `ZEROCLAW_PROVIDER`, `ZEROCLAW_MODEL`); provider API-key
+            environment variables should not be used for active autonomous
+            runtime paths. Any other secret-bearing field — Telegram
             `bot_token`, Discord `bot_token`, etc. — needs the
             `envsubst` path to avoid living in `/nix/store`.
 
@@ -422,8 +425,9 @@ in
           me = {
             environmentFile = "/run/agenix/zeroclaw-bot-token";
             settings = {
-              default_provider = "anthropic";
-              default_model = "claude-sonnet-4-6";
+              codex_cli.enabled = true;
+              claude_code.enabled = true;
+              gemini_cli.enabled = true;
               channels.telegram = {
                 enabled = true;
                 bot_token = "$BOT_TOKEN";

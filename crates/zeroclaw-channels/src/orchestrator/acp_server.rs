@@ -2846,13 +2846,14 @@ mod tests {
             data_dir: cwd.path().to_path_buf(),
             providers: {
                 let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.anthropic.insert(
+                p.models.gemini_cli.insert(
                     "default".to_string(),
-                    zeroclaw_config::schema::AnthropicModelProviderConfig {
+                    zeroclaw_config::schema::GeminiCliModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
-                            model: Some("claude-haiku-4-5".to_string()),
+                            model: Some("gemini-3.5-flash".to_string()),
                             ..Default::default()
                         },
+                        binary_path: Some("agy".to_string()),
                     },
                 );
                 p
@@ -2866,7 +2867,7 @@ mod tests {
         config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
+                model_provider: "gemini_cli.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },
@@ -2966,13 +2967,14 @@ mod tests {
             data_dir: cwd.to_path_buf(),
             ..Default::default()
         };
-        cfg.providers.models.anthropic.insert(
+        cfg.providers.models.gemini_cli.insert(
             "default".to_string(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
+            zeroclaw_config::schema::GeminiCliModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("claude-haiku-4-5".to_string()),
+                    model: Some("gemini-3.5-flash".to_string()),
                     ..Default::default()
                 },
+                binary_path: Some("agy".to_string()),
             },
         );
         cfg.risk_profiles.insert(
@@ -2982,7 +2984,7 @@ mod tests {
         cfg.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
+                model_provider: "gemini_cli.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },

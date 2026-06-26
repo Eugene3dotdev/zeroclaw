@@ -37,7 +37,7 @@ permissions:
 jobs:
   publish-aur:
     name: Update AUR Package
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build-runner]
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
