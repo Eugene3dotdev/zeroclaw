@@ -76,8 +76,8 @@ After the first deploy, you must set your API key on the Pi (see [First-Time Set
 2. **Stop service** — runs `sudo systemctl stop zeroclaw` on the Pi (continues if not yet installed).
 3. **Create remote directory** — ensures `$RPI_DIR` exists on the Pi.
 4. **Copy binary** — SCPs the compiled binary to `$RPI_DIR/zeroclaw`.
-5. **Create `.env`** — writes an `.env` skeleton with an `ANTHROPIC_API_KEY=` placeholder to `$RPI_DIR/.env` with mode `600`. Skipped if the file already exists so an existing key is not overwritten.
-6. **Deploy config** — copies `rpi-config.toml` to `~/.zeroclaw/config.toml`, preserving any `api_key` already present in the file.
+5. **Create `.env`** — writes a runtime-policy note to `$RPI_DIR/.env` with mode `600`. Skipped if the file already exists.
+6. **Deploy config** — copies `rpi-config.toml` to `~/.zeroclaw/config.toml`.
 7. **Install systemd service** — copies `zeroclaw.service` to `/etc/systemd/system/`, then enables and restarts it.
 8. **Hardware permissions** — adds the deploy user to the `gpio` group, copies `99-act-led.rules` to `/etc/udev/rules.d/`, and resets the ACT LED trigger.
 
@@ -85,16 +85,18 @@ After the first deploy, you must set your API key on the Pi (see [First-Time Set
 
 ## First-Time Setup
 
-After the first successful deploy, SSH into the Pi and fill in your API key:
+After the first successful deploy, SSH into the Pi and authenticate the approved CLI runtimes:
 
 ```bash
 ssh pi@raspberrypi.local
-nano ~/zeroclaw/.env
-# Set: ANTHROPIC_API_KEY=sk-ant-...
+codex login
+claude login
+# Authenticate Antigravity (`agy`) for this user with the installed CLI flow.
 sudo systemctl restart zeroclaw
 ```
 
-The `.env` is loaded by the systemd service as an `EnvironmentFile`.
+The `.env` is loaded by the systemd service as an `EnvironmentFile` for
+non-provider runtime toggles. Do not place direct provider API keys there.
 
 ---
 
@@ -166,7 +168,7 @@ If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I
 | Remote path | Source | Description |
 |------------|--------|-------------|
 | `~/zeroclaw/zeroclaw` | compiled binary | Main agent binary |
-| `~/zeroclaw/.env` | created on first deploy | API key and environment variables |
+| `~/zeroclaw/.env` | created on first deploy | Non-provider runtime environment |
 | `~/.zeroclaw/config.toml` | `rpi-config.toml` | Agent configuration |
 | `/etc/systemd/system/zeroclaw.service` | `zeroclaw.service` | systemd service unit |
 | `/etc/udev/rules.d/99-act-led.rules` | `99-act-led.rules` | ACT LED permissions |
@@ -177,8 +179,8 @@ If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I
 
 `rpi-config.toml` is the production config template. Key defaults:
 
-- **Provider**: `anthropic-custom:https://api.z.ai/api/anthropic`
-- **Model**: `claude-3-5-sonnet-20241022`
+- **Primary runtime**: Codex CLI (`codex exec -m gpt-5.6-sol`)
+- **Fallback runtimes**: Claude Code CLI (Opus 4.8 xhigh), Antigravity (`agy` with Gemini 3.5 Flash/high)
 - **Autonomy**: `full`
 - **Allowed shell commands**: `git`, `cargo`, `npm`, `mkdir`, `touch`, `cp`, `mv`, `ls`, `cat`, `grep`, `find`, `echo`, `pwd`, `wc`, `head`, `tail`, `date`
 

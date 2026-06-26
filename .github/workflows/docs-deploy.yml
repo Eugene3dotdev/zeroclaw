@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, build-runner]
     steps:
       - name: Determine version tag
         id: version

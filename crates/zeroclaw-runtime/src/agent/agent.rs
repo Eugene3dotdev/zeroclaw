@@ -4702,7 +4702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_accepts_openai_alias_with_requires_openai_auth() {
+    async fn from_config_blocks_openai_alias_with_requires_openai_auth() {
         use tempfile::TempDir;
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
@@ -4745,11 +4745,10 @@ mod tests {
 
         let result = Agent::from_config(&config, "test-agent").await;
 
-        assert!(
-            result.is_ok(),
-            "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
-            result.err().unwrap()
-        );
+        match result {
+            Ok(_) => panic!("direct OpenAI/Codex provider alias must be blocked by policy"),
+            Err(err) => assert!(err.to_string().contains("disabled by policy")),
+        }
     }
 
     #[test]

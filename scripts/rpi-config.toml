@@ -3,16 +3,22 @@
 # Copy this to ~/.zeroclaw/config.toml on the Pi.
 # deploy-rpi.sh does this automatically.
 #
-# API key is loaded from ~/.zeroclaw/.env (EnvironmentFile in systemd).
-# Set it there as: ANTHROPIC_API_KEY=your-key-here
-# Or set api_key directly below (not recommended for version control).
+# Model execution must use CLI-authenticated runtimes. Do not put direct
+# provider API keys in this file or the service EnvironmentFile.
 
-# api_key = ""
-default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"
-default_model = "claude-3-5-sonnet-20241022"
 default_temperature = 0.4
 model_routes = []
 embedding_routes = []
+
+[codex_cli]
+enabled = true
+extra_args = ["--skip-git-repo-check"]
+
+[claude_code]
+enabled = true
+
+[gemini_cli]
+enabled = true
 
 [model_providers]
 

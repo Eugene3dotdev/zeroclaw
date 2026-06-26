@@ -8,19 +8,34 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::GeminiCliConfig;
 
-/// Environment variables safe to pass through to the `gemini` subprocess.
+/// Environment variables safe to pass through to the `agy` subprocess.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Gemini CLI (`gemini -p`).
+const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.5-flash";
+const DEFAULT_ANTIGRAVITY_REASONING: &str = "high";
+const FORBIDDEN_PROVIDER_API_ENV_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "VERTEX_PROJECT",
+    "VERTEXAI_PROJECT",
+];
+
+/// Delegates coding tasks to Antigravity CLI (`agy -p`).
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
-/// tasks and delegates complex coding work to Gemini CLI, which has its own
+/// tasks and delegates complex coding work to Antigravity, which has its own
 /// agent loop with file editing and shell tools.
 ///
-/// Authentication uses the `gemini` binary's own session by default. No API key
-/// is needed unless `env_passthrough` includes `GOOGLE_API_KEY`.
+/// Authentication uses the `agy` binary's own session. Direct provider API
+/// credentials are not forwarded to the subprocess even if they are present in
+/// `env_passthrough`.
 pub struct GeminiCliTool {
     security: Arc<SecurityPolicy>,
     config: GeminiCliConfig,
@@ -39,7 +54,7 @@ impl Tool for GeminiCliTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a coding task to Gemini CLI (gemini -p). Supports file editing and shell execution. Use for complex coding work that benefits from Gemini CLI's full agent loop."
+        "Delegate a coding task to Antigravity CLI (agy -p) with Gemini 3.5 Flash. Supports file editing and shell execution. Use for complex coding work that benefits from Antigravity's full agent loop."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -48,7 +63,7 @@ impl Tool for GeminiCliTool {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "The coding task to delegate to Gemini CLI"
+                    "description": "The coding task to delegate to Antigravity CLI"
                 },
                 "working_directory": {
                     "type": "string",
@@ -136,14 +151,18 @@ impl Tool for GeminiCliTool {
             self.security.workspace_dir.clone()
         };
 
-        // Build CLI command
-        let gemini_bin = if cfg!(target_os = "windows") {
-            "gemini.cmd"
+        // Build CLI command. The public tool/config name remains
+        // `gemini_cli` for compatibility, but direct Gemini CLI/API usage is
+        // deprecated in favor of Antigravity.
+        let antigravity_bin = if cfg!(target_os = "windows") {
+            "agy.cmd"
         } else {
-            "gemini"
+            "agy"
         };
-        let mut cmd = Command::new(gemini_bin);
+        let mut cmd = Command::new(antigravity_bin);
         cmd.arg("-p").arg(prompt);
+        cmd.arg("--model").arg(DEFAULT_ANTIGRAVITY_MODEL);
+        cmd.arg("--reasoning").arg(DEFAULT_ANTIGRAVITY_REASONING);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
         cmd.env_clear();
@@ -154,6 +173,9 @@ impl Tool for GeminiCliTool {
         }
         for var in &self.config.env_passthrough {
             let trimmed = var.trim();
+            if is_forbidden_provider_api_env_var(trimmed) {
+                continue;
+            }
             if !trimmed.is_empty()
                 && let Ok(val) = std::env::var(trimmed)
             {
@@ -201,9 +223,9 @@ impl Tool for GeminiCliTool {
                     || err_msg.contains("not found")
                     || err_msg.contains("cannot find")
                 {
-                    "Gemini CLI ('gemini') not found in PATH. Install with: npm install -g @google/gemini-cli or see https://github.com/google-gemini/gemini-cli".into()
+                    "Antigravity CLI ('agy') not found in PATH. Install and authenticate Antigravity before using the gemini_cli compatibility adapter.".into()
                 } else {
-                    format!("Failed to execute gemini: {e}")
+                    format!("Failed to execute agy: {e}")
                 };
                 Ok(ToolResult {
                     success: false,
@@ -218,13 +240,17 @@ impl Tool for GeminiCliTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Gemini CLI timed out after {}s and was killed",
+                        "Antigravity CLI timed out after {}s and was killed",
                         self.config.timeout_secs
                     )),
                 })
             }
         }
     }
+}
+
+fn is_forbidden_provider_api_env_var(name: &str) -> bool {
+    FORBIDDEN_PROVIDER_API_ENV_VARS.contains(&name)
 }
 
 #[cfg(test)]
@@ -343,5 +369,21 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.timeout_secs, 600);
         assert_eq!(config.max_output_bytes, 2_097_152);
+    }
+
+    #[test]
+    fn gemini_cli_runtime_policy_uses_antigravity_defaults() {
+        assert_eq!(DEFAULT_ANTIGRAVITY_MODEL, "gemini-3.5-flash");
+        assert_eq!(DEFAULT_ANTIGRAVITY_REASONING, "high");
+    }
+
+    #[test]
+    fn gemini_cli_blocks_direct_provider_api_env_passthrough() {
+        assert!(is_forbidden_provider_api_env_var("GOOGLE_API_KEY"));
+        assert!(is_forbidden_provider_api_env_var("GEMINI_API_KEY"));
+        assert!(is_forbidden_provider_api_env_var(
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        ));
+        assert!(!is_forbidden_provider_api_env_var("TMPDIR"));
     }
 }
