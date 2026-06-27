@@ -80,9 +80,10 @@ in
       services.zeroclaw.instances.test = {
         package = stubPackage;
         settings = {
-          default_provider = "anthropic";
-          default_model = "claude-sonnet-4-6";
           default_temperature = 0.4;
+          codex_cli.enabled = true;
+          claude_code.enabled = true;
+          gemini_cli.enabled = true;
           channels.telegram = {
             enabled = true;
             bot_token = "fake-token-for-test";
@@ -94,8 +95,8 @@ in
       services.zeroclaw.instances.other = {
         package = stubPackage;
         settings = {
-          default_provider = "anthropic";
-          default_model = "claude-haiku-4-6";
+          codex_cli.enabled = true;
+          claude_code.enabled = true;
         };
       };
 
@@ -111,7 +112,7 @@ in
         package = stubPackage;
         environmentFile = "/etc/zeroclaw-secret-env";
         settings = {
-          default_provider = "anthropic";
+          codex_cli.enabled = true;
           channels.telegram = {
             enabled = true;
             bot_token = "$BOT_TOKEN";
@@ -128,7 +129,7 @@ in
         package = stubPackage;
         dataDir = "/srv/zeroclaw-srv";
         settings = {
-          default_provider = "anthropic";
+          codex_cli.enabled = true;
         };
       };
 
@@ -142,7 +143,7 @@ in
         createUser = false;
         dataDir = "/var/lib/zeroclaw-shared-user";
         settings = {
-          default_provider = "anthropic";
+          codex_cli.enabled = true;
         };
       };
 
@@ -181,16 +182,16 @@ in
         assert mode == "600", f"expected 600, got {mode}"
         assert owner == "zeroclaw-test:zeroclaw-test", f"unexpected owner {owner}"
 
-    with subtest("rendered TOML round-trips through a parser"):
-        model = machine.succeed(
-            "yq -p toml -o json '.default_model' /var/lib/zeroclaw-test/config.toml"
+    with subtest("rendered CLI runtime policy round-trips through a parser"):
+        codex_cli_enabled = machine.succeed(
+            "yq -p toml -o json '.codex_cli.enabled' /var/lib/zeroclaw-test/config.toml"
         ).strip().strip('"')
-        assert model == "claude-sonnet-4-6", f"expected claude-sonnet-4-6, got {model}"
+        assert codex_cli_enabled == "true", f"expected codex_cli.enabled=true, got {codex_cli_enabled}"
 
-        other_model = machine.succeed(
-            "yq -p toml -o json '.default_model' /var/lib/zeroclaw-other/config.toml"
+        claude_code_enabled = machine.succeed(
+            "yq -p toml -o json '.claude_code.enabled' /var/lib/zeroclaw-other/config.toml"
         ).strip().strip('"')
-        assert other_model == "claude-haiku-4-6", f"expected claude-haiku-4-6, got {other_model}"
+        assert claude_code_enabled == "true", f"expected claude_code.enabled=true, got {claude_code_enabled}"
 
     with subtest("hardening defaults applied (ProtectSystem=strict)"):
         out = machine.succeed(

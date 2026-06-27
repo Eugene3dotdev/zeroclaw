@@ -27,6 +27,20 @@ use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
 
+fn runtime_policy_allows_model_provider(family: &str) -> bool {
+    !matches!(
+        family,
+        "anthropic"
+            | "openai"
+            | "azure"
+            | "gemini"
+            | "vertex"
+            | "openai-codex"
+            | "openai_codex"
+            | "codex"
+    )
+}
+
 /// Per-family construction trait. Implemented (directly or via the
 /// `CompatFamilySpec` blanket) by every typed `<Family>ModelProviderConfig`.
 ///
@@ -248,6 +262,12 @@ pub fn dispatch_family_factory(
     api_url: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> Result<Box<dyn ModelProvider>> {
+    if !runtime_policy_allows_model_provider(family) {
+        return Err(anyhow::anyhow!(
+            "direct provider API runtime `{family}` is disabled by policy; use Codex CLI/ACP, Claude Code CLI/Agents SDK, or Antigravity CLI adapters"
+        ));
+    }
+
     macro_rules! emit_dispatch {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match family {
