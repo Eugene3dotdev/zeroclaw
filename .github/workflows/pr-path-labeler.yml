@@ -11,7 +11,7 @@ permissions:
 jobs:
   label:
     name: Apply path labels
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build-runner]
     timeout-minutes: 5
     steps:
       - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213 # v6.1.0

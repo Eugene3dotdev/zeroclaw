@@ -153,9 +153,9 @@ else
   # shellcheck disable=SC2029
   ${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
     "mkdir -p ${RPI_DIR} && \
-     printf '# Set your API key here\nANTHROPIC_API_KEY=sk-ant-\n' > ${ENV_DEST} && \
+     printf '# ZeroClaw runtime policy: use CLI-authenticated Codex, Claude Code, and Antigravity sessions.\n# Do not place direct provider API keys in this EnvironmentFile.\n' > ${ENV_DEST} && \
      chmod 600 ${ENV_DEST}"
-  echo "    IMPORTANT: edit ${ENV_DEST} on the Pi and set ANTHROPIC_API_KEY"
+  echo "    IMPORTANT: authenticate codex, claude, and agy on the Pi user before starting agent tasks"
 fi
 
 # ── 5. Deploy config ─────────────────────────────────────────────────────────
@@ -164,17 +164,7 @@ echo ""
 echo "==> Deploying config to ${CONFIG_DEST}"
 # shellcheck disable=SC2029
 ${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" "mkdir -p /home/${RPI_USER}/.zeroclaw"
-# Preserve existing api_key from the remote config if present.
-# shellcheck disable=SC2029
-EXISTING_API_KEY=$(${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
-  "grep -m1 '^api_key' ${CONFIG_DEST} 2>/dev/null || true")
 ${SCP_CMD} ${SCP_OPTS} "scripts/rpi-config.toml" "${RPI_USER}@${RPI_HOST}:${CONFIG_DEST}"
-if [[ -n "${EXISTING_API_KEY}" ]]; then
-  echo "    Restoring existing api_key from previous config"
-  # shellcheck disable=SC2029
-  ${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
-    "sed -i 's|^# api_key = .*|${EXISTING_API_KEY}|' ${CONFIG_DEST}"
-fi
 
 # ── 6. Deploy and enable systemd service ─────────────────────────────────────
 SERVICE_DEST="/etc/systemd/system/zeroclaw.service"

@@ -22,18 +22,33 @@ fn assert_provider_ok(name: &str, key: Option<&str>, url: Option<&str>) {
     );
 }
 
+/// Helper: direct provider API families must stay blocked in active runtime
+/// paths. CLI/agent adapters cover these vendors instead.
+fn assert_direct_provider_blocked(name: &str, key: Option<&str>, url: Option<&str>) {
+    let result = create_model_provider_with_url(name, key, url);
+    assert!(
+        result.is_err(),
+        "{name} should be blocked by runtime policy"
+    );
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("direct provider API runtime"),
+        "error should mention direct provider runtime policy: {err_msg}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory resolution: each major model_provider name resolves without error
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_resolves_openai_provider() {
-    assert_provider_ok("openai", Some("test-key"), None);
+fn factory_blocks_openai_provider() {
+    assert_direct_provider_blocked("openai", Some("test-key"), None);
 }
 
 #[test]
-fn factory_resolves_anthropic_provider() {
-    assert_provider_ok("anthropic", Some("test-key"), None);
+fn factory_blocks_anthropic_provider() {
+    assert_direct_provider_blocked("anthropic", Some("test-key"), None);
 }
 
 #[test]
@@ -209,8 +224,8 @@ fn factory_ollama_with_custom_api_url() {
 }
 
 #[test]
-fn factory_openai_with_custom_api_url() {
-    assert_provider_ok(
+fn factory_openai_with_custom_api_url_is_blocked() {
+    assert_direct_provider_blocked(
         "openai",
         Some("test-key"),
         Some("https://custom-openai-proxy.example.com/v1"),
@@ -224,8 +239,6 @@ fn factory_openai_with_custom_api_url() {
 #[test]
 fn convenience_factory_resolves_major_providers() {
     for provider_name in &[
-        "openai",
-        "anthropic",
         "deepseek",
         "mistral",
         "groq",
@@ -239,6 +252,22 @@ fn convenience_factory_resolves_major_providers() {
             result.is_ok(),
             "convenience factory should resolve {provider_name}: {}",
             result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+}
+
+#[test]
+fn convenience_factory_blocks_direct_provider_api_families() {
+    for provider_name in &["openai", "anthropic"] {
+        let result = create_model_provider(provider_name, Some("test-key"));
+        assert!(
+            result.is_err(),
+            "convenience factory should block direct {provider_name}"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("direct provider API runtime"),
+            "error should mention runtime policy: {err_msg}"
         );
     }
 }
@@ -263,8 +292,13 @@ fn factory_resolves_openrouter_provider() {
 }
 
 #[test]
-fn factory_resolves_gemini_provider() {
-    assert_provider_ok("gemini", Some("test-key"), None);
+fn factory_blocks_gemini_provider() {
+    assert_direct_provider_blocked("gemini", Some("test-key"), None);
+}
+
+#[test]
+fn factory_resolves_gemini_cli_provider() {
+    assert_provider_ok("gemini_cli", None, None);
 }
 
 #[test]
@@ -283,13 +317,17 @@ fn factory_resolves_synthetic_provider() {
 }
 
 #[test]
-fn factory_resolves_openai_codex_provider() {
+fn factory_blocks_openai_codex_provider() {
     let options = zeroclaw::providers::ModelProviderRuntimeOptions::default();
     let result = create_model_provider_with_options("openai-codex", None, &options);
     assert!(
-        result.is_ok(),
-        "openai-codex model_provider should resolve: {}",
-        result.err().map(|e| e.to_string()).unwrap_or_default()
+        result.is_err(),
+        "openai-codex should be blocked by runtime policy"
+    );
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("direct provider API runtime"),
+        "error should mention runtime policy: {err_msg}"
     );
 }
 
@@ -414,13 +452,13 @@ fn factory_resolves_ovhcloud_provider() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_google_alias_resolves_to_gemini() {
-    assert_provider_ok("google", Some("test-key"), None);
+fn factory_google_alias_is_blocked_with_direct_gemini() {
+    assert_direct_provider_blocked("google", Some("test-key"), None);
 }
 
 #[test]
-fn factory_google_gemini_alias_resolves_to_gemini() {
-    assert_provider_ok("google-gemini", Some("test-key"), None);
+fn factory_google_gemini_alias_is_blocked_with_direct_gemini() {
+    assert_direct_provider_blocked("google-gemini", Some("test-key"), None);
 }
 
 #[test]
@@ -478,8 +516,8 @@ fn factory_ovh_alias_resolves_to_ovhcloud() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_anthropic_custom_endpoint_resolves() {
-    assert_provider_ok(
+fn factory_anthropic_custom_endpoint_is_blocked() {
+    assert_direct_provider_blocked(
         "anthropic-custom:https://api.example.com",
         Some("test-key"),
         None,

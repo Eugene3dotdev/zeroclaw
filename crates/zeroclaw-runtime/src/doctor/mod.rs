@@ -1144,7 +1144,9 @@ mod tests {
     fn provider_validation_checks_custom_url_shape() {
         assert!(provider_validation_error("openrouter").is_none());
         assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        let blocked_anthropic =
+            provider_validation_error("anthropic-custom:https://example.com").unwrap_or_default();
+        assert!(blocked_anthropic.contains("disabled by policy"));
 
         let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));

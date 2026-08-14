@@ -1541,16 +1541,41 @@ mod tests {
         for f in tracked_files {
             std::fs::write(dir.join(f), "initial").unwrap();
         }
-        std::process::Command::new("git")
+        let add = std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(dir)
             .output()
             .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=ZeroClaw Test",
+                "-c",
+                "user.email=zeroclaw-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "--no-verify",
+                "-m",
+                "initial",
+            ])
             .current_dir(dir)
             .output()
             .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
     }
 
     /// `stash push` with no extra args stashes everything tracked — staged
