@@ -179,7 +179,7 @@ If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I
 
 `rpi-config.toml` is the production config template. Key defaults:
 
-- **Primary runtime**: Codex CLI (`codex exec -m gpt-5.6-sol`)
+- **Primary runtime**: Codex CLI (`codex exec -m gpt-5.5`)
 - **Fallback runtimes**: Claude Code CLI (Opus 4.8 xhigh), Antigravity (`agy` with Gemini 3.5 Flash/high)
 - **Autonomy**: `full`
 - **Allowed shell commands**: `git`, `cargo`, `npm`, `mkdir`, `touch`, `cp`, `mv`, `ls`, `cat`, `grep`, `find`, `echo`, `pwd`, `wc`, `head`, `tail`, `date`

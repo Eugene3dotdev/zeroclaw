@@ -13,7 +13,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 const DEFAULT_CODEX_REASONING: &str = "medium";
 const FORBIDDEN_PROVIDER_API_ENV_VARS: &[&str] = &[
     "OPENAI_API_KEY",
@@ -151,7 +151,7 @@ impl Tool for CodexCliTool {
             self.security.workspace_dir.clone()
         };
 
-        // Build CLI command: `codex exec -m gpt-5.6-sol [extra_args...] <prompt>`.
+        // Build CLI command: `codex exec -m gpt-5.5 [extra_args...] <prompt>`.
         // The intended reasoning level is medium; current Codex CLI builds
         // use profile/config defaults for that knob.
         let codex_bin = if cfg!(target_os = "windows") {
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn codex_cli_runtime_policy_defaults() {
-        assert_eq!(DEFAULT_CODEX_MODEL, "gpt-5.6-sol");
+        assert_eq!(DEFAULT_CODEX_MODEL, "gpt-5.5");
         assert_eq!(DEFAULT_CODEX_REASONING, "medium");
     }
 
