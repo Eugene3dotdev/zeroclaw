@@ -31,7 +31,7 @@
 #   services.zeroclaw.instances.me = {
 #     environmentFile = "/run/agenix/zeroclaw-bot-token";
 #     settings = {
-#       codex_cli.enabled = true;       # primary: codex exec -m gpt-5.6-sol
+#       codex_cli.enabled = true;       # primary: codex exec -m gpt-5.5
 #       claude_code.enabled = true;     # fallback: claude -p Opus 4.8 xhigh
 #       gemini_cli.enabled = true;      # compatibility adapter: agy Gemini 3.5 Flash
 #       channels.telegram = {

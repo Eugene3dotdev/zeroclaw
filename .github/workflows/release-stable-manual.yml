@@ -28,7 +28,7 @@ env:
 jobs:
   validate:
     name: Validate Version
-    runs-on: [self-hosted, build-runner]
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       version: ${{ steps.check.outputs.version }}
@@ -78,7 +78,7 @@ jobs:
 
   web:
     name: Build Web Dashboard
-    runs-on: [self-hosted, build-runner]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -109,7 +109,7 @@ jobs:
 
   release-notes:
     name: Generate Release Notes
-    runs-on: [self-hosted, build-runner]
+    runs-on: ubuntu-latest
     outputs:
       notes: ${{ steps.notes.outputs.body }}
     steps:
@@ -205,28 +205,28 @@ jobs:
         include:
           # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
           # ensuring compatibility with Ubuntu 22.04+ (#3573).
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             artifact: zeroclaw
             ext: tar.gz
             use_cross: true
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
             cross_compiler: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-musl
             artifact: zeroclaw
             ext: tar.gz
             use_cross: true
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             artifact: zeroclaw
             ext: tar.gz
@@ -234,7 +234,7 @@ jobs:
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
             skip_prometheus: true
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-22.04
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
             ext: tar.gz
@@ -242,11 +242,11 @@ jobs:
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
             skip_prometheus: true
-          - os: [self-hosted, build-runner]
+          - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
-          - os: [self-hosted, build-runner]
+          - os: ubuntu-latest
             target: aarch64-linux-android
             artifact: zeroclaw
             ext: tar.gz
@@ -367,7 +367,7 @@ jobs:
   build-desktop:
     name: Build Desktop App (macOS Universal)
     needs: [validate]
-    runs-on: [self-hosted, build-runner]
+    runs-on: macos-14
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -422,7 +422,7 @@ jobs:
   publish:
     name: Publish Stable Release
     needs: [validate, release-notes, build, build-desktop]
-    runs-on: [self-hosted, build-runner]
+    runs-on: ubuntu-latest
     environment:
       name: github-releases
       url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}
@@ -518,7 +518,7 @@ jobs:
   redeploy-website:
     name: Trigger Website Redeploy
     needs: [publish]
-    runs-on: [self-hosted, build-runner]
+    runs-on: ubuntu-latest
     steps:
       - name: Trigger website redeploy
         env:
@@ -533,7 +533,7 @@ jobs:
   docker:
     name: Push Docker Image
     needs: [validate, build]
-    runs-on: [self-hosted, build-runner]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
       name: docker

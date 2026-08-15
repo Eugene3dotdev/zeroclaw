@@ -36,7 +36,7 @@ instance:
     # fields) is documented at
     # https://github.com/EugOT/zeroclaw/blob/master/docs/book/src/providers/configuration.md
     settings = {
-      codex_cli.enabled = true;                     # primary: codex exec -m gpt-5.6-sol
+      codex_cli.enabled = true;                     # primary: codex exec -m gpt-5.5
       claude_code.enabled = true;                   # fallback: claude -p Opus 4.8 xhigh
       gemini_cli.enabled = true;                    # compatibility adapter: agy Gemini 3.5 Flash
 
