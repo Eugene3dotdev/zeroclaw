@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Minimal config with a single dispatchable agent `test-agent`. Mirrors the
-/// runtime unit helper `make_test_config`: an Anthropic provider profile (no
+/// runtime unit helper `make_test_config`: an Ollama provider profile (no
 /// key), the `default` risk/runtime profiles, and an agent that references them.
 /// `[agents.test-agent]` needs no explicit `workspace`, so its workspace
 /// resolves to `<install-root>/agents/test-agent/workspace`, where the install
@@ -30,15 +30,15 @@ use std::time::{Duration, Instant};
 const TEST_CONFIG: &str = r#"
 schema_version = 3
 
-[providers.models.anthropic.default]
-model = "claude-haiku-4-5"
+[providers.models.ollama.default]
+model = "test-model"
 
 [risk_profiles.default]
 
 [runtime_profiles.default]
 
 [agents.test-agent]
-model_provider = "anthropic.default"
+model_provider = "ollama.default"
 risk_profile = "default"
 runtime_profile = "default"
 "#;

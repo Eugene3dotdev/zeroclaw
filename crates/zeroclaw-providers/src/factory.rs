@@ -1808,10 +1808,8 @@ mod tests {
         }
     }
 
-    /// Regression for the #7136 review: the Kilo Gateway default exists in two
-    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
-    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
-    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
+    /// The typed `KiloEndpoint` and `CompatFamilySpec::DEFAULT_URL` represent
+    /// the same gateway endpoint and must stay equal.
     #[test]
     fn kilo_gateway_default_url_matches_schema_endpoint() {
         use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};

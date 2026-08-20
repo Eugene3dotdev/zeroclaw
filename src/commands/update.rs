@@ -1400,7 +1400,7 @@ async fn install_web_dist(
 }
 
 /// Decide where to install the refreshed `web/dist` bundle, mirroring the
-/// gateway's dashboard auto-detection ([`crates/zeroclaw-gateway/src/lib.rs`])
+/// gateway's dashboard auto-detection (`crates/zeroclaw-gateway/src/lib.rs`)
 /// and `install.sh`:
 ///   1. existing `web/dist` next to the running binary (dev / packaged), or
 ///   2. one of `host_candidates` (Docker / system-package / platform data-dir

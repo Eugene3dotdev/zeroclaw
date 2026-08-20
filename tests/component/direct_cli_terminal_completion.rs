@@ -36,14 +36,14 @@ provider_backoff_ms = 0
 
 [runtime_profiles.default]
 
-[providers.models.openai.mock]
+[providers.models.custom.mock]
 api_key = "test-key"
 uri = "{}"
 model = "test-model"
 wire_api = "chat_completions"
 
 [agents.default]
-model_provider = "openai.mock"
+model_provider = "custom.mock"
 risk_profile = "default"
 runtime_profile = "default"
 "#,
@@ -102,9 +102,15 @@ async fn interactive_agent_localizes_semantic_empty_terminal_failure() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{"message": {"content": "   "}}]
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"id\":\"cmpl_test\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl_test\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n",
+                ),
+        )
         .mount(&server)
         .await;
 
@@ -122,14 +128,14 @@ provider_backoff_ms = 0
 
 [runtime_profiles.default]
 
-[providers.models.openai.mock]
+[providers.models.custom.mock]
 api_key = "test-key"
 uri = "{}"
 model = "test-model"
 wire_api = "chat_completions"
 
 [agents.default]
-model_provider = "openai.mock"
+model_provider = "custom.mock"
 risk_profile = "default"
 runtime_profile = "default"
 "#,
@@ -139,33 +145,52 @@ runtime_profile = "default"
     .expect("write test config");
 
     let config_dir_arg = config_dir.path().to_path_buf();
-    let output = std::thread::spawn(move || {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
-            .env("RUST_LOG", "off")
-            .args([
-                "--config-dir",
-                config_dir_arg.to_str().expect("UTF-8 config path"),
-                "agent",
-                "--agent",
-                "default",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start interactive zeroclaw agent");
-        child
-            .stdin
-            .as_mut()
-            .expect("piped stdin")
-            .write_all(b"test prompt\n/quit\n")
-            .expect("send interactive prompt and quit");
-        child
-            .wait_with_output()
-            .expect("wait for interactive zeroclaw agent")
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("RUST_LOG", "off")
+        .args([
+            "--config-dir",
+            config_dir_arg.to_str().expect("UTF-8 config path"),
+            "agent",
+            "--agent",
+            "default",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start interactive zeroclaw agent");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin
+        .write_all(b"test prompt\n")
+        .expect("send interactive prompt");
+    stdin.flush().expect("flush interactive prompt");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .expect("request recording enabled")
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     })
-    .join()
-    .expect("interactive zeroclaw agent process must not panic");
+    .await
+    .expect("interactive provider request before timeout");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stdin
+        .write_all(b"/quit\n")
+        .expect("send interactive quit command");
+    drop(stdin);
+
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .expect("interactive process waiter must not panic")
+        .expect("wait for interactive zeroclaw agent");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let expected = zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None);

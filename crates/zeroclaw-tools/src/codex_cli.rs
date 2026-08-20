@@ -58,14 +58,39 @@ impl CodexCliTool {
             executor,
         }
     }
+}
 
-    fn reasoning_config_arg(reasoning_effort: &str) -> Option<String> {
-        let effort = reasoning_effort.trim();
-        if effort.is_empty() {
-            return None;
-        }
-        Some(format!("model_reasoning_effort=\"{effort}\""))
+fn codex_exec_args(config: &CodexCliConfig, prompt: &str) -> Vec<String> {
+    let mut args = vec!["exec".to_string()];
+    let model = config.model.trim();
+    if !model.is_empty() {
+        args.extend(["-m".to_string(), model.to_string()]);
     }
+
+    let reasoning_effort = config.reasoning_effort.trim();
+    if !reasoning_effort.is_empty() {
+        args.extend([
+            "-c".to_string(),
+            format!("model_reasoning_effort=\"{reasoning_effort}\""),
+        ]);
+    }
+
+    let mut has_terminator = false;
+
+    for (_, arg) in config.effective_extra_args() {
+        has_terminator |= arg == "--";
+        args.push(arg.to_string());
+    }
+
+    // Keep the model-supplied prompt in the positional-argument lane. Without
+    // this boundary, a dangling value-taking extra arg could consume the
+    // prompt as its value instead of letting Codex parse it as the prompt.
+    if !has_terminator {
+        args.push("--".to_string());
+    }
+    args.push(prompt.to_string());
+
+    args
 }
 
 #[async_trait]
@@ -177,28 +202,9 @@ impl Tool for CodexCliTool {
             self.security.workspace_dir.clone()
         };
 
-        // Build CLI command: `codex exec [extra_args...] <prompt>`
+        // Build CLI command: `codex exec [model/reasoning] [extra_args...] -- <prompt>`
         let mut cmd = CodingCliCommand::new("codex", work_dir.clone(), self.config.timeout_secs);
-        cmd.arg("exec");
-
-        let model = self.config.model.trim();
-        if !model.is_empty() {
-            cmd.arg("-m").arg(model);
-        }
-
-        if let Some(reasoning_arg) = Self::reasoning_config_arg(&self.config.reasoning_effort) {
-            cmd.arg("-c").arg(reasoning_arg);
-        }
-
-        // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
-        for arg in &self.config.extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                cmd.arg(trimmed);
-            }
-        }
-
-        cmd.arg(prompt);
+        cmd.args(codex_exec_args(&self.config, prompt));
 
         // Direct OpenAI credential passthrough is rejected before the
         // environment is populated so no forbidden variable can reach the
@@ -478,12 +484,58 @@ mod tests {
     }
 
     #[test]
-    fn codex_cli_reasoning_config_arg_quotes_medium() {
+    fn codex_cli_command_args_include_model_and_reasoning() {
         assert_eq!(
-            CodexCliTool::reasoning_config_arg("medium").as_deref(),
-            Some("model_reasoning_effort=\"medium\"")
+            codex_exec_args(&test_config(), "hello"),
+            vec![
+                "exec",
+                "-m",
+                "gpt-5.6-sol",
+                "-c",
+                "model_reasoning_effort=\"medium\"",
+                "--",
+                "hello"
+            ]
         );
-        assert!(CodexCliTool::reasoning_config_arg("   ").is_none());
+    }
+
+    #[test]
+    fn codex_cli_command_args_separate_prompt_from_dangling_value_flags() {
+        let prompt = "danger-full-access";
+
+        for flag in [
+            "--sandbox",
+            "--config",
+            "-c",
+            "--profile",
+            "--cd",
+            "-C",
+            "--add-dir",
+            "--enable",
+            "--disable",
+        ] {
+            let mut config = test_config();
+            config.extra_args = vec![flag.to_string()];
+
+            let args = codex_exec_args(&config, prompt);
+            assert_eq!(&args[args.len() - 3..], &[flag, "--", prompt]);
+        }
+    }
+
+    #[test]
+    fn codex_cli_command_args_preserve_an_explicit_terminator() {
+        let mut config = test_config();
+        config.extra_args = vec!["  --skip-git-repo-check  ".to_string(), "--".to_string()];
+
+        let args = codex_exec_args(&config, "--prompt-starting-with-a-dash");
+        assert_eq!(
+            &args[args.len() - 3..],
+            &[
+                "--skip-git-repo-check",
+                "--",
+                "--prompt-starting-with-a-dash"
+            ]
+        );
     }
 
     #[test]

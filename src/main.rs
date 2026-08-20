@@ -2907,7 +2907,7 @@ enum ConfigCommands {
     },
     /// Initialize unconfigured sections with defaults (enabled=false)
     Init {
-        /// Section prefix (e.g. channels.matrix), or <section>.<alias> to create a new dynamic-map alias (e.g. risk_profiles.strict). Omit to init all.
+        /// Section prefix (e.g. channels.matrix), or `<section>.<alias>` to create a new dynamic-map alias (e.g. risk_profiles.strict). Omit to init all.
         section: Option<String>,
         /// Emit a structured JSON envelope ({initialized: [...]}) instead of plain text.
         #[arg(long)]
@@ -3072,7 +3072,7 @@ enum AuthCommands {
     Status,
     /// Authenticate an email channel via OAuth2 device-code flow
     EmailLogin {
-        /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
+        /// Email channel alias from `[channels.email.<alias>]` (e.g. 'hotmail')
         #[arg(long)]
         channel: String,
         /// Profile name (default: default)
