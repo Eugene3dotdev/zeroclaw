@@ -512,7 +512,7 @@ impl ModelRoutingConfigTool {
                         "action": "upsert_scenario",
                         "hint": "coding",
                         "model_provider": "openai",
-                        "model": "gpt-5.3-codex",
+                        "model": "gpt-5.6-sol",
                         "classification_enabled": true,
                         "keywords": ["code", "bug", "refactor", "test"],
                         "patterns": ["```"],
@@ -1282,7 +1282,7 @@ mod tests {
                 "action": "upsert_scenario",
                 "hint": "coding",
                 "model_provider": "openai",
-                "model": "gpt-5.3-codex",
+                "model": "gpt-5.6-sol",
                 "classification_enabled": true,
                 "keywords": ["code", "bug", "refactor"],
                 "patterns": ["```"],
@@ -1303,7 +1303,7 @@ mod tests {
         assert!(scenarios.iter().any(|item| {
             item["hint"] == json!("coding")
                 && item["model_provider"] == json!("openai")
-                && item["model"] == json!("gpt-5.3-codex")
+                && item["model"] == json!("gpt-5.6-sol")
         }));
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
                 "action": "upsert_scenario",
                 "hint": "coding",
                 "model_provider": "openai",
-                "model": "gpt-5.3-codex",
+                "model": "gpt-5.6-sol",
                 "classification_enabled": true,
                 "keywords": ["code"]
             }))
@@ -1349,7 +1349,7 @@ mod tests {
                 "action": "upsert_agent",
                 "name": "coder",
                 "model_provider": "openai",
-                "model": "gpt-5.3-codex",
+                "model": "gpt-5.6-sol",
                 "agentic": true,
                 "allowed_tools": ["file_read", "file_write", "shell"],
                 "max_iterations": 6

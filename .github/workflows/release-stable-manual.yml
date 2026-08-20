@@ -347,13 +347,18 @@ jobs:
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           extra=""
+          aliases=""
+          if [ -f target/${{ matrix.target }}/release/zrc ]; then
+            cp target/${{ matrix.target }}/release/zrc staging/
+            aliases="zrc"
+          fi
           if [ -f target/${{ matrix.target }}/release/zerocode ]; then
             cp target/${{ matrix.target }}/release/zerocode staging/
             extra="zerocode"
           fi
           cp -r web/dist staging/web/dist
           cd staging
-          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
+          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $aliases $extra web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -362,13 +367,18 @@ jobs:
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           extra=""
+          aliases=""
+          if [ -f target/${{ matrix.target }}/release/zrc.exe ]; then
+            cp target/${{ matrix.target }}/release/zrc.exe staging/
+            aliases="zrc.exe"
+          fi
           if [ -f target/${{ matrix.target }}/release/zerocode.exe ]; then
             cp target/${{ matrix.target }}/release/zerocode.exe staging/
             extra="zerocode.exe"
           fi
           cp -r web/dist staging/web/dist
           cd staging
-          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
+          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $aliases $extra web/dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

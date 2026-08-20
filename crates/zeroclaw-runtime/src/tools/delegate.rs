@@ -3118,7 +3118,7 @@ mod tests {
         agents.insert(
             "coder".to_string(),
             AliasedAgentConfig {
-                model_provider: "openrouter.coder".into(),
+                model_provider: "ollama.coder".into(),
                 ..Default::default()
             },
         );
@@ -3478,7 +3478,7 @@ mod tests {
 
     fn agentic_agent_config() -> AliasedAgentConfig {
         AliasedAgentConfig {
-            model_provider: "openrouter.agentic".into(),
+            model_provider: "ollama.agentic".into(),
             risk_profile: "agentic_test".into(),
             runtime_profile: "agentic_test".into(),
             ..Default::default()
@@ -4533,7 +4533,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -4543,7 +4543,7 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "got: {:?}", result.error);
-        assert!(result.output.contains("(openrouter/model-test, agentic)"));
+        assert!(result.output.contains("(ollama/model-test, agentic)"));
     }
 
     #[tokio::test]
@@ -4559,7 +4559,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &FinalOnlyModelProvider,
                 "test",
@@ -4596,7 +4596,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &FinalOnlyModelProvider,
                 "test",
@@ -4630,7 +4630,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &FinalOnlyModelProvider,
                 "test",
@@ -4665,7 +4665,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &FinalOnlyModelProvider,
                 "test",
@@ -4694,7 +4694,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -4704,7 +4704,7 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("(openrouter/model-test, agentic)"));
+        assert!(result.output.contains("(ollama/model-test, agentic)"));
         assert!(result.output.contains("tool count matched: 1"));
     }
 
@@ -5117,7 +5117,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -5157,7 +5157,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -5182,7 +5182,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -5219,7 +5219,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -5475,7 +5475,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -6073,7 +6073,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run mcp",
@@ -6249,7 +6249,7 @@ mod tests {
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run mcp",
@@ -6269,7 +6269,7 @@ mod tests {
     #[test]
     fn enriched_prompt_includes_tools_workspace_date() {
         let config = AliasedAgentConfig {
-            model_provider: "openrouter.test".into(),
+            model_provider: "ollama.test".into(),
             ..Default::default()
         };
 
@@ -9495,7 +9495,7 @@ command = "echo hi"
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -9546,7 +9546,7 @@ command = "echo hi"
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",
@@ -9594,7 +9594,7 @@ command = "echo hi"
             .execute_agentic(
                 "agentic",
                 &config,
-                "openrouter",
+                "ollama",
                 "model-test",
                 &model_provider,
                 "run",

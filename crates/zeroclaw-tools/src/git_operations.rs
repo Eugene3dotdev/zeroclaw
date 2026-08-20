@@ -1049,10 +1049,10 @@ mod tests {
         GitOperationsTool::new(security, dir.to_path_buf())
     }
 
-    /// Initialise a git repo for tests with commit/tag signing disabled and a
-    /// fixed identity. Tests run real `git commit`; without this they inherit
-    /// the developer's global `commit.gpgsign`, blocking the suite on a
-    /// hardware-key tap.
+    /// Initialise a git repo for tests with commit/tag signing disabled, hooks
+    /// isolated from the user's global hooks, and a fixed identity. Tests run
+    /// real `git commit`; without this they inherit host Git policy such as
+    /// signing and commit-message hooks.
     fn git_init_no_sign(dir: &std::path::Path, extra_init: &[&str]) {
         let mut init = vec!["init"];
         init.extend_from_slice(extra_init);
@@ -1062,6 +1062,7 @@ mod tests {
             &["config", "user.name", "Test"],
             &["config", "commit.gpgsign", "false"],
             &["config", "tag.gpgsign", "false"],
+            &["config", "core.hooksPath", ".git/hooks"],
         ] {
             std::process::Command::new("git")
                 .args(args)

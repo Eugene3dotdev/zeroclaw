@@ -11,11 +11,37 @@ use crate::coding_cli::{
     add_safe_env,
 };
 
-/// Environment variables safe to pass through to the `gemini` subprocess.
+/// Environment variables safe to pass through to the Antigravity subprocess.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+fn is_forbidden_provider_env(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "GOOGLE_API_KEY"
+            | "GEMINI_API_KEY"
+            | "GOOGLE_APPLICATION_CREDENTIALS"
+            | "GOOGLE_CLOUD_PROJECT"
+            | "GCLOUD_PROJECT"
+            | "CLOUDSDK_CORE_PROJECT"
+            | "VERTEX_PROJECT"
+            | "VERTEX_LOCATION"
+            | "VERTEX_REGION"
+            | "AIPLATFORM_ENDPOINT"
+    ) || upper.starts_with("VERTEX_")
+        || upper.starts_with("GOOGLE_VERTEX_")
+}
+
+/// Delegates coding tasks to the Antigravity CLI (`agy -p`).
+///
+/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
+/// tasks and delegates Gemini-family work to Antigravity, which owns its own
+/// runtime/session.
+///
+/// Direct Google AI Studio / Gemini API / Vertex credential passthrough is
+/// blocked by runtime policy.
 pub struct GeminiCliTool {
     security: Arc<SecurityPolicy>,
     config: GeminiCliConfig,
@@ -52,7 +78,7 @@ impl Tool for GeminiCliTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a coding task to Gemini CLI (gemini -p). Supports file editing and shell execution. Use for complex coding work that benefits from Gemini CLI's full agent loop."
+        "Delegate a coding task to Antigravity CLI (agy -p). Supports Gemini-family work through the approved Antigravity runtime path."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -61,7 +87,7 @@ impl Tool for GeminiCliTool {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "The coding task to delegate to Gemini CLI"
+                    "description": "The coding task to delegate to Antigravity CLI"
                 },
                 "working_directory": {
                     "type": "string",
@@ -154,8 +180,34 @@ impl Tool for GeminiCliTool {
             self.security.workspace_dir.clone()
         };
 
+        // Direct Google credential passthrough is rejected before the command is
+        // built so no forbidden variable can reach the subprocess environment.
+        if let Some(blocked) = self
+            .config
+            .env_passthrough
+            .iter()
+            .map(|var| var.trim())
+            .find(|var| is_forbidden_provider_env(var))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "env_passthrough entry `{blocked}` is blocked: Gemini-family runtimes must use Antigravity CLI/session auth, not direct Google AI Studio, Gemini API, or Vertex credentials."
+                )),
+            });
+        }
+
         // Build CLI command
-        let mut cmd = CodingCliCommand::new("gemini", work_dir.clone(), self.config.timeout_secs);
+        // `agy` is not one of the shims `host_native_program` rewrites, so the
+        // Windows extension is selected here.
+        let antigravity_bin = if cfg!(target_os = "windows") {
+            "agy.cmd"
+        } else {
+            "agy"
+        };
+        let mut cmd =
+            CodingCliCommand::new(antigravity_bin, work_dir.clone(), self.config.timeout_secs);
         cmd.arg("-p").arg(prompt);
 
         add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
@@ -191,9 +243,9 @@ impl Tool for GeminiCliTool {
                     || err_msg.contains("not found")
                     || err_msg.contains("cannot find")
                 {
-                    "Gemini CLI ('gemini') not found in PATH. Install with: npm install -g @google/gemini-cli or see https://github.com/google-gemini/gemini-cli".into()
+                    "Antigravity CLI ('agy') not found in PATH. Install/configure Antigravity and ensure `agy` is available for Gemini-family runtimes.".into()
                 } else {
-                    format!("Failed to execute gemini: {e}")
+                    format!("Failed to execute Antigravity CLI: {e}")
                 };
                 Ok(ToolResult {
                     success: false,
@@ -205,14 +257,14 @@ impl Tool for GeminiCliTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!(
-                    "Gemini CLI timed out after {}s and was killed",
+                    "Antigravity CLI timed out after {}s and was killed",
                     self.config.timeout_secs
                 )),
             }),
             Err(CodingCliExecutionError::Prepare(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Failed to prepare gemini execution: {e}")),
+                error: Some(format!("Failed to prepare Antigravity execution: {e}")),
             }),
         }
     }
@@ -338,6 +390,36 @@ mod tests {
             config.env_passthrough.is_empty(),
             "env_passthrough should default to empty"
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_rejects_direct_provider_env_passthrough() {
+        let mut config = test_config();
+        config.env_passthrough = vec!["GOOGLE_API_KEY".into()];
+        let tool = GeminiCliTool::new(test_security(AutonomyLevel::Full), config);
+        let result = tool
+            .execute(json!({"prompt": "hello"}))
+            .await
+            .expect("policy rejection should return a result");
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
+    }
+
+    #[test]
+    fn gemini_cli_blocks_google_and_vertex_env_names() {
+        for name in [
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "CLOUDSDK_CORE_PROJECT",
+            "VERTEX_REGION",
+            "GOOGLE_VERTEX_API_KEY",
+        ] {
+            assert!(is_forbidden_provider_env(name), "{name} must be blocked");
+        }
+        assert!(!is_forbidden_provider_env("PATH"));
     }
 
     #[test]

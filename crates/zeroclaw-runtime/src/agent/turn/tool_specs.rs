@@ -37,7 +37,7 @@ pub(crate) fn build_iteration_tool_specs(
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-        .map(|tool| tool.spec())
+        .map(|tool| crate::tools::localized_tool_spec(tool.as_ref()))
         .collect();
     if let Some(at) = activated_tools {
         let activated_tools = match at.lock() {

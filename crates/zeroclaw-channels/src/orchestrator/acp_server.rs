@@ -3011,7 +3011,7 @@ mod tests {
         // When a client passes cwd = '.' (resolved to the install root), the
         // session must still use the per-agent workspace — not the daemon cwd.
         let cwd = tempfile::tempdir().unwrap();
-        // A fully-wired config (valid `anthropic.default` provider + `test-agent`)
+        // A fully-wired config (valid `ollama.default` provider + `test-agent`)
         // so agent construction succeeds. A failing construction would emit the
         // shared "ACP session/new failed" log line and race the attribution test
         // that matches events by message text alone.
@@ -3181,13 +3181,14 @@ mod tests {
             data_dir: cwd.path().to_path_buf(),
             providers: {
                 let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
+                p.models.ollama.insert(
                     "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                    zeroclaw_config::schema::OllamaModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        ..Default::default()
                     },
                 );
                 p
@@ -3228,7 +3229,7 @@ mod tests {
                 exclude: Vec::new(),
             },
         );
-        let mut agent = dispatchable_test_agent("openrouter.default");
+        let mut agent = dispatchable_test_agent("ollama.default");
         agent.mcp_bundles = vec!["slow-bundle".to_string()];
         config.agents.insert("test-agent".to_string(), agent);
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -3521,14 +3522,14 @@ mod tests {
             data_dir: cwd.path().to_path_buf(),
             providers: {
                 let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
+                p.models.ollama.insert(
                     "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                    zeroclaw_config::schema::OllamaModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        ..Default::default()
                     },
                 );
                 p
@@ -3545,7 +3546,7 @@ mod tests {
         );
         config.agents.insert(
             "only-agent".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -3596,14 +3597,14 @@ mod tests {
             data_dir: cwd.path().to_path_buf(),
             providers: {
                 let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
+                p.models.ollama.insert(
                     "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                    zeroclaw_config::schema::OllamaModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        ..Default::default()
                     },
                 );
                 p
@@ -3620,11 +3621,11 @@ mod tests {
         );
         config.agents.insert(
             "agent-alpha".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -3650,14 +3651,14 @@ mod tests {
             data_dir: cwd.path().to_path_buf(),
             providers: {
                 let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
+                p.models.ollama.insert(
                     "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                    zeroclaw_config::schema::OllamaModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        ..Default::default()
                     },
                 );
                 p
@@ -3674,11 +3675,11 @@ mod tests {
         );
         config.agents.insert(
             "agent-alpha".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -3715,10 +3716,8 @@ mod tests {
     fn two_agent_config(cwd: &std::path::Path) -> Config {
         let mut cfg = make_test_config(cwd);
         for alias in ["agent-alpha", "agent-beta"] {
-            cfg.agents.insert(
-                alias.to_string(),
-                dispatchable_test_agent("anthropic.default"),
-            );
+            cfg.agents
+                .insert(alias.to_string(), dispatchable_test_agent("ollama.default"));
         }
         cfg
     }
@@ -3932,7 +3931,7 @@ mod tests {
         config.agents.clear();
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         // Missing config default is skipped; sole configured agent applies.
         // Connection default stays out of the restore chain.
@@ -3971,7 +3970,7 @@ mod tests {
         let mut config = two_agent_config(cwd.path());
         config.agents.insert(
             "agent-gamma".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         config.agents.get_mut("agent-alpha").unwrap().enabled = false;
         config.acp.default_agent = Some("agent-beta".to_string());
@@ -4960,13 +4959,14 @@ mod tests {
             data_dir: cwd.to_path_buf(),
             ..Default::default()
         };
-        cfg.providers.models.anthropic.insert(
+        cfg.providers.models.ollama.insert(
             "default".to_string(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
+            zeroclaw_config::schema::OllamaModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("claude-haiku-4-5".to_string()),
+                    model: Some("test-model".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         cfg.risk_profiles.insert(
@@ -4979,7 +4979,7 @@ mod tests {
         );
         cfg.agents.insert(
             "test-agent".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("ollama.default"),
         );
         cfg
     }
@@ -4999,7 +4999,7 @@ mod tests {
             .write()
             .providers
             .models
-            .anthropic
+            .ollama
             .get_mut("default")
             .unwrap()
             .base
@@ -5457,7 +5457,7 @@ mod tests {
         cfg.agents.insert(
             "finance".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
+                model_provider: "ollama.default".into(),
                 risk_profile: "default".into(),
                 runtime_profile: "default".into(),
                 mcp_bundles: vec!["b1".into()],

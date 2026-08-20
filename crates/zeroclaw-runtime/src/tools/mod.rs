@@ -122,6 +122,19 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
+/// Build the LLM-facing tool metadata with a Fluent description when the
+/// runtime has a catalog entry for the tool name.
+pub fn localized_tool_spec(tool: &dyn Tool) -> ToolSpec {
+    // Derived from the tool's own spec rather than rebuilt field by field, so
+    // that fields added to ToolSpec upstream keep their values instead of
+    // silently reverting to defaults here.
+    let mut spec = tool.spec();
+    if let Some(description) = crate::i18n::get_tool_description(tool.name()) {
+        spec.description = description.to_string();
+    }
+    spec
+}
+
 // Local tool re-exports (tools with root deps, kept in misc)
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -2000,7 +2013,10 @@ mod tests {
                 cfg.codex_cli.enabled = true;
                 cfg.codex_cli.timeout_secs = 5;
             }),
-            ("gemini_cli", "gemini -p", |cfg: &mut Config| {
+            // The fork routes Gemini-family work through the Antigravity CLI,
+            // so the registry-wired command is `agy -p`, not upstream's
+            // `gemini -p`.
+            ("gemini_cli", "agy -p", |cfg: &mut Config| {
                 cfg.gemini_cli.enabled = true;
                 cfg.gemini_cli.timeout_secs = 5;
             }),
@@ -2917,6 +2933,24 @@ mod tests {
             assert_eq!(spec.description, tool.description());
             assert!(spec.parameters.is_object());
         }
+    }
+
+    #[test]
+    fn localized_tool_spec_uses_fluent_when_available() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GeminiCliTool::new(security, Default::default());
+
+        let spec = localized_tool_spec(&tool);
+
+        assert_eq!(spec.name, "gemini_cli");
+        assert_eq!(
+            spec.description,
+            "Delegate a coding task to Antigravity CLI (agy -p). Supports Gemini-family work through the approved Antigravity runtime path."
+        );
+        assert_eq!(
+            crate::i18n::get_tool_description("gemini_cli"),
+            Some(spec.description.as_str())
+        );
     }
 
     #[test]

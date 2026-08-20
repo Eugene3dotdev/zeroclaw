@@ -16,6 +16,21 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+fn is_forbidden_provider_env(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "OPENAI_API_KEY" | "OPENAI_BASE_URL" | "OPENAI_ORG_ID" | "OPENAI_PROJECT_ID"
+    )
+}
+
+/// Delegates coding tasks to the Codex CLI (`codex exec`).
+///
+/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
+/// tasks and delegates complex coding work to Codex, which has its own
+/// agent loop with file editing and shell tools.
+///
+/// Authentication uses the `codex` binary's own approved session. Direct
+/// OpenAI API-key env passthrough is blocked by runtime policy.
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
     config: CodexCliConfig,
@@ -42,6 +57,14 @@ impl CodexCliTool {
             config,
             executor,
         }
+    }
+
+    fn reasoning_config_arg(reasoning_effort: &str) -> Option<String> {
+        let effort = reasoning_effort.trim();
+        if effort.is_empty() {
+            return None;
+        }
+        Some(format!("model_reasoning_effort=\"{effort}\""))
     }
 }
 
@@ -158,6 +181,15 @@ impl Tool for CodexCliTool {
         let mut cmd = CodingCliCommand::new("codex", work_dir.clone(), self.config.timeout_secs);
         cmd.arg("exec");
 
+        let model = self.config.model.trim();
+        if !model.is_empty() {
+            cmd.arg("-m").arg(model);
+        }
+
+        if let Some(reasoning_arg) = Self::reasoning_config_arg(&self.config.reasoning_effort) {
+            cmd.arg("-c").arg(reasoning_arg);
+        }
+
         // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
         for arg in &self.config.extra_args {
             let trimmed = arg.trim();
@@ -167,6 +199,25 @@ impl Tool for CodexCliTool {
         }
 
         cmd.arg(prompt);
+
+        // Direct OpenAI credential passthrough is rejected before the
+        // environment is populated so no forbidden variable can reach the
+        // subprocess.
+        if let Some(blocked) = self
+            .config
+            .env_passthrough
+            .iter()
+            .map(|var| var.trim())
+            .find(|var| is_forbidden_provider_env(var))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "env_passthrough entry `{blocked}` is blocked: GPT/Codex-family runtimes must use Codex CLI/app/SDK/ACP session auth, not direct OpenAI API credentials."
+                )),
+            });
+        }
 
         add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
 
@@ -404,6 +455,19 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_cli_rejects_direct_provider_env_passthrough() {
+        let mut config = test_config();
+        config.env_passthrough = vec!["OPENAI_API_KEY".into()];
+        let tool = CodexCliTool::new(test_security(AutonomyLevel::Full), config);
+        let result = tool
+            .execute(json!({"prompt": "hello"}))
+            .await
+            .expect("policy rejection should return a result");
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
+    }
+
     #[test]
     fn codex_cli_extra_args_defaults() {
         let config = CodexCliConfig::default();
@@ -414,10 +478,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_cli_reasoning_config_arg_quotes_medium() {
+        assert_eq!(
+            CodexCliTool::reasoning_config_arg("medium").as_deref(),
+            Some("model_reasoning_effort=\"medium\"")
+        );
+        assert!(CodexCliTool::reasoning_config_arg("   ").is_none());
+    }
+
+    #[test]
     fn codex_cli_default_config_values() {
         let config = CodexCliConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.timeout_secs, 600);
         assert_eq!(config.max_output_bytes, 2_097_152);
+        assert_eq!(config.model, "gpt-5.6-sol");
+        assert_eq!(config.reasoning_effort, "medium");
     }
 }

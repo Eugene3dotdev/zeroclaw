@@ -84,6 +84,39 @@ wire_api = "responses"
 
 The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
 
+## Loopback OpenAI-compatible gateway (CLIProxyAPI)
+
+For a local OpenAI-compatible / Responses gateway (for example CLIProxyAPI on
+`127.0.0.1:8317`), use the `custom` slot with an explicit loopback `uri` and
+`wire_api = "responses"`. Keep native OpenAI / Codex subscription aliases on a
+separate config (or leave them unset) so the gateway path stays opt-in:
+
+```toml
+[providers.models.custom.cliproxyapi]
+uri = "http://127.0.0.1:8317/v1"
+model = "gpt-5.6-sol"
+wire_api = "responses"
+native_tools = true
+
+[agents.default]
+model_provider = "custom.cliproxyapi"
+risk_profile = "supervised"
+```
+
+Inject the local gateway token at process start (never commit it). Schema-mirror
+env overrides are never persisted:
+
+```sh
+export ZEROCLAW_CONFIG_DIR="$HOME/.zeroclaw-cliproxyapi"
+export ZEROCLAW_providers__models__custom__cliproxyapi__api_key="$(cliproxyapi-client-token)"
+zeroclaw agent -a default -m "hello"
+```
+
+Do **not** set `requires_openai_auth = true` on this alias: that path reads the
+Codex / ChatGPT subscription login and is for the branded `openai` slot, not a
+foreign loopback gateway. Leave empty `fallback` / `fallback_models` so an
+outage fails closed instead of falling through to another credential.
+
 ## Validation
 
 Regardless of approach:

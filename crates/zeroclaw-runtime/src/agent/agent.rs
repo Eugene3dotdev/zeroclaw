@@ -5144,11 +5144,16 @@ mod tests {
             );
         }
 
+        /// Upstream routes vision to an Anthropic-compatible endpoint here and
+        /// asserts the stored prompt is rebuilt for native tools. The EugOT
+        /// runtime policy refuses every native-tool family (`anthropic`,
+        /// `openai`, `gemini`, `openrouter`), so no allowed family is both
+        /// vision- and native-tool-capable and that rebuild is unreachable in
+        /// this fork. What must hold instead is that the refusal is fail-closed:
+        /// the turn errors and the prompt keeps its XML tool surface rather than
+        /// degrading to one advertising tools the agent cannot actually use.
         #[tokio::test]
-        async fn turn_streamed_rebuilds_prompt_for_vision_routed_native_provider() {
-            // Base provider does not support native tools or vision. The
-            // configured vision provider is an Anthropic-compatible endpoint:
-            // it supports both vision and native tools.
+        async fn turn_streamed_keeps_xml_prompt_when_vision_provider_is_policy_blocked() {
             let (base_provider, _captured) = capturing_provider(false);
             let mm_config = zeroclaw_config::schema::MultimodalConfig {
                 vision_model_provider: Some("anthropic-custom:http://127.0.0.1:9".into()),
@@ -5164,10 +5169,12 @@ mod tests {
             let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
 
-            let result = agent.turn_streamed(msg, event_tx, None).await;
+            let Err(error) = agent.turn_streamed(msg, event_tx, None).await else {
+                panic!("policy-blocked vision provider must fail the turn");
+            };
             assert!(
-                result.is_err(),
-                "vision provider chat should fail to connect"
+                error.to_string().contains("EugOT runtime policy"),
+                "vision routing must fail closed on the policy, got: {error}"
             );
 
             let system_content = match &agent.history[0] {
@@ -5175,18 +5182,8 @@ mod tests {
                 _ => panic!("history[0] should be a chat message"),
             };
             assert!(
-                !system_content.contains(XML_TOOLS_MARKER),
-                "stored system prompt must be rebuilt for native vision provider"
-            );
-
-            let provider_messages = NativeToolDispatcher.to_provider_messages(&agent.history);
-            let system = provider_messages
-                .iter()
-                .find(|m| m.role == "system")
-                .expect("transcript must contain a system message");
-            assert!(
-                !system.content.contains(XML_TOOLS_MARKER),
-                "provider-visible transcript must advertise native tools for vision provider"
+                system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must keep its XML tool surface when vision routing is refused"
             );
         }
     }
@@ -5411,7 +5408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_accepts_openai_alias_with_requires_openai_auth() {
+    async fn from_config_rejects_openai_alias_with_requires_openai_auth() {
         use tempfile::TempDir;
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
@@ -5454,10 +5451,14 @@ mod tests {
 
         let result = Agent::from_config(&config, "test-agent").await;
 
+        let err = match result {
+            Ok(_) => panic!("openai aliases must not construct direct API providers"),
+            Err(err) => err,
+        };
         assert!(
-            result.is_ok(),
-            "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
-            result.err().unwrap()
+            err.to_string()
+                .contains("Direct OpenAI provider runtime is disabled"),
+            "expected direct OpenAI runtime policy error, got: {err}"
         );
     }
 

@@ -96,7 +96,10 @@ impl XmlToolDispatcher {
     }
 
     pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {
-        tools.iter().map(|tool| tool.spec()).collect()
+        tools
+            .iter()
+            .map(|tool| crate::tools::localized_tool_spec(tool.as_ref()))
+            .collect()
     }
 }
 

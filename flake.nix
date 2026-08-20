@@ -80,6 +80,9 @@
             pkgs.nix-prefetch-git
             pkgs.jq
           ];
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ];
         };
       }) // {
       # The `services.zeroclaw` NixOS module (multi-instance; see nix/module.nix

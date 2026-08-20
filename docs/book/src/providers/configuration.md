@@ -174,7 +174,12 @@ One type per family; pick the region via the typed `endpoint` field on the alias
 
 ### Custom OpenAI-compatible endpoint
 
-The `custom` slot requires `uri`. See [Custom providers](./custom.md).
+The `custom` slot requires `uri`. See [Custom providers](./custom.md). For a
+loopback OpenAI Responses gateway (for example CLIProxyAPI), set
+`wire_api = "responses"`, point `uri` at `http://127.0.0.1:<port>/v1`, inject the
+local token via `ZEROCLAW_providers__models__custom__<alias>__api_key`, and keep
+`requires_openai_auth` unset so the branded OpenAI / Codex subscription path is
+not reused.
 
 ## Picking which provider an agent uses
 

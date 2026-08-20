@@ -13034,16 +13034,17 @@ temperature = 0.3
 
     #[tokio::test]
     async fn resolve_classifier_route_returns_alias_temperature() {
-        // Build a config where `openai.my-classifier` has `temperature = 0.0`.
+        // Build a config where `ollama.my-classifier` has `temperature = 0.0`.
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.providers.models.openai.insert(
+        cfg.providers.models.ollama.insert(
             "my-classifier".to_string(),
-            zeroclaw_config::schema::OpenAIModelProviderConfig {
+            zeroclaw_config::schema::OllamaModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("gpt-4o-mini".to_string()),
+                    model: Some("fast-intent".to_string()),
                     temperature: Some(0.0),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -13053,7 +13054,7 @@ temperature = 0.3
             ..base_ctx
         });
 
-        let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("openai.my-classifier");
+        let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("ollama.my-classifier");
         let result = resolve_classifier_route(
             ctx.as_ref(),
             &alias_ref,

@@ -27,6 +27,13 @@ use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
 
+fn direct_provider_policy_error(family: &str, alias: &str, allowed_path: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "Direct {family} provider runtime is disabled for alias `{alias}` by the EugOT runtime policy. \
+         Use {allowed_path}; direct provider API credentials and endpoints are not allowed in active runtime paths."
+    ))
+}
+
 const XAI_DEFAULT_URL: &str = "https://api.x.ai/v1";
 const OLLAMA_COMPAT_DEFAULT_URL: &str = "http://localhost:11434/v1";
 const GROQ_DEFAULT_URL: &str = "https://api.groq.com/openai/v1";
@@ -59,6 +66,13 @@ impl ProviderEndpoint {
     }
 }
 
+/// Per-family construction trait. Implemented (directly or via the
+/// `CompatFamilySpec` blanket) by every typed `<Family>ModelProviderConfig`.
+///
+/// `&self` IS the typed alias config — implementations read their own
+/// per-alias fields directly instead of through a flat options dumping
+/// ground. `api_url` is the resolved endpoint URL (operator override or
+/// pre-resolved family default); `key` is the resolved API credential.
 pub(crate) trait FamilyProviderFactory {
     const ENDPOINT: ProviderEndpoint;
 
@@ -1053,19 +1067,15 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
+        api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
-            .credential(key)
-            .max_tokens(opts.provider_max_tokens);
-        if let Some(t) = opts.provider_timeout_secs {
-            b = b.timeout_secs(t);
-        }
-        if let Some(extra) = opts.provider_extra.clone() {
-            b = b.extra_body(extra);
-        }
-        Ok(Box::new(b.build()))
+        let _ = (self, key, api_url, opts);
+        Err(direct_provider_policy_error(
+            "OpenRouter",
+            alias,
+            "an explicitly documented gateway exception outside the Gemini/Claude/GPT model families",
+        ))
     }
 }
 
@@ -1079,16 +1089,12 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
-            .credential(key)
-            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
-        if let Some(mt) = opts.provider_max_tokens {
-            b = b.max_tokens(mt);
-        }
-        if let Some(ts) = opts.provider_timeout_secs {
-            b = b.timeout_secs(ts);
-        }
-        Ok(Box::new(b.build()))
+        let _ = (self, key, api_url, opts);
+        Err(direct_provider_policy_error(
+            "Anthropic",
+            alias,
+            "Claude Code CLI (`claude -p`) or another approved Claude CLI/agent runtime",
+        ))
     }
 }
 
@@ -1123,36 +1129,17 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Codex variant routing: OAuth subscription auth → Codex responses protocol.
-        if self.base.requires_openai_auth {
-            return Ok(Box::new(
-                crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?,
-            ));
-        }
-        // Responses wire protocol with standard API key — full streaming tool calls.
-        // New OpenAI provider slots default wire_api to Responses via
-        // OpenAIModelProviderConfig::default() (persisted-slot creation). Bare/
-        // dangling dispatch uses openai_missing_entry_fallback_config() and stays
-        // on the chat wire; unset/legacy configs also fall through below.
-        if let Some(p) =
-            build_responses_provider_if_requested(self.base.wire_api, alias, api_url, key, opts)
-        {
-            return Ok(p);
-        }
-        // Fallback: chat_completions wire (explicit opt-in or legacy unset configs).
-        let mut b = crate::openai::OpenAiModelProvider::builder(alias).credential(key);
-        if let Some(url) = api_url {
-            b = b.base_url(url);
-        }
-        if let Some(t) = opts.provider_timeout_secs {
-            b = b.timeout_secs(t);
-        }
-        if let Some(mt) = opts.provider_max_tokens {
-            b = b.max_tokens(Some(mt));
-        }
-        Ok(Box::new(b.build()))
+        let _ = (self, key, api_url, opts);
+        Err(direct_provider_policy_error(
+            "OpenAI",
+            alias,
+            "Codex CLI/app/Agents SDK/ACP instead of direct OpenAI API construction",
+        ))
     }
 
+    // Auth-readiness stays permissive so a fallback that names an OpenAI alias
+    // surfaces the policy error from `create_provider` rather than a misleading
+    // "missing credential" diagnostic.
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || self.base.requires_openai_auth
     }
@@ -1228,29 +1215,19 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
+        api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
-            directories::UserDirs::new().map_or_else(
-                || std::path::PathBuf::from(".zeroclaw"),
-                |dirs| dirs.home_dir().join(".zeroclaw"),
-            )
-        });
-        let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        Ok(Box::new(
-            crate::gemini::GeminiModelProvider::builder(alias)
-                .api_key(key)
-                .managed_auth(auth_service, opts.auth_profile_override.clone())
-                .oauth_project_seed(self.oauth_project.clone())
-                .oauth_client(
-                    self.oauth_client_id.clone(),
-                    self.oauth_client_secret.clone(),
-                )
-                .build(),
+        let _ = (self, key, api_url, opts);
+        Err(direct_provider_policy_error(
+            "Gemini",
+            alias,
+            "Antigravity / antigravity-cli (`agy chat`) for Gemini-family runtimes",
         ))
     }
 
+    // See the OpenAI impl: readiness stays permissive so the policy error is
+    // what an operator sees when a fallback names a Gemini alias.
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || matches!(self.auth_mode, Some(AuthMode::OAuth))
     }
@@ -1281,55 +1258,14 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
-        opts: &ModelProviderRuntimeOptions,
+        api_url: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Reads typed Azure alias fields directly. Operator sets these
-        // under `[providers.models.azure.<alias>]` or via the schema-mirror
-        // env grammar — env-var fallback eradicated.
-        let resource = self.resource.as_deref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "family": "azure",
-                        "alias": alias,
-                        "missing": "resource",
-                    })),
-                "factory: azure provider missing resource"
-            );
-            anyhow::Error::msg(
-                "Azure model_provider requires `resource`: set \
-                 `[providers.models.azure.<alias>] resource = \"...\"` in config.toml.",
-            )
-        })?;
-        let deployment = self.deployment.as_deref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "family": "azure",
-                        "alias": alias,
-                        "missing": "deployment",
-                    })),
-                "factory: azure provider missing deployment"
-            );
-            anyhow::Error::msg(
-                "Azure model_provider requires `deployment`: set \
-                 `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml.",
-            )
-        })?;
-        let api_version = self.api_version.as_deref();
-        Ok(Box::new(
-            crate::azure_openai::AzureOpenAiModelProvider::builder(alias)
-                .resource_name(resource)
-                .deployment_name(deployment)
-                .credential(key)
-                .api_version(api_version)
-                .reasoning_effort(opts.reasoning_effort.clone())
-                .build(),
+        let _ = (self, key, api_url);
+        Err(direct_provider_policy_error(
+            "Azure OpenAI",
+            alias,
+            "Codex CLI/app/Agents SDK/ACP or an approved local gateway",
         ))
     }
 }
@@ -1795,20 +1731,30 @@ mod tests {
                         <$cfg_ty as FamilyProviderFactory>::ENDPOINT
                     {
                         let config = <$cfg_ty>::default();
-                        let provider = config
-                            .create_provider($type_str, Some("test-key"), None, &opts)
-                            .unwrap_or_else(|error| {
+                        let result = config.create_provider($type_str, Some("test-key"), None, &opts);
+                        // These families still declare a canonical endpoint for
+                        // the registry, but their direct runtime is disabled, so
+                        // "constructs from its endpoint" becomes "fails closed".
+                        if matches!($type_str, "openrouter" | "anthropic") {
+                            assert!(
+                                provider_err_text(result).contains("provider runtime is disabled"),
+                                "policy-blocked family {:?} must not construct a direct runtime",
+                                $type_str
+                            );
+                        } else {
+                            let provider = result.unwrap_or_else(|error| {
                                 panic!(
                                     "fixed provider family {:?} did not construct from its canonical endpoint: {error:#}",
                                     $type_str
                                 )
                             });
-                        assert_eq!(
-                            provider.default_base_url(),
-                            Some(url),
-                            "fixed provider family {:?} constructed a different default endpoint",
-                            $type_str
-                        );
+                            assert_eq!(
+                                provider.default_base_url(),
+                                Some(url),
+                                "fixed provider family {:?} constructed a different default endpoint",
+                                $type_str
+                            );
+                        }
                     }
                 )+
             }};
@@ -1855,6 +1801,17 @@ mod tests {
         }
     }
 
+    fn provider_err_text(result: Result<Box<dyn ModelProvider>>) -> String {
+        match result {
+            Ok(_) => panic!("provider construction unexpectedly succeeded"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// Regression for the #7136 review: the Kilo Gateway default exists in two
+    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
+    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
+    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
     #[test]
     fn kilo_gateway_default_url_matches_schema_endpoint() {
         use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};
@@ -1949,24 +1906,26 @@ mod tests {
     }
 
     #[test]
-    fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
+    fn openai_factory_blocks_codex_direct_runtime() {
         let cfg = OpenAIModelProviderConfig {
             base: ModelProviderConfig {
                 requires_openai_auth: true,
                 ..Default::default()
             },
         };
-        let provider = cfg
-            .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
-            .unwrap();
-        // OpenAiCodexModelProvider reports native_tool_calling; standard OpenAiModelProvider does not
-        assert!(provider.capabilities().native_tool_calling);
+        let err = provider_err_text(cfg.create_provider(
+            "test",
+            None,
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ));
+        assert!(err.contains("Codex CLI"));
     }
 
     #[test]
-    fn openai_factory_routes_to_standard_when_requires_openai_auth_false() {
-        // Explicit chat_completions: OpenAIModelProviderConfig::default() now
-        // selects the responses wire, so this regression pins the legacy path.
+    fn direct_vendor_factories_fail_closed_by_policy() {
+        let opts = ModelProviderRuntimeOptions::default();
+
         let cfg = OpenAIModelProviderConfig {
             base: ModelProviderConfig {
                 requires_openai_auth: false,
@@ -1974,60 +1933,68 @@ mod tests {
                 ..Default::default()
             },
         };
-        let provider = cfg
-            .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
-            .unwrap();
-        assert!(!provider.capabilities().native_tool_calling);
-    }
-
-    #[test]
-    fn openai_factory_defaults_new_provider_to_responses_wire() {
-        // Creating a new OpenAI provider slot (create_map_key / ensure) uses
-        // OpenAIModelProviderConfig::default(), which must select responses.
-        let provider = OpenAIModelProviderConfig::default()
-            .create_provider(
-                "test",
-                Some("sk-test"),
-                None,
-                &ModelProviderRuntimeOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(provider.default_wire_api(), "responses");
-        assert!(provider.capabilities().native_tool_calling);
-    }
-
-    #[test]
-    fn openai_dispatch_missing_entry_stays_on_chat_wire() {
-        // The responses default applies only to persisted slot creation. An implicit
-        // dispatch with no config entry — a bare `model_provider = "openai"` ref or
-        // a dangling alias —
-        // must keep the historical chat-completions wire and prompt-guided tools,
-        // so existing installs don't silently flip wire + tool-calling on upgrade.
-        let provider = dispatch_family_factory(
-            None,
-            "openai",
-            "default",
-            Some("sk-test"),
-            None,
-            &ModelProviderRuntimeOptions::default(),
-        )
-        .expect("bare openai dispatch should build");
-        assert_eq!(
-            provider.default_wire_api(),
-            "chat_completions",
-            "missing-entry openai dispatch must not adopt the responses wire"
+        assert!(
+            provider_err_text(cfg.create_provider("test", Some("sk-test"), None, &opts))
+                .contains("Direct OpenAI provider runtime is disabled")
         );
         assert!(
-            !provider.capabilities().native_tool_calling,
-            "missing-entry openai dispatch must keep prompt-guided tool calling"
+            provider_err_text(AnthropicModelProviderConfig::default().create_provider(
+                "test",
+                Some("sk-ant-test"),
+                None,
+                &opts
+            ))
+            .contains("Claude Code CLI")
+        );
+        assert!(
+            provider_err_text(GeminiModelProviderConfig::default().create_provider(
+                "test",
+                Some("AIza-test"),
+                None,
+                &opts
+            ))
+            .contains("Antigravity")
+        );
+        assert!(
+            provider_err_text(OpenRouterModelProviderConfig::default().create_provider(
+                "test",
+                Some("sk-or-test"),
+                None,
+                &opts
+            ))
+            .contains("Direct OpenRouter provider runtime is disabled")
+        );
+        assert!(
+            provider_err_text(AzureModelProviderConfig::default().create_provider(
+                "test",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default()
+            ))
+            .contains("Direct Azure OpenAI provider runtime is disabled")
         );
     }
 
     #[test]
-    fn openai_dispatch_persisted_entry_honors_responses_default() {
-        // The counterpart to the missing-entry test: a persisted openai slot that
-        // stored wire_api = responses (as create_map_key now writes) still routes
-        // through the responses provider when dispatched.
+    fn openai_dispatch_is_policy_blocked_for_every_entry_shape() {
+        // Upstream distinguishes the missing-entry (chat wire) and persisted
+        // (responses wire) dispatch shapes. Both are unreachable here: no
+        // config shape may produce a direct OpenAI runtime.
+        let opts = ModelProviderRuntimeOptions::default();
+
+        assert!(
+            provider_err_text(dispatch_family_factory(
+                None,
+                "openai",
+                "default",
+                Some("sk-test"),
+                None,
+                &opts
+            ))
+            .contains("Direct OpenAI provider runtime is disabled"),
+            "missing-entry openai dispatch must fail closed"
+        );
+
         let mut config = zeroclaw_config::schema::Config::default();
         config.providers.models.openai.insert(
             "default".to_string(),
@@ -2038,75 +2005,28 @@ mod tests {
                 },
             },
         );
-        let provider = dispatch_family_factory(
-            Some(&config),
-            "openai",
-            "default",
-            Some("sk-test"),
-            None,
-            &ModelProviderRuntimeOptions::default(),
-        )
-        .expect("persisted openai dispatch should build");
-        assert_eq!(provider.default_wire_api(), "responses");
-        assert!(provider.capabilities().native_tool_calling);
-    }
-
-    #[tokio::test]
-    async fn openai_factory_forwards_timeout_to_native_provider() {
-        use axum::{Json, Router, routing::post};
-        use serde_json::json;
-        use tokio::time::{Duration, Instant};
-
-        async fn slow_chat_completion() -> Json<serde_json::Value> {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            Json(json!({
-                "choices": [{"message": {"content": "too late"}}]
-            }))
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("test server addr");
-        let app = Router::new().route("/chat/completions", post(slow_chat_completion));
-        let server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.expect("serve test server");
-        });
-
-        let opts = ModelProviderRuntimeOptions {
-            provider_timeout_secs: Some(1),
-            ..Default::default()
-        };
-        // Pin the chat-completions path explicitly: OpenAI defaults to responses.
-        let provider = OpenAIModelProviderConfig {
-            base: ModelProviderConfig {
-                wire_api: Some(WireApi::ChatCompletions),
-                ..Default::default()
-            },
-        }
-        .create_provider(
-            "native",
-            Some("test-key"),
-            Some(&format!("http://{addr}")),
-            &opts,
-        )
-        .expect("openai provider should build");
-
-        let started = Instant::now();
-        let result = provider
-            .chat_with_system(None, "hello", "gpt-4o", Some(0.7))
-            .await;
-        let elapsed = started.elapsed();
-
-        server.abort();
-
         assert!(
-            result.is_err(),
-            "slow response should time out when factory forwards provider_timeout_secs"
+            provider_err_text(dispatch_family_factory(
+                Some(&config),
+                "openai",
+                "default",
+                Some("sk-test"),
+                None,
+                &opts
+            ))
+            .contains("Direct OpenAI provider runtime is disabled"),
+            "persisted openai dispatch must fail closed"
         );
+
         assert!(
-            elapsed < Duration::from_secs(3),
-            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+            provider_err_text(OpenAIModelProviderConfig::default().create_provider(
+                "test",
+                Some("sk-test"),
+                None,
+                &opts
+            ))
+            .contains("Direct OpenAI provider runtime is disabled"),
+            "the default persisted-slot config must fail closed"
         );
     }
 
@@ -2304,6 +2224,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn custom_factory_loopback_gateway_responses_with_native_tools() {
+        // CEL-856: CLIProxyAPI-style custom alias (loopback + Responses + tools).
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://127.0.0.1:8317/v1".to_string()),
+                wire_api: Some(WireApi::Responses),
+                native_tools: Some(true),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "cliproxyapi",
+                Some("local-gateway-token"),
+                Some("http://127.0.0.1:8317/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert!(
+            provider.supports_native_tools(),
+            "loopback gateway aliases that set native_tools = true must keep tool calling"
+        );
     }
 
     #[test]

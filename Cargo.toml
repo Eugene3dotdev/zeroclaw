@@ -64,6 +64,10 @@ name = "zeroclaw"
 path = "src/main.rs"
 
 [[bin]]
+name = "zrc"
+path = "src/main.rs"
+
+[[bin]]
 name = "zeroclaw-acp-bridge"
 path = "src/bin/zeroclaw-acp-bridge.rs"
 required-features = ["acp-bridge"]

@@ -105,6 +105,8 @@ tool-git-forge-error-raw-requires-path = 'raw' requires 'path'.
 tool-git-forge-error-requires-resource = a typed call requires 'resource' (or use action 'raw'/'describe').
 tool-git-forge-error-missing-repo = Missing 'repo' (expected 'owner/repo').
 
+tool-gemini-cli = Delegate a coding task to Antigravity CLI (agy -p). Supports Gemini-family work through the approved Antigravity runtime path.
+
 tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 
 tool-google-workspace = Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) via the gws CLI. Requires gws to be installed and authenticated.

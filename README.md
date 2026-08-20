@@ -50,6 +50,8 @@ For the guided Unix installer, source builds, app and feature selection, and PAT
 
 Run `./install.sh --help` for the complete Unix installer flag reference.
 
+The EugOT fork also builds `zrc` as a short, collision-free alias for the same CLI entry point. Existing `zeroclaw` invocations continue to work, and `./install.sh --skip-quickstart` lets you run `zrc quickstart` later.
+
 > **Working on the docs?** The translated documentation catalogues live in a
 > git submodule (`docs/book/po`). The Rust build does not need it, but building
 > or syncing the docs does. Clone with it, or add it to an existing clone:
@@ -64,11 +66,13 @@ Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/b
 ## Quick start
 
 ```bash
-zeroclaw quickstart               # one-shot setup: pick a provider, write a working config
-zeroclaw agent -a <alias>         # interactive chat using the [agents.<alias>] entry
-zeroclaw service install          # register as systemd/launchctl/Windows Service
-zeroclaw service start            # run it always-on in the background
+zrc quickstart                    # one-shot setup: pick a provider, write a working config
+zrc agent -a <alias>              # interactive chat using the [agents.<alias>] entry
+zrc service install               # register as systemd/launchctl/Windows Service
+zrc service start                 # run it always-on in the background
 ```
+
+`zeroclaw` remains equivalent for existing scripts; `zrc` is the preferred EugOT fork alias when command names collide with another installed ZeroClaw package.
 
 Full walkthrough: [Quick start](docs/book/src/getting-started/quickstart.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
 

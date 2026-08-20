@@ -315,6 +315,7 @@ install_prebuilt() {
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    info "[dry-run] Would install zrc to $CARGO_HOME/bin/zrc (if in tarball)"
     info "[dry-run] Would install $TUI_BIN_NAME to $CARGO_HOME/bin/$TUI_BIN_NAME (if in tarball)"
     info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
@@ -366,6 +367,11 @@ install_prebuilt() {
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
+  if [ -f "$tmp_dir/zrc" ]; then
+    install -m 755 "$tmp_dir/zrc" "$CARGO_HOME/bin/zrc"
+  elif [ -f "$tmp_dir/zrc.exe" ]; then
+    install -m 755 "$tmp_dir/zrc.exe" "$CARGO_HOME/bin/zrc.exe"
+  fi
   if [ -f "$tmp_dir/$TUI_BIN_NAME" ]; then
     install -m 755 "$tmp_dir/$TUI_BIN_NAME" "$CARGO_HOME/bin/$TUI_BIN_NAME"
   fi
@@ -1276,6 +1282,11 @@ See all available features:
       fi
     else
       warn "Binary not found at expected path: $BIN"
+    fi
+    ZRC_BIN="$CARGO_HOME/bin/zrc"
+    if [ -f "$ZRC_BIN" ]; then
+      ZRC_SIZE=$(du -h "$ZRC_BIN" | awk '{print $1}')
+      info "Installed: $ZRC_BIN ($ZRC_SIZE)"
     fi
     TUI_BIN="$CARGO_HOME/bin/$TUI_BIN_NAME"
     if [ -f "$TUI_BIN" ]; then

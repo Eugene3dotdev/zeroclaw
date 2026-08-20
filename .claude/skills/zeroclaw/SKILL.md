@@ -23,48 +23,52 @@ Default to a middle ground — brief explanation of what you're about to do, the
 
 Before running any ZeroClaw operation, make sure you know where things are:
 
-1. **Find the binary.** Search in this order:
-   - `which zeroclaw` (PATH)
+1. **Find the binaries.** Probe both PATH installs before choosing a session binary, so collisions are visible up front:
+   - `command -v zrc` (PATH)
+   - `command -v zeroclaw` (PATH)
+   - The current project's alias build output: `./target/release/zrc` or `./target/debug/zrc`
    - The current project's build output: `./target/release/zeroclaw` or `./target/debug/zeroclaw` — this is the right choice when the user is working inside the ZeroClaw source tree and may have local changes
-   - Common install locations: `~/.cargo/bin/zeroclaw`, `~/Downloads/zeroclaw-bin/zeroclaw`
+   - Common install locations: `~/.cargo/bin/zrc`, `~/.cargo/bin/zeroclaw`, `~/Downloads/zeroclaw-bin/zrc`, `~/Downloads/zeroclaw-bin/zeroclaw`
 
-   If no binary is found anywhere, offer to build from source (see "Building from Source" below). If the user is a developer working on ZeroClaw itself, they'll likely want the local build — watch for cues like them editing source files, mentioning PRs, or being in the project directory.
+   Use the selected binary consistently for later commands in the same session. Store it as `ZC=/path/to/zrc` or `ZC=/path/to/zeroclaw` in examples and replace every `$ZC` below with that same resolved path. If `zeroclaw` and `zrc` both exist but point to different installs, prefer `zrc` for the EugOT fork and report the collision before running stateful commands. If no binary is found anywhere, offer to build from source (see "Building from Source" below). If the user is a developer working on ZeroClaw itself, they'll likely want the local build — watch for cues like them editing source files, mentioning PRs, or being in the project directory.
 
-2. **Check if the gateway is running** (only needed for REST/WebSocket operations). A quick `curl -sf http://127.0.0.1:42617/health` tells you. If it's not running and the user wants REST access, let them know and offer to start it (`zeroclaw gateway` or `zeroclaw daemon`).
+   In the normal EugOT fork path this means examples resolve to `zrc`, for example `ZC="$(command -v zrc)"` followed by `"$ZC" status` or `"$ZC" quickstart`. Keep `zeroclaw` as the fallback only when `zrc` is absent, and do not switch back to bare `zeroclaw` after `zrc` has been selected.
 
-3. **Check auth status.** If the gateway requires pairing (`require_pairing = true` is the default), REST calls need a bearer token. Run `zeroclaw status` to see the current state, or check `~/.zeroclaw/config.toml` for a stored token under `[gateway]`.
+2. **Check if the gateway is running** (only needed for REST/WebSocket operations). A quick `curl -sf http://127.0.0.1:42617/health` tells you. If it's not running and the user wants REST access, let them know and offer to start it (`$ZC gateway` or `$ZC daemon`).
 
-4. **Discover the agent alias.** Every `zeroclaw agent` invocation requires `-a <alias>` — there is no default agent. Read `~/.zeroclaw/config.toml` and find the `[agents.<alias>]` headers; that `<alias>` is what the user means when they say "my agent." If multiple agents exist, ask the user which one to target before invoking. The examples below use `<alias>` as a placeholder for the alias you discovered.
+3. **Check auth status.** If the gateway requires pairing (`require_pairing = true` is the default), REST calls need a bearer token. Run `$ZC status` to see the current state, or check `~/.zeroclaw/config.toml` for a stored token under `[gateway]`.
+
+4. **Discover the agent alias.** Every `$ZC agent` invocation requires `-a <alias>` — there is no default agent. Read `~/.zeroclaw/config.toml` and find the `[agents.<alias>]` headers; that `<alias>` is what the user means when they say "my agent." If multiple agents exist, ask the user which one to target before invoking. The examples below use `<alias>` as a placeholder for the alias you discovered.
 
 Cache these findings for the conversation — don't re-discover every time.
 
 ## Important: REPL Limitation
 
-`zeroclaw agent -a <alias>` (interactive REPL) requires interactive stdin, which doesn't work through the Bash tool. When the user wants to chat with their agent, use single-message mode instead:
+`$ZC agent -a <alias>` (interactive REPL) requires interactive stdin, which doesn't work through the Bash tool. When the user wants to chat with their agent, use single-message mode instead:
 
 ```bash
-zeroclaw agent -a <alias> -m "the message"
+"$ZC" agent -a <alias> -m "the message"
 ```
 
-Each `-m` invocation is independent (no conversation history between calls). If the user needs multi-turn conversation, let them know they can run `zeroclaw agent -a <alias>` directly in their terminal, or use the WebSocket endpoint for programmatic streaming.
+Each `-m` invocation is independent (no conversation history between calls). If the user needs multi-turn conversation, let them know they can run `$ZC agent -a <alias>` directly in their terminal, or use the WebSocket endpoint for programmatic streaming.
 
 ## First-Time Setup
 
 If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), guide them through quickstart:
 
 ```bash
-zeroclaw quickstart                                              # Interactive — picks a provider + agent
-zeroclaw quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
-zeroclaw config set channels.<name>.<field>=<value>              # Configure a channel after quickstart
+"$ZC" quickstart                                              # Interactive — picks a provider + agent
+"$ZC" quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
+"$ZC" config set channels.<name>.<field>=<value>              # Configure a channel after quickstart
 ```
 
 After quickstart, verify everything works:
 ```bash
-zeroclaw status
-zeroclaw doctor
+"$ZC" status
+"$ZC" doctor
 ```
 
-If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<name>.<field>=<value>` rather than re-running quickstart (quickstart leaves an existing config alone).
+If they already have a config but a channel is broken, edit just that channel's fields with `$ZC config set channels.<name>.<field>=<value>` rather than re-running quickstart (quickstart leaves an existing config alone).
 
 ## Building from Source
 
@@ -74,7 +78,7 @@ If the user wants to build ZeroClaw (or no binary is installed):
 cargo build --release
 ```
 
-This produces `target/release/zeroclaw`. For faster iteration during development, `cargo build` (debug mode) is quicker but produces a slower binary at `target/debug/zeroclaw`.
+This produces `target/release/zeroclaw` and, in the EugOT fork, `target/release/zrc`. For faster iteration during development, `cargo build` (debug mode) is quicker but produces slower binaries at `target/debug/zeroclaw` and `target/debug/zrc`.
 
 You can also run directly without a separate build step:
 ```bash
@@ -95,7 +99,7 @@ Both surfaces can do most things. Rules of thumb:
 
 ### Sending Messages
 
-**CLI:** `zeroclaw agent -a <alias> -m "your message here"` — always use `-m` mode (not bare `zeroclaw agent -a <alias>`) so it returns instead of blocking on the REPL.
+**CLI:** `$ZC agent -a <alias> -m "your message here"` — always use `-m` mode (not bare `$ZC agent -a <alias>`) so it returns instead of blocking on the REPL.
 
 **REST:**
 ```bash
@@ -110,22 +114,22 @@ Response: `{"response": "...", "model": "..."}`
 
 ### System Status
 
-Run `zeroclaw status` to see provider, model, uptime, channels, memory backend. For deeper diagnostics: `zeroclaw doctor`.
+Run `$ZC status` to see provider, model, uptime, channels, memory backend. For deeper diagnostics: `$ZC doctor`.
 
 **REST:** `GET /api/status` (same info as JSON), `GET /health` (no auth, quick ok/not-ok).
 
 ### Memory
 
 The CLI can list, get, and clear memories but **cannot store** them directly. To store a memory:
-- Via agent: `zeroclaw agent -a <alias> -m "remember that my favorite color is blue"`
+- Via agent: `$ZC agent -a <alias> -m "remember that my favorite color is blue"`
 - Via REST: `POST /api/memory` with `{"key": "...", "content": "...", "category": "core"}`
 
 **CLI (read/delete):**
-- `zeroclaw memory list` — list all entries
-- `zeroclaw memory list --category core --limit 10` — filtered
-- `zeroclaw memory get "key-name"` — get specific entry
-- `zeroclaw memory stats` — usage statistics
-- `zeroclaw memory clear --key "prefix" --yes` — delete entries (confirm with user first)
+- `$ZC memory list` — list all entries
+- `$ZC memory list --category core --limit 10` — filtered
+- `$ZC memory get "key-name"` — get specific entry
+- `$ZC memory stats` — usage statistics
+- `$ZC memory clear --key "prefix" --yes` — delete entries (confirm with user first)
 
 **REST (full CRUD):**
 - `GET /api/memory` — list all (optional: `?query=search+text&category=core`)
@@ -137,12 +141,12 @@ Categories: `core`, `daily`, `conversation`, or any custom string.
 ### Cron / Scheduling
 
 **CLI:**
-- `zeroclaw cron list` — show all jobs
-- `zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York` — recurring
-- `zeroclaw cron add-at '2026-03-11T10:00:00Z' 'Remind me'` — one-time at specific time
-- `zeroclaw cron add-every 3600000 'Check health'` — interval in ms
-- `zeroclaw cron once 30m 'Follow up'` — delay from now
-- `zeroclaw cron pause <id>` / `zeroclaw cron resume <id>` / `zeroclaw cron remove <id>`
+- `$ZC cron list` — show all jobs
+- `$ZC cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York` — recurring
+- `$ZC cron add-at '2026-03-11T10:00:00Z' 'Remind me'` — one-time at specific time
+- `$ZC cron add-every 3600000 'Check health'` — interval in ms
+- `$ZC cron once 30m 'Follow up'` — delay from now
+- `$ZC cron pause <id>` / `$ZC cron resume <id>` / `$ZC cron remove <id>`
 
 **REST:**
 - `GET /api/cron` — list jobs
@@ -157,7 +161,7 @@ To see what's available: `GET /api/tools` (REST) lists all registered tools with
 
 ### Configuration
 
-Edit `~/.zeroclaw/config.toml` directly, use `zeroclaw config set <key>=<value>` for one field at a time, or delete `~/.zeroclaw/` and re-run `zeroclaw quickstart` for a fresh setup.
+Edit `~/.zeroclaw/config.toml` directly, use `$ZC config set <key>=<value>` for one field at a time, or delete `~/.zeroclaw/` and re-run `$ZC quickstart` for a fresh setup.
 
 **REST:**
 - `GET /api/config`: compatibility whole-config read (secrets masked as `***MASKED***`)
@@ -166,12 +170,12 @@ Edit `~/.zeroclaw/config.toml` directly, use `zeroclaw config set <key>=<value>`
 
 ### Providers & Models
 
-- `zeroclaw providers` — list all supported providers
-- `zeroclaw models list` — cached model catalog
-- `zeroclaw models refresh --all` — refresh from providers
-- `zeroclaw models set anthropic/claude-sonnet-4-6` — set default model
+- `$ZC providers` — list all supported providers
+- `$ZC models list` — cached model catalog
+- `$ZC models refresh --all` — refresh from providers
+- `$ZC models set anthropic/claude-sonnet-4-6` — set default model
 
-Override per-message: `zeroclaw agent -a <alias> -p anthropic --model claude-sonnet-4-6 -m "hello"`
+Override per-message: `$ZC agent -a <alias> -p anthropic --model claude-sonnet-4-6 -m "hello"`
 
 ### Real-Time Events (SSE)
 
@@ -189,22 +193,24 @@ Streams JSON events: `llm_request`, `tool_call_start`, `tool_call`, `agent_start
 
 Confirm with the user before running any estop command — these are disruptive.
 
-- `zeroclaw estop --level kill-all` — stop everything
-- `zeroclaw estop --level network-kill` — block all network
-- `zeroclaw estop --level tool-freeze --tool shell` — freeze specific tool
-- `zeroclaw estop status` — check current estop state
-- `zeroclaw estop resume --network` — resume
+- `$ZC estop --level kill-all` — stop everything
+- `$ZC estop --level network-kill` — block all network
+- `$ZC estop --level tool-freeze --tool shell` — freeze specific tool
+- `$ZC estop status` — check current estop state
+- `$ZC estop resume --network` — resume
 
 ### Gateway Lifecycle
 
-- `zeroclaw gateway` — start HTTP gateway (foreground)
-- `zeroclaw gateway -p 8080 --host 127.0.0.1` — custom bind
-- `zeroclaw daemon` — start gateway + channels + scheduler + heartbeat
-- `zeroclaw service install/start/stop/status/uninstall` — OS service management
+- `$ZC gateway` — start HTTP gateway (foreground)
+- `$ZC gateway -p 8080 --host 127.0.0.1` — custom bind
+- `$ZC daemon` — start gateway + channels + scheduler + heartbeat
+- `$ZC service install/start/stop/status/uninstall` — OS service management
 
 ### Channels
 
-Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channels doctor` to check their health. Consult the current channel guide and generated config reference before editing `~/.zeroclaw/config.toml`; do not infer config keys from a fixed channel inventory.
+Channel availability depends on the installed build's feature set. Use `$ZC channels list` to inspect configured channels and `$ZC channels doctor` to check their health. Consult the current channel guide and generated config reference before editing `~/.zeroclaw/config.toml`; do not infer config keys from a fixed channel inventory.
+
+For the full list of channels and their config fields, read `references/cli-reference.md` (Channels section).
 
 ### Pairing (Authentication Setup)
 
@@ -219,21 +225,21 @@ Response includes `{"token": "..."}` — save this for subsequent requests.
 Here are multi-step sequences you're likely to need:
 
 **"Is my agent healthy?"**
-1. Run `zeroclaw status` — check provider, model, channels
-2. Run `zeroclaw doctor` — check connectivity, diagnose issues
+1. Run `$ZC status` — check provider, model, channels
+2. Run `$ZC doctor` — check connectivity, diagnose issues
 3. If gateway needed: `curl -sf http://127.0.0.1:42617/health`
 
 **"Set up a new channel"**
 1. Read the current config: `cat ~/.zeroclaw/config.toml`
 2. Add the channel config (edit the TOML)
-3. Restart: `zeroclaw service restart` (or restart daemon manually)
-4. Verify: `zeroclaw channels doctor`
+3. Restart: `$ZC service restart` (or restart daemon manually)
+4. Verify: `$ZC channels doctor`
 
 **"Switch to a different model"**
-1. Check available: `zeroclaw models list`
-2. Set it: `zeroclaw models set <provider/model>`
-3. Verify: `zeroclaw status`
-4. Test: `zeroclaw agent -a <alias> -m "hello, what model are you?"`
+1. Check available: `$ZC models list`
+2. Set it: `$ZC models set <provider/model>`
+3. Verify: `$ZC status`
+4. Test: `$ZC agent -a <alias> -m "hello, what model are you?"`
 
 ## Gateway Defaults
 
@@ -256,13 +262,13 @@ Only load these when you need precise details beyond what's in this file — for
 
 ## Troubleshooting
 
-**"zeroclaw: command not found"** — Binary not in PATH. Check `./target/release/zeroclaw`, `~/.cargo/bin/zeroclaw`, or build from source with `cargo build --release`.
+**"zrc/zeroclaw: command not found"** — Binary not in PATH. Check `./target/release/zrc`, `./target/release/zeroclaw`, `~/.cargo/bin/zrc`, `~/.cargo/bin/zeroclaw`, or build from source with `cargo build --release`.
 
-**"Connection refused" on REST calls** — Gateway isn't running. Start it with `zeroclaw gateway` or `zeroclaw daemon`.
+**"Connection refused" on REST calls** — Gateway isn't running. Start it with `$ZC gateway` or `$ZC daemon`.
 
 **"Unauthorized" (401/403)** — Bearer token is missing or invalid. Re-pair via `POST /pair` with the pairing code, or check `~/.zeroclaw/config.toml` for the stored token.
 
-**"LLM request failed" (500)** — Provider issue. Run `zeroclaw doctor` to check connectivity. Common causes: expired API key, provider outage, rate limiting on the provider side.
+**"LLM request failed" (500)** — Provider issue. Run `$ZC doctor` to check connectivity. Common causes: expired API key, provider outage, rate limiting on the provider side.
 
 **"Too many requests" (429)** — You're hitting ZeroClaw's rate limit. Back off — the response includes `retry_after` with the number of seconds to wait.
 
@@ -270,6 +276,6 @@ Only load these when you need precise details beyond what's in this file — for
 
 **Memory not persisting** — Check `[memory]` config. If `backend = "none"`, nothing is stored. Switch to `"sqlite"` or `"markdown"`. Also verify `auto_save = true`.
 
-**Channel not responding** — Run `zeroclaw channels doctor` for the specific channel. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
+**Channel not responding** — Run `$ZC channels doctor` for the specific channel. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
 
 Report errors to the user with context appropriate to their expertise level. For beginners, explain what went wrong and suggest the fix. For experts, just show the error and the fix.

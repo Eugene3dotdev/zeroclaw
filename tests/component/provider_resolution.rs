@@ -15,18 +15,37 @@ fn assert_provider_ok(name: &str, key: Option<&str>, url: Option<&str>) {
     );
 }
 
+/// Helper: assert direct provider construction is blocked by runtime policy.
+fn assert_provider_policy_err(name: &str, key: Option<&str>, url: Option<&str>, expected: &str) {
+    let result = create_model_provider_with_url(name, key, url);
+    assert!(
+        result.is_err(),
+        "{name} model_provider should be policy-blocked"
+    );
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains(expected),
+        "error should mention {expected:?}: {err_msg}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory resolution: each major model_provider name resolves without error
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_resolves_openai_provider() {
-    assert_provider_ok("openai", Some("test-key"), None);
+fn factory_rejects_direct_openai_provider_by_policy() {
+    assert_provider_policy_err(
+        "openai",
+        Some("test-key"),
+        None,
+        "Codex CLI/app/Agents SDK/ACP",
+    );
 }
 
 #[test]
-fn factory_resolves_anthropic_provider() {
-    assert_provider_ok("anthropic", Some("test-key"), None);
+fn factory_rejects_direct_anthropic_provider_by_policy() {
+    assert_provider_policy_err("anthropic", Some("test-key"), None, "Claude Code CLI");
 }
 
 #[test]
@@ -197,11 +216,12 @@ fn factory_ollama_with_custom_api_url() {
 }
 
 #[test]
-fn factory_openai_with_custom_api_url() {
-    assert_provider_ok(
+fn factory_rejects_openai_with_custom_api_url_by_policy() {
+    assert_provider_policy_err(
         "openai",
         Some("test-key"),
         Some("https://custom-openai-proxy.example.com/v1"),
+        "Codex CLI/app/Agents SDK/ACP",
     );
 }
 
@@ -212,8 +232,6 @@ fn factory_openai_with_custom_api_url() {
 #[test]
 fn convenience_factory_resolves_major_providers() {
     for provider_name in &[
-        "openai",
-        "anthropic",
         "deepseek",
         "mistral",
         "groq",
@@ -246,13 +264,28 @@ fn convenience_factory_ollama_no_key() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_resolves_openrouter_provider() {
-    assert_provider_ok("openrouter", Some("test-key"), None);
+fn factory_rejects_direct_openrouter_provider_by_policy() {
+    assert_provider_policy_err(
+        "openrouter",
+        Some("test-key"),
+        None,
+        "documented gateway exception",
+    );
 }
 
 #[test]
-fn factory_resolves_gemini_provider() {
-    assert_provider_ok("gemini", Some("test-key"), None);
+fn factory_rejects_direct_gemini_provider_by_policy() {
+    assert_provider_policy_err(
+        "gemini",
+        Some("test-key"),
+        None,
+        "Antigravity / antigravity-cli",
+    );
+}
+
+#[test]
+fn factory_resolves_gemini_cli_provider() {
+    assert_provider_ok("gemini-cli", None, None);
 }
 
 #[test]
@@ -271,13 +304,14 @@ fn factory_resolves_synthetic_provider() {
 }
 
 #[test]
-fn factory_resolves_openai_codex_provider() {
+fn factory_rejects_openai_codex_direct_provider_by_policy() {
     let options = zeroclaw::providers::ModelProviderRuntimeOptions::default();
     let result = create_model_provider_with_options("openai-codex", None, &options);
+    assert!(result.is_err(), "openai-codex should be policy-blocked");
+    let err_msg = result.err().unwrap().to_string();
     assert!(
-        result.is_ok(),
-        "openai-codex model_provider should resolve: {}",
-        result.err().map(|e| e.to_string()).unwrap_or_default()
+        err_msg.contains("Codex CLI/app/Agents SDK/ACP"),
+        "error should mention approved Codex paths: {err_msg}"
     );
 }
 
@@ -402,13 +436,23 @@ fn factory_resolves_ovhcloud_provider() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_google_alias_resolves_to_gemini() {
-    assert_provider_ok("google", Some("test-key"), None);
+fn factory_google_alias_maps_to_policy_blocked_gemini() {
+    assert_provider_policy_err(
+        "google",
+        Some("test-key"),
+        None,
+        "Antigravity / antigravity-cli",
+    );
 }
 
 #[test]
-fn factory_google_gemini_alias_resolves_to_gemini() {
-    assert_provider_ok("google-gemini", Some("test-key"), None);
+fn factory_google_gemini_alias_maps_to_policy_blocked_gemini() {
+    assert_provider_policy_err(
+        "google-gemini",
+        Some("test-key"),
+        None,
+        "Antigravity / antigravity-cli",
+    );
 }
 
 #[test]
@@ -466,10 +510,11 @@ fn factory_ovh_alias_resolves_to_ovhcloud() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn factory_anthropic_custom_endpoint_resolves() {
-    assert_provider_ok(
+fn factory_rejects_anthropic_custom_endpoint_by_policy() {
+    assert_provider_policy_err(
         "anthropic-custom:https://api.example.com",
         Some("test-key"),
         None,
+        "Claude Code CLI",
     );
 }

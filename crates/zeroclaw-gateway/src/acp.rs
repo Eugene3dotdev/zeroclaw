@@ -224,13 +224,17 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     /// On-disk-equivalent of the channels-crate `make_test_config`: a fake
-    /// `anthropic.default` provider (model name only, no key — agent
+    /// `ollama.default` provider (model name only, no key — agent
     /// construction is offline) and one dispatchable agent `test-agent`, with
     /// `config_path` pinned so `agent_workspace_dir` resolves under the temp
     /// install root. Pairing is disabled so the WS client needs no token.
+    ///
+    /// The family is `ollama` rather than `anthropic` because the EugOT runtime
+    /// policy refuses direct Anthropic construction, which would fail agent
+    /// init before this test reaches the workspace resolution it exercises.
     fn front_door_config(install_root: &std::path::Path) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
             RiskProfileConfig, RuntimeProfileConfig,
         };
 
@@ -240,13 +244,14 @@ mod tests {
             ..Config::default()
         };
         cfg.gateway.require_pairing = false;
-        cfg.providers.models.anthropic.insert(
+        cfg.providers.models.ollama.insert(
             "default".to_string(),
-            AnthropicModelProviderConfig {
+            OllamaModelProviderConfig {
                 base: ModelProviderConfig {
-                    model: Some("claude-haiku-4-5".to_string()),
+                    model: Some("test-model".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         cfg.risk_profiles
@@ -256,7 +261,7 @@ mod tests {
         cfg.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
+                model_provider: "ollama.default".into(),
                 risk_profile: "default".into(),
                 runtime_profile: "default".into(),
                 ..Default::default()

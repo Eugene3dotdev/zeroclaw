@@ -7096,8 +7096,8 @@ mod tests {
         {
             let base = providers
                 .models
-                .ensure("openai", "test-provider")
-                .expect("`openai` slot must exist");
+                .ensure("custom", "test-provider")
+                .expect("`custom` slot must exist");
             base.api_key = Some("test-key".into());
             base.model = Some("test-model".into());
             base.uri = Some("http://127.0.0.1:1".into());
@@ -7108,7 +7108,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: "openai.test-provider".into(),
+                model_provider: "custom.test-provider".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },
@@ -9049,8 +9049,8 @@ mod tests {
         let provider = config
             .providers
             .models
-            .ensure("openai", "test-provider")
-            .expect("openai provider slot exists");
+            .ensure("custom", "test-provider")
+            .expect("custom provider slot exists");
         provider.api_key = Some("test-key".into());
         provider.uri = Some("http://127.0.0.1:1".into());
         provider.model = Some("old-model".into());
@@ -9060,7 +9060,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: "openai.test-provider".into(),
+                model_provider: "custom.test-provider".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },
@@ -9150,8 +9150,8 @@ mod tests {
         let other = cfg
             .providers
             .models
-            .ensure("openai", "other-provider")
-            .expect("openai provider slot exists");
+            .ensure("custom", "other-provider")
+            .expect("custom provider slot exists");
         other.api_key = Some("test-key".into());
         other.uri = Some("http://127.0.0.1:1".into());
         other.model = Some("other-model".into());
@@ -9168,7 +9168,7 @@ mod tests {
         let res = dispatcher
             .handle_config_set(&json!({
                 "prop": "agents.test-agent.model_provider",
-                "value": "openai.other-provider"
+                "value": "custom.other-provider"
             }))
             .await;
         assert!(
@@ -9257,8 +9257,8 @@ mod tests {
         let other = cfg
             .providers
             .models
-            .ensure("openai", "other-provider")
-            .expect("openai provider slot exists");
+            .ensure("custom", "other-provider")
+            .expect("custom provider slot exists");
         other.api_key = Some("test-key".into());
         other.uri = Some("http://127.0.0.1:1".into());
         other.model = Some("other-model".into());
@@ -9279,7 +9279,7 @@ mod tests {
             .agents
             .get_mut("test-agent")
             .expect("test agent exists")
-            .model_provider = "openai.other-provider".into();
+            .model_provider = "custom.other-provider".into();
         let refresh_ctx = Arc::clone(&dispatcher.ctx);
         let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
         let refresh_wait = refresh_waiting.notified();
@@ -9302,7 +9302,7 @@ mod tests {
             configure_task_dispatcher
                 .handle_session_configure(&json!({
                     "session_id": configure_session_id,
-                    "overrides": { "model_provider": "openai.test-provider" }
+                    "overrides": { "model_provider": "custom.test-provider" }
                 }))
                 .await
         });
@@ -9328,7 +9328,7 @@ mod tests {
                 .get_overrides(&session_id)
                 .await
                 .and_then(|overrides| overrides.model_provider),
-            Some("openai.test-provider".to_string())
+            Some("custom.test-provider".to_string())
         );
     }
 
@@ -9343,8 +9343,8 @@ mod tests {
             let provider = cfg
                 .providers
                 .models
-                .ensure("openai", alias)
-                .expect("openai provider slot exists");
+                .ensure("custom", alias)
+                .expect("custom provider slot exists");
             provider.api_key = Some("test-key".into());
             provider.uri = Some("http://127.0.0.1:1".into());
             provider.model = Some(model.into());
@@ -9366,7 +9366,7 @@ mod tests {
             .agents
             .get_mut("test-agent")
             .expect("test agent exists")
-            .model_provider = "openai.other-provider".into();
+            .model_provider = "custom.other-provider".into();
         let release_older_refresh = Arc::new(tokio::sync::Notify::new());
         let older_release = Arc::clone(&release_older_refresh);
         let older_ctx = Arc::clone(&dispatcher.ctx);
@@ -9382,7 +9382,7 @@ mod tests {
             .agents
             .get_mut("test-agent")
             .expect("test agent exists")
-            .model_provider = "openai.latest-provider".into();
+            .model_provider = "custom.latest-provider".into();
         let latest_ctx = Arc::clone(&dispatcher.ctx);
         let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
         let latest_wait = latest_waiting.notified();
@@ -9483,7 +9483,7 @@ mod tests {
 
         let res = dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
+                "prop": "providers.models.custom.test-provider.model",
                 "value": "new-model"
             }))
             .await;
@@ -9504,7 +9504,7 @@ mod tests {
 
         let res = dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
+                "prop": "providers.models.custom.test-provider.model",
                 "value": ""
             }))
             .await;
@@ -9516,7 +9516,7 @@ mod tests {
         let stored = cfg
             .providers
             .models
-            .openai
+            .custom
             .get("test-provider")
             .and_then(|e| e.base.model.clone());
         assert_eq!(
@@ -9651,7 +9651,7 @@ mod tests {
 
         let res = dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.temperature",
+                "prop": "providers.models.custom.test-provider.temperature",
                 "value": 0.4
             }))
             .await;
@@ -9681,7 +9681,7 @@ mod tests {
 
         let res = dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
+                "prop": "providers.models.custom.test-provider.model",
                 "value": "new-model"
             }))
             .await;
@@ -9707,7 +9707,7 @@ mod tests {
 
         let res = dispatcher
             .handle_config_delete(&json!({
-                "prop": "providers.models.openai.test-provider.temperature",
+                "prop": "providers.models.custom.test-provider.temperature",
             }))
             .await;
         assert!(res.is_ok(), "config/delete must succeed: {res:?}");

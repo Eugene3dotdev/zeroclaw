@@ -29,6 +29,31 @@ const SAFE_ENV_VARS: &[&str] = &[
     "TMPDIR",
 ];
 
+fn is_forbidden_provider_env(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "ANTHROPIC_API_KEY"
+            | "ANTHROPIC_AUTH_TOKEN"
+            | "ANTHROPIC_BASE_URL"
+            | "ANTHROPIC_AWS_API_KEY"
+            | "ANTHROPIC_AWS_BASE_URL"
+            | "ANTHROPIC_VERTEX_BASE_URL"
+            | "ANTHROPIC_FOUNDRY_API_KEY"
+            | "ANTHROPIC_FOUNDRY_BASE_URL"
+            | "ANTHROPIC_BEDROCK_BASE_URL"
+            | "CLAUDE_API_KEY"
+            | "CLAUDE_BASE_URL"
+    )
+}
+
+/// Delegates coding tasks to the Claude Code CLI (`claude -p`).
+///
+/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
+/// tasks and delegates complex coding work to Claude Code, which has its own
+/// agent loop with Read/Edit/Bash tools.
+///
+/// Authentication uses the `claude` binary's own approved session. Direct
+/// Anthropic API-key env passthrough is blocked by runtime policy.
 pub struct ClaudeCodeTool {
     security: Arc<SecurityPolicy>,
     config: ClaudeCodeConfig,
@@ -210,6 +235,16 @@ impl Tool for ClaudeCodeTool {
         cmd.arg("-p").arg(prompt);
         cmd.arg("--output-format").arg("json");
 
+        let model = self.config.model.trim();
+        if !model.is_empty() {
+            cmd.arg("--model").arg(model);
+        }
+
+        let effort = self.config.effort.trim();
+        if !effort.is_empty() {
+            cmd.arg("--effort").arg(effort);
+        }
+
         if !allowed_tools.is_empty() {
             for tool in &allowed_tools {
                 cmd.arg("--allowedTools").arg(tool);
@@ -227,6 +262,26 @@ impl Tool for ClaudeCodeTool {
         if let Some(schema) = json_schema {
             let schema_str = serde_json::to_string(schema).unwrap_or_else(|_| "{}".to_string());
             cmd.arg("--json-schema").arg(schema_str);
+        }
+
+        // Direct Anthropic credential passthrough is rejected before the
+        // environment is populated so no forbidden variable can reach the
+        // subprocess. HOME stays in SAFE_ENV_VARS so `claude` still finds its
+        // approved session in ~/.claude/.
+        if let Some(blocked) = self
+            .config
+            .env_passthrough
+            .iter()
+            .map(|var| var.trim())
+            .find(|var| is_forbidden_provider_env(var))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "env_passthrough entry `{blocked}` is blocked: Claude-family runtimes must use Claude Code CLI session auth, not direct Anthropic API credentials."
+                )),
+            });
         }
 
         add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
@@ -452,6 +507,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn claude_code_rejects_direct_provider_env_passthrough() {
+        let mut config = test_config();
+        config.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        let tool = ClaudeCodeTool::new(test_security(AutonomyLevel::Full), config);
+        let result = tool
+            .execute(json!({"prompt": "hello"}))
+            .await
+            .expect("policy rejection should return a result");
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
+    }
+
+    #[test]
+    fn claude_code_blocks_anthropic_auth_env_names() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_AWS_API_KEY",
+            "ANTHROPIC_VERTEX_BASE_URL",
+            "ANTHROPIC_FOUNDRY_API_KEY",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+        ] {
+            assert!(is_forbidden_provider_env(name), "{name} must be blocked");
+        }
+        assert!(!is_forbidden_provider_env("PATH"));
+    }
+
     #[test]
     fn claude_code_default_config_values() {
         let config = ClaudeCodeConfig::default();
@@ -460,6 +543,8 @@ mod tests {
         assert_eq!(config.max_output_bytes, 2_097_152);
         assert!(config.system_prompt.is_none());
         assert_eq!(config.allowed_tools, vec!["Read", "Edit", "Bash", "Write"]);
+        assert_eq!(config.model, "claude-opus-4-8");
+        assert_eq!(config.effort, "xhigh");
     }
 
     #[test]

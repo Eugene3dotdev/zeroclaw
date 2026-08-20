@@ -1635,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
+    fn websocket_handler_projects_empty_terminal_stream_as_user_error() {
         // This production-shaped fixture exceeds the Linux test harness's
         // default stack; isolate only this test instead of weakening CI-wide
         // stack limits or dropping the real WebSocket boundary coverage.
@@ -1647,41 +1647,47 @@ mod tests {
                     .enable_all()
                     .build()
                     .expect("test runtime")
-                    .block_on(websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner());
+                    .block_on(
+                        websocket_handler_projects_empty_terminal_stream_as_user_error_inner(),
+                    );
             })
             .expect("spawn WebSocket regression thread")
             .join()
             .expect("WebSocket regression thread must not panic");
     }
 
-    async fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner() {
+    async fn websocket_handler_projects_empty_terminal_stream_as_user_error_inner() {
         // This is a real WebSocket upgrade and a real agent built from live
-        // config. The local Anthropic-shaped server completes an empty SSE
+        // config. The local OpenAI-compatible server completes an empty SSE
         // response, then returns an empty non-stream fallback, exercising the
         // production path through `process_chat_message` to the client.
+        //
+        // The fixture speaks the OpenAI-compatible wire rather than Anthropic's
+        // because the EugOT runtime policy refuses direct Anthropic
+        // construction; an anthropic alias would fail agent init and never
+        // reach the empty-terminal projection this test covers.
         let mock_app = Router::new().route(
-            "/v1/messages",
+            "/chat/completions",
             post(|Json(request): Json<serde_json::Value>| async move {
                 if request["stream"].as_bool() == Some(true) {
                     (
                         [(header::CONTENT_TYPE, "text/event-stream")],
-                        "event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
-event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
-event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n\n",
+                        "data: {\"id\":\"cmpl_test\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl_test\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n",
                     )
                         .into_response()
                 } else {
                     Json(serde_json::json!({
-                        "id": "msg_test",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "claude-test",
-                        "content": [],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                        "id": "cmpl_test",
+                        "object": "chat.completion",
+                        "model": "fixture-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}
                     }))
                     .into_response()
                 }
@@ -1689,12 +1695,12 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
         let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind local Anthropic fixture");
+            .expect("bind local provider fixture");
         let mock_addr = mock_listener.local_addr().expect("fixture address");
         let mock_server = zeroclaw_spawn::spawn!(async move {
             axum::serve(mock_listener, mock_app)
                 .await
-                .expect("local Anthropic fixture serves");
+                .expect("local provider fixture serves");
         });
 
         let tmp = tempfile::tempdir().expect("temporary gateway workspace");
@@ -1707,13 +1713,16 @@ data: {\"type\":\"message_stop\"}\n\n",
         };
         config.memory.backend = "none".to_string();
         config.reliability.provider_retries = 0;
-        config.providers.models.anthropic.insert(
+        // A `custom` provider rather than `anthropic`: the EugOT runtime policy
+        // refuses direct Anthropic construction, so an anthropic fixture would
+        // fail agent init and never reach the empty-terminal path under test.
+        config.providers.models.custom.insert(
             "fixture".to_string(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
+            zeroclaw_config::schema::CustomModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
                     api_key: Some("test-key".to_string()),
                     uri: Some(format!("http://{mock_addr}")),
-                    model: Some("claude-test".to_string()),
+                    model: Some("fixture-test".to_string()),
                     ..Default::default()
                 },
             },
@@ -1729,7 +1738,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         config.agents.insert(
             "web".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.fixture".into(),
+                model_provider: "custom.fixture".into(),
                 risk_profile: "fixture".into(),
                 runtime_profile: "fixture".into(),
                 workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {

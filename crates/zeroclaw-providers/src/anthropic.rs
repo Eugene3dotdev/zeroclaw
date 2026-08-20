@@ -5011,65 +5011,42 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// Upstream asserts here that the factory forwards `provider_timeout_secs`
+    /// into a natively constructed Anthropic provider. The EugOT runtime policy
+    /// refuses direct Anthropic construction outright, so that path cannot be
+    /// reached in this fork and the refusal is what must hold instead. Generic
+    /// factory timeout forwarding stays covered on an allowed family by
+    /// `factory::tests::responses_factory_forwards_timeout_secs_to_responses_provider`.
     #[tokio::test]
-    async fn anthropic_factory_forwards_timeout_to_native_provider() {
+    async fn anthropic_factory_native_provider_is_policy_blocked() {
         use crate::ModelProviderRuntimeOptions;
         use crate::factory::FamilyProviderFactory;
-        use axum::{Json, Router, routing::post};
-        use serde_json::json;
-        use tokio::time::{Duration, Instant};
         use zeroclaw_config::schema::AnthropicModelProviderConfig;
-
-        async fn slow_messages() -> Json<serde_json::Value> {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            Json(json!({
-                "id": "msg_late",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "too late"}],
-                "model": "claude-sonnet-4-5",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            }))
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("test server addr");
-        let app = Router::new().route("/v1/messages", post(slow_messages));
-        let server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.expect("serve test server");
-        });
 
         let opts = ModelProviderRuntimeOptions {
             provider_timeout_secs: Some(1),
             ..Default::default()
         };
-        let provider = AnthropicModelProviderConfig::default()
-            .create_provider(
-                "native",
-                Some("test-key"),
-                Some(&format!("http://{addr}")),
-                &opts,
-            )
-            .expect("anthropic provider should build");
 
-        let started = Instant::now();
-        let result = provider
-            .chat_with_system(None, "hello", "claude-sonnet-4-5", Some(0.7))
-            .await;
-        let elapsed = started.elapsed();
-
-        server.abort();
+        // `create_provider` yields a boxed trait object that is not `Debug`, so
+        // the Ok arm is rejected by hand rather than through `expect_err`.
+        let message = match AnthropicModelProviderConfig::default().create_provider(
+            "native",
+            Some("test-key"),
+            Some("http://127.0.0.1:1"),
+            &opts,
+        ) {
+            Ok(_) => panic!("EugOT runtime policy must refuse direct Anthropic construction"),
+            Err(err) => err.to_string(),
+        };
 
         assert!(
-            result.is_err(),
-            "slow response should time out when factory forwards provider_timeout_secs"
+            message.contains("EugOT runtime policy"),
+            "refusal must attribute itself to the policy, got: {message}"
         );
         assert!(
-            elapsed < Duration::from_secs(3),
-            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+            message.contains("native"),
+            "refusal must name the offending alias, got: {message}"
         );
     }
 
