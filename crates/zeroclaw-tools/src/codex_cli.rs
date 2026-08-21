@@ -17,15 +17,16 @@ const SAFE_ENV_VARS: &[&str] = &[
 ];
 
 fn is_forbidden_provider_env(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
     matches!(
-        name.trim().to_ascii_uppercase().as_str(),
+        upper.as_str(),
         "OPENAI_API_KEY"
             | "OPENAI_BASE_URL"
             | "OPENAI_ORG_ID"
             | "OPENAI_PROJECT_ID"
             | "CODEX_API_KEY"
             | "CODEX_ACCESS_TOKEN"
-    )
+    ) || upper.starts_with("CODEX_")
 }
 
 /// Delegates coding tasks to the Codex CLI (`codex exec`).
@@ -35,7 +36,7 @@ fn is_forbidden_provider_env(name: &str) -> bool {
 /// agent loop with file editing and shell tools.
 ///
 /// Authentication uses the `codex` binary's own approved session. Direct
-/// OpenAI API-key env passthrough is blocked by runtime policy.
+/// OpenAI/Codex credential and routing env passthrough is blocked by runtime policy.
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
     config: CodexCliConfig,
@@ -471,8 +472,12 @@ mod tests {
         for variable in [
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
+            "OPENAI_ORG_ID",
+            "OPENAI_PROJECT_ID",
             "CODEX_API_KEY",
             "CODEX_ACCESS_TOKEN",
+            "CODEX_HOME",
+            "CODEX_BASE_URL",
         ] {
             let mut config = test_config();
             config.env_passthrough = vec![variable.into()];
@@ -484,6 +489,28 @@ mod tests {
             assert!(!result.success, "expected {variable} to be blocked");
             assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
         }
+    }
+
+    #[test]
+    fn codex_cli_forbidden_provider_env_is_normalized_and_scoped() {
+        for variable in [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_ORG_ID",
+            "OPENAI_PROJECT_ID",
+            "CODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_HOME",
+            "CODEX_BASE_URL",
+            " openai_api_key ",
+            " codex_home ",
+        ] {
+            assert!(
+                is_forbidden_provider_env(variable),
+                "expected {variable:?} to be blocked"
+            );
+        }
+        assert!(!is_forbidden_provider_env("PATH"));
     }
 
     #[test]

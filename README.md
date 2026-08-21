@@ -72,7 +72,7 @@ zeroclaw service install          # register as systemd/launchctl/Windows Servic
 zeroclaw service start            # run it always-on in the background
 ```
 
-`zeroclaw` remains equivalent for existing scripts; `zrc` is the preferred EugOT fork alias when command names collide with another installed ZeroClaw package.
+`zrc` remains available as a shorter EugOT fork alias; use it when command names collide with another installed ZeroClaw package.
 
 Full walkthrough: [Quick start](docs/book/src/getting-started/quickstart.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
 
