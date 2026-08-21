@@ -101,6 +101,9 @@ native_tools = true
 [agents.default]
 model_provider = "custom.cliproxyapi"
 risk_profile = "supervised"
+
+[risk_profiles.supervised]
+level = "supervised"
 ```
 
 Inject the local gateway token at process start (never commit it). Schema-mirror

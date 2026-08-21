@@ -19,7 +19,12 @@ const SAFE_ENV_VARS: &[&str] = &[
 fn is_forbidden_provider_env(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_uppercase().as_str(),
-        "OPENAI_API_KEY" | "OPENAI_BASE_URL" | "OPENAI_ORG_ID" | "OPENAI_PROJECT_ID"
+        "OPENAI_API_KEY"
+            | "OPENAI_BASE_URL"
+            | "OPENAI_ORG_ID"
+            | "OPENAI_PROJECT_ID"
+            | "CODEX_API_KEY"
+            | "CODEX_ACCESS_TOKEN"
     )
 }
 
@@ -463,15 +468,22 @@ mod tests {
 
     #[tokio::test]
     async fn codex_cli_rejects_direct_provider_env_passthrough() {
-        let mut config = test_config();
-        config.env_passthrough = vec!["OPENAI_API_KEY".into()];
-        let tool = CodexCliTool::new(test_security(AutonomyLevel::Full), config);
-        let result = tool
-            .execute(json!({"prompt": "hello"}))
-            .await
-            .expect("policy rejection should return a result");
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
+        for variable in [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "CODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+        ] {
+            let mut config = test_config();
+            config.env_passthrough = vec![variable.into()];
+            let tool = CodexCliTool::new(test_security(AutonomyLevel::Full), config);
+            let result = tool
+                .execute(json!({"prompt": "hello"}))
+                .await
+                .expect("policy rejection should return a result");
+            assert!(!result.success, "expected {variable} to be blocked");
+            assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
+        }
     }
 
     #[test]

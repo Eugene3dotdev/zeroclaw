@@ -66,10 +66,10 @@ Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/b
 ## Quick start
 
 ```bash
-zrc quickstart                    # one-shot setup: pick a provider, write a working config
-zrc agent -a <alias>              # interactive chat using the [agents.<alias>] entry
-zrc service install               # register as systemd/launchctl/Windows Service
-zrc service start                 # run it always-on in the background
+zeroclaw quickstart               # one-shot setup: pick a provider, write a working config
+zeroclaw agent -a <alias>         # interactive chat using the [agents.<alias>] entry
+zeroclaw service install          # register as systemd/launchctl/Windows Service
+zeroclaw service start            # run it always-on in the background
 ```
 
 `zeroclaw` remains equivalent for existing scripts; `zrc` is the preferred EugOT fork alias when command names collide with another installed ZeroClaw package.

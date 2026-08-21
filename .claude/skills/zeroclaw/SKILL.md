@@ -82,7 +82,7 @@ This produces `target/release/zeroclaw` and, in the EugOT fork, `target/release/
 
 You can also run directly without a separate build step:
 ```bash
-cargo run --release -- <subcommand> [args]
+cargo run --release --bin zeroclaw -- <subcommand> [args]
 ```
 
 Before building, `cargo check` gives a quick compile validation without the full build.
