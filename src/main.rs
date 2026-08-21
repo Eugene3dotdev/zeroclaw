@@ -37,10 +37,78 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dialoguer::{Password, Select};
+use dialoguer::Select;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::{BufRead, ErrorKind, Read, Write};
+
+const STDIN_LINE_CAP: usize = 1024 * 1024;
+
+/// Result of [`read_capped_line`].
+#[cfg(not(feature = "agent-runtime"))]
+#[derive(Debug)]
+enum CappedLine {
+    /// A full line under the cap, with the trailing `\n` stripped.
+    Line(String),
+    /// The physical line exceeded `cap`. The remainder has been drained
+    /// and must not be used as a prompt.
+    Truncated,
+    /// EOF with no bytes read.
+    Eof,
+}
+
+#[cfg(not(feature = "agent-runtime"))]
+fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take((cap + 1) as u64);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
+    let truncated = raw.len() > cap;
+    if truncated {
+        let mut inner = limited.into_inner();
+        discard_until_newline(&mut inner)?;
+        return Ok(CappedLine::Truncated);
+    } else if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.is_empty() {
+        return Ok(CappedLine::Eof);
+    }
+    Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
+}
+
+/// Truncate `line` in place to at most `cap` bytes, rounding the cut down to a
+/// UTF-8 char boundary. `String::truncate` panics when the byte index lands
+/// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
+/// is a latent panic. No-op when the string already fits.
+fn cap_line_utf8_safe(line: &mut String, cap: usize) {
+    if line.len() > cap {
+        line.truncate(line.floor_char_boundary(cap));
+    }
+}
+
+/// Discard bytes from `reader` until the next `\n` or EOF, using only
+/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
+/// that `read_until(..., &mut Vec::new())` would incur on an oversized
+/// physical line, and it stops exactly at the newline so the next line
+/// is not consumed.
+#[cfg(not(feature = "agent-runtime"))]
+fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        reader.consume(len);
+    }
+}
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -69,6 +137,47 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     {
         fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
+}
+
+/// Interactive secret prompt with pre-submit feedback.
+///
+/// The value stays hidden, but the prompt shows a bounded mask once the input
+/// buffer becomes non-empty.
+#[cfg(feature = "agent-runtime")]
+fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(ta(
+            "cli-secret-needs-tty",
+            &[],
+            "Secret input requires a terminal on stdin and stderr."
+        ));
+    }
+
+    let value = cli_input::SecretInput::new()
+        .with_prompt(prompt_text)
+        .interact()?;
+    if allow_empty || !value.trim().is_empty() {
+        Ok(value)
+    } else {
+        bail!(ta("cli-secret-empty", &[], "Value cannot be empty."))
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn qta(key: &str, args: &[(&str, &str)]) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
+    qta(key, &[("glyph", glyph), ("summary", summary)])
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
+    t(step.label_key(), step.label())
 }
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
@@ -100,18 +209,25 @@ fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
     path: &str,
+    op_index: usize,
+    json: bool,
 ) -> Result<String> {
     let kind = config_patch_prop_kind(config, path);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind).map_err(|e| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"path": path, "error": e.message.clone()})),
-            "config patch coercion rejected JSON value"
-        );
-        anyhow::Error::msg(e.message)
-    })
+    match zeroclaw_config::typed_value::coerce_for_set_prop(value, kind) {
+        Ok(value_str) => Ok(value_str),
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"path": path, "error": err.message.clone()})),
+                "config patch coercion rejected JSON value"
+            );
+            let err = err.with_path(path).with_op_index(op_index);
+            let human = err.message.clone();
+            config_patch_fail_json_or_human(json, err, human)
+        }
+    }
 }
 
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
@@ -160,7 +276,9 @@ where
 }
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
-    let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    let t: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid temperature '{s}': {e}"))?;
     config::schema::validate_temperature(t)
 }
 
@@ -208,12 +326,25 @@ fn pause_after_no_command_help() {
     println!();
     print!("{}", t("cli-press-enter", "Press Enter to exit..."));
     let _ = std::io::stdout().flush();
+    // Cap the read so a piped-in flood (e.g. `dir | zeroclaw` with no
+    // command) cannot blow up RSS in this trivial one-Enter prompt.
+    // See module-level `STDIN_LINE_CAP` for rationale.
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
+    let _ = std::io::stdin()
+        .lock()
+        .take((STDIN_LINE_CAP + 1) as u64)
+        .read_line(&mut line);
+    if line.len() > STDIN_LINE_CAP {
+        // Round down to a UTF-8 char boundary before truncating: a piped
+        // multi-byte payload can land the byte cap inside a character, and
+        // `String::truncate` panics on a non-boundary index.
+        cap_line_utf8_safe(&mut line, STDIN_LINE_CAP);
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
 mod agent;
+mod alias_cli;
 #[cfg(feature = "agent-runtime")]
 mod approval;
 #[cfg(feature = "agent-runtime")]
@@ -266,10 +397,14 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_registry;
+#[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
 #[cfg(feature = "agent-runtime")]
 mod security;
+#[cfg(feature = "agent-runtime")]
+mod security_status;
 #[cfg(feature = "agent-runtime")]
 mod service;
 #[cfg(feature = "agent-runtime")]
@@ -293,9 +428,10 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillBundleCommands, SkillCommands,
-    SopCommands,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
+    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
+    SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -376,12 +512,33 @@ impl LogLevel {
     }
 }
 
+/// Subcommands for `zeroclaw eval`.
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum EvalCommands {
+    /// Run a suite of evaluation cases.
+    Run {
+        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        #[arg(long)]
+        suite: Option<String>,
+
+        /// Execution mode: `replay` (deterministic) or `live` (later phase).
+        /// Defaults to config `[eval] mode`.
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: commands::eval::OutputFormat,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
-    /// path. Non-interactive in this build: writes balanced defaults
-    /// for risk/runtime/memory and prints next-step instructions.
+    /// path. Interactive: the flags below pre-seed checklist selectors
+    /// but do not skip them; a terminal is required.
     Quickstart {
         /// Provider type (anthropic / openai / openrouter / ollama).
         #[arg(long)]
@@ -603,17 +760,13 @@ Examples:
         format: Option<String>,
     },
 
-    /// Engage, inspect, and resume emergency-stop states.
-    ///
-    /// Examples:
-    /// - `zeroclaw estop`
-    /// - `zeroclaw estop --level network-kill`
-    /// - `zeroclaw estop --level domain-block --domain "*.chase.com"`
-    /// - `zeroclaw estop --level tool-freeze --tool shell --tool browser`
-    /// - `zeroclaw estop status`
-    /// - `zeroclaw estop resume --network`
-    /// - `zeroclaw estop resume --domain "*.chase.com"`
-    /// - `zeroclaw estop resume --tool shell`
+    /// Inspect the active security posture derived from local config and host detection
+    #[cfg(feature = "agent-runtime")]
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
+    },
+
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
@@ -647,12 +800,12 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
+  zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+  zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
   zeroclaw cron pause TASK_ID
   zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -666,8 +819,10 @@ Examples:
         model_command: ModelCommands,
     },
 
-    /// List supported AI model_providers
-    Providers,
+    Providers {
+        #[command(subcommand)]
+        providers_command: Option<ProvidersCommands>,
+    },
 
     /// Manage channels (telegram, discord, slack)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -688,6 +843,19 @@ Examples:
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
+    },
+
+    /// Manage agent aliases (create/list/rename/delete). Distinct from `agent`,
+    /// which runs an agent.
+    Agents {
+        #[command(subcommand)]
+        agents_command: AgentsCommands,
+    },
+
+    /// Manage channel aliases (create/list/rename/delete)
+    Channels {
+        #[command(subcommand)]
+        channels_command: ChannelsCommands,
     },
 
     /// Browse 50+ integrations
@@ -817,6 +985,7 @@ Examples:
   zeroclaw config set channels.matrix.access-token      # secret: masked input
   zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
   zeroclaw config init channels.matrix                  # init section with defaults
+  zeroclaw config init risk_profiles.strict             # create a new dynamic-map alias
   zeroclaw config schema                                # print JSON Schema to stdout
   zeroclaw config schema > schema.json
 
@@ -848,12 +1017,15 @@ Examples:
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
-        /// Skip confirmation prompt
+        /// Install even if the target is not newer (reinstall or downgrade/pin to --version)
         #[arg(long)]
         force: bool,
         /// Target version (default: latest)
         #[arg(long)]
         version: Option<String>,
+        /// With --check, emit machine-readable JSON instead of human text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run diagnostic self-tests
@@ -872,6 +1044,25 @@ Examples:
         /// Run quick checks only (no network)
         #[arg(long)]
         quick: bool,
+    },
+
+    #[cfg(feature = "agent-runtime")]
+    /// Run the agent evaluation harness
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Run the agent evaluation harness.
+
+Phase 0 supports deterministic replay: every `*.json` trace fixture in the suite \
+directory is replayed through the real agent loop and graded against its declarative \
+expectations. No network calls, fully deterministic. Exits non-zero if any case fails, \
+so it can gate CI.
+
+Examples:
+  zeroclaw eval run                                  # replay ./evals
+  zeroclaw eval run --suite evals --format json")]
+    Eval {
+        #[command(subcommand)]
+        eval_command: EvalCommands,
     },
 
     /// Generate shell completion script to stdout
@@ -971,12 +1162,6 @@ enum LocalesCommands {
     },
 }
 
-// `zeroclaw onboard <section>` parses its positional subcommand into
-// `zeroclaw_config::sections::Section` directly via clap's
-// `Subcommand` derive (gated on the `clap` feature there). No mirror
-// enum, no parallel variant list — the canonical `Section` enum IS
-// the clap surface.
-
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
 /// `zeroclaw props <anything>` and print a deprecation message.
 #[derive(Subcommand, Debug)]
@@ -1041,6 +1226,20 @@ fn apply_homebrew_onboard_config_dir() {
     );
 }
 
+#[cfg(feature = "agent-runtime")]
+fn quickstart_runtime_profile_for_provider(
+    provider_type: &str,
+    providers: &[zeroclaw_runtime::quickstart::QuickstartTypeOption],
+    default_runtime_profile: &str,
+) -> String {
+    providers
+        .iter()
+        .find(|provider| provider.kind == provider_type)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .unwrap_or(default_runtime_profile)
+        .to_string()
+}
+
 /// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
 ///
 /// Mirrors the TUI Quickstart pane's structure: a single screen
@@ -1071,7 +1270,7 @@ async fn run_quickstart_cli(
     api_key: Option<String>,
     agent: Option<String>,
 ) -> anyhow::Result<()> {
-    use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
+    use dialoguer::{Confirm, Editor, FuzzySelect, Input};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
         RISK_PRESETS, SelectorChoice,
@@ -1081,12 +1280,20 @@ async fn run_quickstart_cli(
         snapshot_state,
     };
 
-    // ── Form state ──────────────────────────────────────────────
-    //
-    // Every field is `Option<…>` and starts `None`. A selector is
-    // `[✓]` iff its constituent fields are all `Some(_)` and
-    // non-empty. The form is mutated by the selector sub-flows and
-    // read by the main checklist render loop.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    {
+        anyhow::bail!(
+            "{}",
+            t(
+                "cli-quickstart-needs-tty",
+                "Quickstart is interactive and needs a terminal on stdin and stderr. \
+                 Run it from an interactive shell, or use \
+                 `zeroclaw config set <path> <value>` for headless configuration."
+            )
+        );
+    }
+
     #[derive(Default)]
     struct Form {
         provider: Option<ProviderChoice>,
@@ -1188,22 +1395,20 @@ async fn run_quickstart_cli(
 
     let mut form = Form::default();
 
-    // ── Seed from flags (silent — no UI hit) ────────────────────
-    //
-    // Flag-seeded values are recorded into the form so the
-    // selector renders `[✓]` immediately, but only when the seed
-    // is enough to satisfy the selector on its own. A bare
-    // `--model-provider anthropic` without `--model` cannot
-    // produce a complete `ProviderChoice::Fresh`, so it is
-    // discarded rather than left half-built — the user opens the
-    // selector and starts fresh.
     if let (Some(mp), Some(m)) = (model_provider.as_deref(), model.as_deref())
-        && let Some(found) = providers.iter().find(|p| p.kind.eq_ignore_ascii_case(mp))
+        && let Some((canonical_provider, codex_auth)) =
+            zeroclaw_runtime::quickstart::resolve_model_provider_type(mp)
+        && let Some(found) = providers
+            .iter()
+            .find(|p| p.kind.eq_ignore_ascii_case(canonical_provider))
     {
-        let needs_key = !found.local && api_key.is_none();
+        let needs_key = !found.local && api_key.is_none() && !codex_auth;
         if !needs_key {
             let mut fields: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            if codex_auth {
+                fields.insert("auth_mode".to_string(), "codex".to_string());
+            }
             if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
                 // Submission field keys are snake_case (`api_key`) — the apply
                 // path round-trips them verbatim into `set_prop_persistent`,
@@ -1257,35 +1462,46 @@ async fn run_quickstart_cli(
         // Render selector list with current status / summary.
         let glyph = |ok: bool| if ok { "[✓]" } else { "[ ]" };
         let provider_summary = match &form.provider {
-            None => "not yet chosen".to_string(),
+            None => t("cli-quickstart-summary-not-yet-chosen", "not yet chosen"),
             Some(ProviderChoice::Fresh {
                 display_name,
                 alias,
                 model,
                 ..
-            }) => format!("{display_name} (alias: {alias}, model: {model})"),
-            Some(ProviderChoice::Existing { alias_ref }) => {
-                format!("use existing {alias_ref}")
-            }
+            }) => qta(
+                "cli-quickstart-summary-provider-fresh",
+                &[("name", display_name), ("alias", alias), ("model", model)],
+            ),
+            Some(ProviderChoice::Existing { alias_ref }) => qta(
+                "cli-quickstart-summary-use-existing",
+                &[("reference", alias_ref)],
+            ),
         };
         let preset_summary = |p: &Option<PresetChoice>| -> String {
             match p {
-                None => "not yet chosen".to_string(),
-                Some(PresetChoice::Fresh(name)) => format!("preset: {name}"),
-                Some(PresetChoice::Existing(a)) => format!("use existing {a}"),
+                None => t("cli-quickstart-summary-not-yet-chosen", "not yet chosen"),
+                Some(PresetChoice::Fresh(name)) => {
+                    qta("cli-quickstart-summary-preset-fresh", &[("name", name)])
+                }
+                Some(PresetChoice::Existing(a)) => {
+                    qta("cli-quickstart-summary-use-existing", &[("reference", a)])
+                }
             }
         };
         let memory_summary = match &form.memory {
-            None => "not yet chosen".to_string(),
+            None => t("cli-quickstart-summary-not-yet-chosen", "not yet chosen"),
             Some(kind) => serde_json::to_value(kind)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{kind:?}").to_lowercase()),
         };
         let channels_summary = if !form.channels_visited {
-            "not yet visited".to_string()
+            t("cli-quickstart-summary-not-yet-visited", "not yet visited")
         } else if form.channels.is_empty() {
-            "none (chat via `zeroclaw agent` only)".to_string()
+            t(
+                "cli-quickstart-summary-channels-none",
+                "none (chat via `zeroclaw agent` only)",
+            )
         } else {
             form.channels
                 .iter()
@@ -1297,16 +1513,21 @@ async fn run_quickstart_cli(
                 .join(", ")
         };
         let agent_summary = match &form.agent {
-            None => "not yet named".to_string(),
-            Some(a) => format!(
-                "alias: {}, system prompt: {} chars, {} personality file(s)",
-                a.name,
-                a.system_prompt.len(),
-                a.personality_files.len(),
+            None => t("cli-quickstart-summary-not-yet-named", "not yet named"),
+            Some(a) => qta(
+                "cli-quickstart-summary-agent",
+                &[
+                    ("alias", &a.name),
+                    ("chars", &a.system_prompt.len().to_string()),
+                    ("files", &a.personality_files.len().to_string()),
+                ],
             ),
         };
         let peer_groups_summary = if form.peer_groups.is_empty() {
-            "none — channels accept no peers".to_string()
+            t(
+                "cli-quickstart-summary-peer-groups-none",
+                "none — channels accept no peers",
+            )
         } else {
             form.peer_groups
                 .iter()
@@ -1315,38 +1536,47 @@ async fn run_quickstart_cli(
                 .join(", ")
         };
 
+        let risk_summary = preset_summary(&form.risk);
         let mut labels: Vec<String> = vec![
-            format!(
-                "{} Model provider     — {provider_summary}",
-                glyph(form.provider_done())
+            quickstart_row(
+                "cli-quickstart-row-model-provider",
+                glyph(form.provider_done()),
+                &provider_summary,
             ),
-            format!(
-                "{} Risk profile       — {}",
+            quickstart_row(
+                "cli-quickstart-row-risk-profile",
                 glyph(form.risk_done()),
-                preset_summary(&form.risk)
+                &risk_summary,
             ),
-            format!(
-                "{} Memory             — {memory_summary}",
-                glyph(form.memory_done())
+            quickstart_row(
+                "cli-quickstart-row-memory",
+                glyph(form.memory_done()),
+                &memory_summary,
             ),
-            format!(
-                "{} Channels (0..N)    — {channels_summary}",
-                glyph(form.channels_done())
+            quickstart_row(
+                "cli-quickstart-row-channels",
+                glyph(form.channels_done()),
+                &channels_summary,
             ),
-            format!(
-                "{} Peer groups        — {peer_groups_summary}",
-                glyph(form.peer_groups_done())
+            quickstart_row(
+                "cli-quickstart-row-peer-groups",
+                glyph(form.peer_groups_done()),
+                &peer_groups_summary,
             ),
-            format!(
-                "{} Agent identity     — {agent_summary}",
-                glyph(form.agent_done())
+            quickstart_row(
+                "cli-quickstart-row-agent-identity",
+                glyph(form.agent_done()),
+                &agent_summary,
             ),
         ];
         let create_enabled = form.all_done();
         labels.push(if create_enabled {
-            "── Create agent".to_string()
+            t("cli-quickstart-create-agent", "── Create agent")
         } else {
-            "── Create agent (locked — fill every selector first)".to_string()
+            t(
+                "cli-quickstart-create-agent-locked",
+                "── Create agent (locked — fill every selector first)",
+            )
         });
 
         let actions = [
@@ -1360,7 +1590,10 @@ async fn run_quickstart_cli(
         ];
 
         let pick = FuzzySelect::new()
-            .with_prompt("Open a selector (Enter), or pick Create. Esc to quit.")
+            .with_prompt(t(
+                "cli-quickstart-open-selector-prompt",
+                "Open a selector (Enter), or pick Create. Esc to quit.",
+            ))
             .items(&labels)
             .default(0)
             .max_length(labels.len())
@@ -1400,16 +1633,16 @@ async fn run_quickstart_cli(
                 let mut mode_labels: Vec<String> = Vec::new();
                 let mut mode_kinds: Vec<&str> = Vec::new();
                 if !state.model_providers.is_empty() {
-                    mode_labels.push("Use existing".to_string());
+                    mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
                     mode_kinds.push("existing");
                 }
-                mode_labels.push("Create new".to_string());
+                mode_labels.push(t("cli-quickstart-create-new", "Create new"));
                 mode_kinds.push("fresh");
                 let mode = if mode_labels.len() == 1 {
                     Some(0)
                 } else {
                     FuzzySelect::new()
-                        .with_prompt("Model provider")
+                        .with_prompt(t("cli-quickstart-model-provider-prompt", "Model provider"))
                         .items(&mode_labels)
                         .default(0)
                         .max_length(mode_labels.len())
@@ -1419,7 +1652,10 @@ async fn run_quickstart_cli(
                 if mode_kinds[mi] == "existing" {
                     let labels: Vec<String> = state.model_providers.clone();
                     let Some(i) = FuzzySelect::new()
-                        .with_prompt("Pick a configured provider")
+                        .with_prompt(t(
+                            "cli-quickstart-pick-configured-provider",
+                            "Pick a configured provider",
+                        ))
                         .items(&labels)
                         .default(0)
                         .max_length(labels.len().max(1))
@@ -1437,14 +1673,17 @@ async fn run_quickstart_cli(
                     .iter()
                     .map(|p| {
                         if p.local {
-                            format!("{} (local)", p.display_name)
+                            qta(
+                                "cli-quickstart-provider-local-label",
+                                &[("name", &p.display_name)],
+                            )
                         } else {
                             p.display_name.clone()
                         }
                     })
                     .collect();
                 let Some(pi) = FuzzySelect::new()
-                    .with_prompt("Provider type")
+                    .with_prompt(t("cli-quickstart-provider-type-prompt", "Provider type"))
                     .items(&prov_labels)
                     .default(0)
                     .max_length(prov_labels.len().max(1))
@@ -1454,9 +1693,15 @@ async fn run_quickstart_cli(
                 };
                 let chosen = &providers[pi];
                 let Ok(alias) = Input::<String>::new()
-                    .with_prompt(format!("Alias for {}", chosen.display_name))
+                    .with_prompt(qta(
+                        "cli-quickstart-alias-for",
+                        &[("name", &chosen.display_name)],
+                    ))
                     .default("default".to_string())
                     .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    })
                     .interact_text()
                 else {
                     continue;
@@ -1468,6 +1713,19 @@ async fn run_quickstart_cli(
                     std::collections::HashMap::new();
                 let mut aborted = false;
                 for d in &descriptors {
+                    if d.key == "api_key" {
+                        let skips_api_key =
+                            quickstart_field_value_eq(&field_buf, "auth_mode", "codex")
+                                || (chosen.kind == "anthropic"
+                                    && quickstart_field_value_eq(
+                                        &field_buf,
+                                        "auth_mode",
+                                        "setup_token",
+                                    ));
+                        if skips_api_key {
+                            continue;
+                        }
+                    }
                     // For the model field, upgrade the descriptor with a
                     // live catalog so `prompt_for_field` renders a picker
                     // instead of a free-text input. Empty catalog (live=false)
@@ -1508,19 +1766,18 @@ async fn run_quickstart_cli(
                     continue;
                 }
                 if model.is_empty() {
-                    // Defensive: every provider's schema should yield
-                    // a `model` field, but if `field_shape` ever
-                    // returns no model row this prevents an empty
-                    // submission silently shipping. The message is
-                    // intentionally alarming — if a user ever sees it
-                    // there's a schema regression worth filing.
                     eprintln!(
-                        "WARN: schema produced no `model` field for `{}` — \
-                         falling back to manual entry. Please report this.",
-                        chosen.kind,
+                        "{}",
+                        qta(
+                            "cli-quickstart-model-field-missing-warning",
+                            &[("provider", &chosen.kind)],
+                        )
                     );
                     let Ok(m) = Input::<String>::new()
-                        .with_prompt(format!("Model id for {}", chosen.display_name))
+                        .with_prompt(qta(
+                            "cli-quickstart-model-id-for",
+                            &[("name", &chosen.display_name)],
+                        ))
                         .allow_empty(false)
                         .interact_text()
                     else {
@@ -1538,7 +1795,7 @@ async fn run_quickstart_cli(
             }
             Action::Risk => {
                 let chosen = pick_preset(
-                    "Risk profile",
+                    &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
                         .iter()
                         .map(|p| (p.preset_name, p.label, p.help))
@@ -1553,11 +1810,6 @@ async fn run_quickstart_cli(
                 }
             }
             Action::Memory => {
-                // Schema-derived list — six variants today, more as
-                // soon as someone adds them to
-                // `zeroclaw_config::multi_agent::MemoryBackendKind`.
-                // The exhaustive `match` here keeps the variant
-                // array honest at compile time.
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1585,7 +1837,7 @@ async fn run_quickstart_cli(
                     })
                     .collect();
                 let Some(i) = FuzzySelect::new()
-                    .with_prompt("Memory backend")
+                    .with_prompt(t("cli-quickstart-memory-backend-prompt", "Memory backend"))
                     .items(&labels)
                     .default(0)
                     .max_length(labels.len().max(1))
@@ -1602,18 +1854,26 @@ async fn run_quickstart_cli(
                         .channels
                         .iter()
                         .map(|c| match c {
-                            ChannelChoice::Fresh { kind, alias, .. } => {
-                                format!("  {kind}.{alias} (remove)")
-                            }
-                            ChannelChoice::Existing { alias_ref } => {
-                                format!("  {alias_ref} (remove)")
-                            }
+                            ChannelChoice::Fresh { kind, alias, .. } => qta(
+                                "cli-quickstart-channel-remove-row",
+                                &[("reference", &format!("{kind}.{alias}"))],
+                            ),
+                            ChannelChoice::Existing { alias_ref } => qta(
+                                "cli-quickstart-channel-remove-row",
+                                &[("reference", alias_ref)],
+                            ),
                         })
                         .collect();
-                    items.push("+ Add a channel".to_string());
-                    items.push("Done (channels selector counts as visited)".to_string());
+                    items.push(t("cli-quickstart-add-channel", "+ Add a channel"));
+                    items.push(t(
+                        "cli-quickstart-channels-done",
+                        "Done (channels selector counts as visited)",
+                    ));
                     let Some(i) = FuzzySelect::new()
-                        .with_prompt("Channels (optional, 0..N)")
+                        .with_prompt(t(
+                            "cli-quickstart-channels-prompt",
+                            "Channels (optional, 0..N)",
+                        ))
                         .items(&items)
                         .default(items.len().saturating_sub(2))
                         .max_length(items.len())
@@ -1630,16 +1890,19 @@ async fn run_quickstart_cli(
                         let mut mode_labels: Vec<String> = Vec::new();
                         let mut mode_kinds: Vec<&str> = Vec::new();
                         if !state.unassigned_channels.is_empty() {
-                            mode_labels.push("Use existing".to_string());
+                            mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
                             mode_kinds.push("existing");
                         }
-                        mode_labels.push("Create new".to_string());
+                        mode_labels.push(t("cli-quickstart-create-new", "Create new"));
                         mode_kinds.push("fresh");
                         let mode = if mode_labels.len() == 1 {
                             Some(0)
                         } else {
                             FuzzySelect::new()
-                                .with_prompt("Channel source")
+                                .with_prompt(t(
+                                    "cli-quickstart-channel-source-prompt",
+                                    "Channel source",
+                                ))
                                 .items(&mode_labels)
                                 .default(0)
                                 .max_length(mode_labels.len())
@@ -1647,24 +1910,22 @@ async fn run_quickstart_cli(
                         };
                         let Some(mi) = mode else { continue };
                         if mode_kinds[mi] == "existing" {
-                            // The snapshot's `unassigned_channels` is
-                            // the schema-side authoritative list of
-                            // channel refs not yet bound to any agent.
-                            // We use it directly so the CLI and TUI
-                            // surfaces apply the same filter without
-                            // either side re-implementing the lookup.
                             let labels: Vec<String> = state.unassigned_channels.clone();
                             if labels.is_empty() {
                                 println!(
-                                    "  Every configured channel is already \
-                                     bound to an agent. Free one with \
-                                     `zeroclaw config set agents.<alias>.channels \
-                                     ...` before reusing it here."
+                                    "{}",
+                                    t(
+                                        "cli-quickstart-all-channels-bound",
+                                        "  Every configured channel is already bound to an agent. Free one with `zeroclaw config set agents.<alias>.channels ...` before reusing it here.",
+                                    )
                                 );
                                 continue;
                             }
                             let Some(ei) = FuzzySelect::new()
-                                .with_prompt("Pick a configured channel")
+                                .with_prompt(t(
+                                    "cli-quickstart-pick-configured-channel",
+                                    "Pick a configured channel",
+                                ))
                                 .items(&labels)
                                 .default(0)
                                 .max_length(labels.len().max(1))
@@ -1692,7 +1953,7 @@ async fn run_quickstart_cli(
                             .map(|c| c.display_name.clone())
                             .collect();
                         let Some(ci) = FuzzySelect::new()
-                            .with_prompt("Channel type")
+                            .with_prompt(t("cli-quickstart-channel-type-prompt", "Channel type"))
                             .items(&labels)
                             .default(0)
                             .max_length(labels.len().max(1))
@@ -1702,7 +1963,10 @@ async fn run_quickstart_cli(
                         };
                         let chosen = &channel_types[ci];
                         let Ok(alias) = Input::<String>::new()
-                            .with_prompt(format!("Alias for {}", chosen.display_name))
+                            .with_prompt(qta(
+                                "cli-quickstart-alias-for",
+                                &[("name", &chosen.display_name)],
+                            ))
                             .default(chosen.kind.clone())
                             .allow_empty(false)
                             .interact_text()
@@ -1768,21 +2032,26 @@ async fn run_quickstart_cli(
                         .peer_groups
                         .iter()
                         .map(|pg| {
-                            format!(
-                                "{} → {} ({} peers)",
-                                pg.channel,
-                                pg.name,
-                                pg.external_peers.len()
+                            qta(
+                                "cli-quickstart-peer-group-row",
+                                &[
+                                    ("channel", &pg.channel),
+                                    ("name", &pg.name),
+                                    ("count", &pg.external_peers.len().to_string()),
+                                ],
                             )
                         })
                         .collect();
                     let drafts = items.len();
                     if !available.is_empty() {
-                        items.push("+ Add peer group".into());
+                        items.push(t("cli-quickstart-add-peer-group", "+ Add peer group"));
                     }
-                    items.push("Done".into());
+                    items.push(t("cli-quickstart-done", "Done"));
                     let Some(pick) = FuzzySelect::new()
-                        .with_prompt("Peer groups (Enter on a row to remove, + Add to create)")
+                        .with_prompt(t(
+                            "cli-quickstart-peer-groups-prompt",
+                            "Peer groups (Enter on a row to remove, + Add to create)",
+                        ))
                         .items(&items)
                         .default(items.len() - 1)
                         .max_length(items.len())
@@ -1796,7 +2065,10 @@ async fn run_quickstart_cli(
                     }
                     if pick == drafts && !available.is_empty() {
                         let Some(ch_idx) = FuzzySelect::new()
-                            .with_prompt("Channel to authorize")
+                            .with_prompt(t(
+                                "cli-quickstart-channel-to-authorize-prompt",
+                                "Channel to authorize",
+                            ))
                             .items(&available)
                             .default(0)
                             .max_length(available.len())
@@ -1811,9 +2083,10 @@ async fn run_quickstart_cli(
                         };
                         let name = format!("{ch_type}_{ch_alias}_default");
                         let Ok(peers_raw) = Input::<String>::new()
-                            .with_prompt(
+                            .with_prompt(t(
+                                "cli-quickstart-external-peers-prompt",
                                 "External peers (comma- or newline-separated, blank for none)",
-                            )
+                            ))
                             .allow_empty(true)
                             .interact_text()
                         else {
@@ -1853,8 +2126,11 @@ async fn run_quickstart_cli(
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
                 let mut input = Input::<String>::new()
-                    .with_prompt("Agent alias")
-                    .allow_empty(false);
+                    .with_prompt(t("cli-quickstart-agent-alias-prompt", "Agent alias"))
+                    .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    });
                 if !default_name.is_empty() {
                     input = input.default(default_name);
                 }
@@ -1867,7 +2143,10 @@ async fn run_quickstart_cli(
                     .map(|a| a.system_prompt.clone())
                     .unwrap_or_default();
                 let edit = Confirm::new()
-                    .with_prompt("Edit system prompt in $EDITOR? (blank if you skip)")
+                    .with_prompt(t(
+                        "cli-quickstart-edit-system-prompt",
+                        "Edit system prompt in $EDITOR? (blank if you skip)",
+                    ))
                     .default(false)
                     .interact_opt()?;
                 if let Some(true) = edit
@@ -1915,17 +2194,26 @@ async fn run_quickstart_cli(
                     Skip,
                 }
                 impl PersonalityAction {
-                    fn label(self, has_staged: bool) -> &'static str {
+                    fn label(self, has_staged: bool) -> String {
                         match self {
-                            Self::StartWithTemplate => "Start with template (open in $EDITOR)",
+                            Self::StartWithTemplate => t(
+                                "cli-quickstart-personality-start-template",
+                                "Start with template (open in $EDITOR)",
+                            ),
                             Self::StartFromScratch => {
                                 if has_staged {
-                                    "Start from current content (open in $EDITOR)"
+                                    t(
+                                        "cli-quickstart-personality-start-current",
+                                        "Start from current content (open in $EDITOR)",
+                                    )
                                 } else {
-                                    "Start from scratch (open in $EDITOR)"
+                                    t(
+                                        "cli-quickstart-personality-start-scratch",
+                                        "Start from scratch (open in $EDITOR)",
+                                    )
                                 }
                             }
-                            Self::Skip => "Skip",
+                            Self::Skip => t("cli-quickstart-personality-skip", "Skip"),
                         }
                     }
                 }
@@ -1951,18 +2239,29 @@ async fn run_quickstart_cli(
                     actions.push(PersonalityAction::StartFromScratch);
                     actions.push(PersonalityAction::Skip);
                     let has_staged = !staged.is_empty();
-                    let choices: Vec<&str> = actions.iter().map(|a| a.label(has_staged)).collect();
+                    let choices: Vec<String> =
+                        actions.iter().map(|a| a.label(has_staged)).collect();
                     let position = if files.len() > 1 {
                         format!(" [{}/{}]", idx + 1, files.len())
                     } else {
                         String::new()
                     };
                     let back_hint = if idx > 0 {
-                        " (Esc to go back)"
+                        t("cli-quickstart-esc-go-back", " (Esc to go back)")
                     } else {
-                        " (Esc to return to checklist)"
+                        t(
+                            "cli-quickstart-esc-return-checklist",
+                            " (Esc to return to checklist)",
+                        )
                     };
-                    let label = format!("{filename}{position} — what next?{back_hint}");
+                    let label = qta(
+                        "cli-quickstart-personality-file-prompt",
+                        &[
+                            ("filename", filename),
+                            ("position", &position),
+                            ("back_hint", &back_hint),
+                        ],
+                    );
                     let Some(pick) = FuzzySelect::new()
                         .with_prompt(label)
                         .items(&choices)
@@ -2035,7 +2334,29 @@ async fn run_quickstart_cli(
     }
 
     // ── Assemble submission ─────────────────────────────────────
+    let inline_auth = match form.provider.as_ref() {
+        Some(ProviderChoice::Fresh {
+            kind,
+            alias,
+            fields,
+            ..
+        }) => quickstart_inline_auth(kind, alias, fields),
+        _ => None,
+    };
+
     let provider = form.provider.expect("provider satisfied");
+    let provider_type = match &provider {
+        ProviderChoice::Fresh { kind, .. } => kind.as_str(),
+        ProviderChoice::Existing { alias_ref } => alias_ref
+            .split_once('.')
+            .map(|(provider_type, _)| provider_type)
+            .unwrap_or(alias_ref),
+    };
+    let runtime_profile = SelectorChoice::Fresh(quickstart_runtime_profile_for_provider(
+        provider_type,
+        providers,
+        &state.default_runtime_profile,
+    ));
     let model_provider = match provider {
         ProviderChoice::Fresh {
             kind,
@@ -2055,9 +2376,6 @@ async fn run_quickstart_cli(
         PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
         PresetChoice::Existing(a) => SelectorChoice::Existing(a),
     };
-    // Runtime profile picker removed from all surfaces; apply silently
-    // forces the `unbounded` preset. Submit it so the field stays well-formed.
-    let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
     let channels = form
         .channels
@@ -2071,14 +2389,7 @@ async fn run_quickstart_cli(
             } => SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: kind,
                 alias,
-                token: extras
-                    .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
+                fields: extras.into_iter().collect(),
             }),
             ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
         })
@@ -2110,11 +2421,17 @@ async fn run_quickstart_cli(
                     "Quickstart complete."
                 )
             );
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
-                "  zeroclaw agent -a {}  # chat with this agent in your terminal",
-                applied.alias
+                "{}",
+                qta(
+                    "cli-quickstart-next-agent-command",
+                    &[("alias", &applied.alias)]
+                )
             );
             if which_zerocode_on_path() {
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
@@ -2131,32 +2448,29 @@ async fn run_quickstart_cli(
                 )
             );
             eprintln!(
-                "Your existing config is untouched. Fix the following and run quickstart again:"
+                "{}",
+                t(
+                    "cli-quickstart-fix-and-rerun",
+                    "Your existing config is untouched. Fix the following and run quickstart again:",
+                )
             );
             eprintln!();
             for e in &errs {
-                eprintln!("  • {}: {}", e.step.label(), e.message);
+                eprintln!("  • {}: {}", quickstart_step_label(e.step), e.message);
             }
             eprintln!();
             anyhow::bail!(
-                "quickstart could not finish: {} problem(s) to fix",
-                errs.len()
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errs.len().to_string())],
+                )
             )
         }
     }
 }
 
-/// Render one schema-driven field descriptor as a dialoguer prompt
-/// and collect the user's answer. Returns `None` when the user
-/// cancels (Esc on a select / confirm), `Some(value)` otherwise.
-/// Used by both the model-provider field form and the channel field
-/// form so the two sub-flows share a single prompt implementation.
 #[cfg(feature = "agent-runtime")]
-/// Recognize a `providers.models.<type>.<alias>.model` config path and
-/// return `<type>` if the family is in the canonical model-provider
-/// registry. Used by `config set` to offer a live model picker when
-/// no value is supplied. Returns `None` for any other path shape or
-/// an unknown provider family.
 fn model_path_provider_type(path: &str) -> Option<&'static str> {
     let parts: Vec<&str> = path.split('.').collect();
     if parts.len() != 5 || parts[0] != "providers" || parts[1] != "models" || parts[4] != "model" {
@@ -2177,24 +2491,115 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
     Some(key)
 }
 
-fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
-    let Some((section_path, key)) = Config::map_key_sections()
+/// Split `section_arg` into the map key under `section_path` with NOTHING after
+/// it, the `config init <section>.<alias>` shape.
+fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
+    let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
+    (!tail.is_empty() && !tail.contains('.')).then_some(tail)
+}
+
+/// Longest alias-materializable section whose path prefixes `path`, plus the
+/// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
+/// are values from another domain (model id, voice, tool name) and may
+/// themselves contain dots, so a dot split would yield a bogus alias.
+fn alias_target_for_path<'a>(
+    path: &'a str,
+    split: impl Fn(&str, &'a str) -> Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    Config::map_key_sections()
         .into_iter()
-        .filter(|section| section.path.starts_with("providers."))
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
-        .filter_map(|section| {
-            let key = map_key_for_prop_path(section.path, prop_path)?;
-            Some((section.path, key))
-        })
+        .filter(|section| !section.resource_key)
+        .filter_map(|section| split(section.path, path).map(|key| (section.path, key)))
         .max_by_key(|(section_path, _)| section_path.len())
+}
+
+/// `config init <section>.<alias>`: materialize a dynamic-map alias with schema
+/// defaults. Returns the created `"<section>.<alias>"` path, or `None` when
+/// `section_arg` is not a `<map-section>.<new-alias>` shape (the alias already
+/// exists, the section is resource-keyed or a natural-key list, or the argument
+/// is a plain nested prefix that `init_defaults` already handles). A reserved
+/// alias is an error, not a silent no-op.
+fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
+    let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
+        return Ok(None);
+    };
+    match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
+        Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
+        Ok(false) => Ok(None),
+        Err(e) => Err(anyhow::Error::msg(e.to_string())),
+    }
+}
+
+/// Dirty every generated leaf under a newly created map alias so required
+/// default-valued fields survive the incremental writer's empty-leaf pruning.
+fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
+    let prefix = format!("{alias_path}.");
+    let leaf_paths: Vec<String> = config
+        .prop_fields()
+        .into_iter()
+        .filter_map(|field| field.name.starts_with(&prefix).then_some(field.name))
+        .collect();
+
+    if leaf_paths.is_empty() {
+        config.mark_dirty(alias_path);
+    } else {
+        for path in leaf_paths {
+            config.mark_dirty(&path);
+        }
+    }
+}
+
+fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
+    let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
     };
 
-    let created = config
-        .create_map_key(section_path, key)
-        .map_err(anyhow::Error::msg)?;
+    // The alias already exists in the loaded config (e.g. a hyphenated cron
+    // alias the TOML loader accepts and `config get`/`config list` resolve):
+    // leave it alone. `create_map_key` applies the strict new-alias grammar,
+    // which would reject a valid loaded key. Mirror `Config::ensure_map_key_for_path`,
+    // which also skips creation for existing keys so alias validation runs only
+    // when auto-materializing a brand-new alias.
+    if config
+        .get_map_keys(section_path)
+        .is_some_and(|keys| keys.iter().any(|k| k == key))
+    {
+        return Ok(false);
+    }
+
+    // Route through the shared `create_map_key_checked` (not raw
+    // `create_map_key`) so this CLI path inherits the reserved `default`
+    // agent guard from the one place it's defined, rather than re-deriving
+    // `section == "agents" && is_reserved_agent_alias(key)` here too. Without
+    // this, widening past `providers.*` would let `config set
+    // agents.default.enabled ...` auto-create the reserved runtime-fallback
+    // agent alias, which the rename guard then refuses to ever rename.
+    let created =
+        match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
+            Ok(created) => created,
+            Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
+            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        };
     if created {
+        // The section matched and the alias was newly materialized, but the
+        // requested prop path might still not resolve (typo'd trailing field
+        // name, or belt-and-suspenders against a resource-key path that
+        // slipped past the `!resource_key` filter above). Roll back rather
+        // than leave a phantom alias, falling through to the normal
+        // "Unknown property" error exactly as before this alias existed.
+        //
+        // IMPORTANT: this probe/rollback must stay strictly inside the
+        // `if created` branch. `create_map_key` returns `Ok(false)` when the
+        // alias already existed (idempotent case) — never run this rollback
+        // when `created == false`, or a bogus tail-field on an
+        // ALREADY-EXISTING alias would delete a legitimate, pre-existing
+        // config entry that has nothing to do with this call.
+        if config.get_prop(prop_path).is_err() {
+            let _ = config.delete_map_key(section_path, key);
+            return Ok(false);
+        }
         config.mark_dirty(&format!("{section_path}.{key}"));
     }
     Ok(created)
@@ -2215,29 +2620,27 @@ fn prompt_for_field(
     desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
     seed: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    use dialoguer::{FuzzySelect, Input, Password};
+    use dialoguer::{FuzzySelect, Input};
     use zeroclaw_config::traits::PropKind;
     if !desc.help.is_empty() {
         println!("  {}", desc.help);
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-        // Map that to `Ok(None)` so the caller treats it as "user backed
-        // out" instead of bubbling a confusing IO-error message.
-        match Password::new()
-            .with_prompt(prompt.clone())
-            .allow_empty_password(true)
-            .interact()
-        {
-            Ok(pw) => return Ok(Some(pw)),
+        match secret_prompt(&prompt, true) {
+            Ok(pw) => {
+                if !pw.is_empty() {
+                    eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                }
+                return Ok(Some(pw));
+            }
             Err(e) => {
-                let io: std::io::Error = e.into();
-                if io.kind() == std::io::ErrorKind::Interrupted {
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+                {
                     return Ok(None);
                 }
-                return Err(io.into());
+                return Err(e);
             }
         }
     }
@@ -2268,7 +2671,7 @@ fn prompt_for_field(
         // field's true type (e.g. a bool) and rejects.
         input = input.default(d.to_string());
     }
-    // Same Ctrl+C-as-cancel mapping as the Password branch above.
+    // Same Ctrl+C-as-cancel mapping as the secret prompt branch above.
     match input.interact_text() {
         Ok(v) => Ok(Some(v)),
         Err(e) => {
@@ -2282,12 +2685,6 @@ fn prompt_for_field(
     }
 }
 
-/// Pick a preset selector — used by both Risk and Runtime since
-/// their UX is identical (a fixed list of preset rows + the same
-/// "use existing alias" dual-mode). Returns `None` when the user
-/// cancels. Returns `Some(Ok(preset_name))` for a fresh preset
-/// pick or `Some(Err(existing_alias))` for a reuse pick so the
-/// caller can map into the right `SelectorChoice` variant.
 #[cfg(feature = "agent-runtime")]
 fn pick_preset(
     prompt: &str,
@@ -2298,10 +2695,10 @@ fn pick_preset(
     let mut mode_labels: Vec<String> = Vec::new();
     let mut mode_kinds: Vec<&str> = Vec::new();
     if !existing.is_empty() {
-        mode_labels.push("Use existing".to_string());
+        mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
         mode_kinds.push("existing");
     }
-    mode_labels.push("Pick a preset".to_string());
+    mode_labels.push(t("cli-quickstart-pick-preset", "Pick a preset"));
     mode_kinds.push("preset");
     let mode = if mode_labels.len() == 1 {
         Some(0)
@@ -2316,7 +2713,10 @@ fn pick_preset(
     let Some(mi) = mode else { return Ok(None) };
     if mode_kinds[mi] == "existing" {
         let Some(i) = FuzzySelect::new()
-            .with_prompt(format!("Pick an existing {prompt}"))
+            .with_prompt(qta(
+                "cli-quickstart-pick-existing-prompt",
+                &[("prompt", prompt)],
+            ))
             .items(existing)
             .default(0)
             .max_length(existing.len().max(1))
@@ -2331,7 +2731,10 @@ fn pick_preset(
         .map(|(_, label, help)| format!("{label}  —  {help}"))
         .collect();
     let Some(i) = FuzzySelect::new()
-        .with_prompt(format!("Pick a {prompt} preset"))
+        .with_prompt(qta(
+            "cli-quickstart-pick-preset-prompt",
+            &[("prompt", prompt)],
+        ))
         .items(&labels)
         .default(0)
         .max_length(labels.len().max(1))
@@ -2354,10 +2757,21 @@ fn which_zerocode_on_path() -> bool {
 enum PluginCommands {
     /// List installed plugins
     List,
-    /// Install a plugin from a directory or URL
+    /// Search an installable plugin registry
+    Search {
+        /// Query to match against plugin names and descriptions
+        query: String,
+        /// Registry JSON URL to search
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Install a plugin from a local directory/manifest or registry name
     Install {
-        /// Path to plugin directory or manifest
+        /// Path to plugin directory/manifest, or registry name/version
         source: String,
+        /// Registry JSON URL used for install-by-name
+        #[arg(long)]
+        registry: Option<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -2369,6 +2783,81 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Move plugins from legacy install directories into the configured one
+    Migrate,
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_host_with_configured_security(
+    config: &crate::config::schema::Config,
+) -> Result<zeroclaw::plugins::host::PluginHost> {
+    let mode = zeroclaw::plugins::host::PluginHost::resolve_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted = config.plugins.security.trusted_publisher_keys.clone();
+    Ok(
+        zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
+            &config.plugins.resolved_plugins_dir(),
+            mode,
+            trusted,
+        )?,
+    )
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entry(
+    config: &mut crate::config::schema::Config,
+    plugin_name: &str,
+) -> Result<()> {
+    let whole_config_degraded = config
+        .degraded_security
+        .iter()
+        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
+    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-skipped",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the \
+                 [plugins] section on disk is malformed. Repair it, add \
+                 `[[plugins.entries]]` with the plugin name, then set values \
+                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
+            )
+        );
+        return Ok(());
+    }
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
+            )
+        );
+        return Ok(());
+    }
+    let created = config
+        .create_map_key("plugins.entries", plugin_name)
+        .map_err(anyhow::Error::msg)?;
+    if !created {
+        return Ok(());
+    }
+    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", plugin_name)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+        )
+    );
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -2418,7 +2907,7 @@ enum ConfigCommands {
     },
     /// Initialize unconfigured sections with defaults (enabled=false)
     Init {
-        /// Section prefix (e.g. channels.matrix). Omit to init all.
+        /// Section prefix (e.g. channels.matrix), or `<section>.<alias>` to create a new dynamic-map alias (e.g. risk_profiles.strict). Omit to init all.
         section: Option<String>,
         /// Emit a structured JSON envelope ({initialized: [...]}) instead of plain text.
         #[arg(long)]
@@ -2426,12 +2915,11 @@ enum ConfigCommands {
     },
     /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
-        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
+        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version, valid?, error?}) instead of plain text.
         #[arg(long)]
         json: bool,
     },
     /// Apply a JSON Patch (RFC 6902) document atomically. Mirrors `PATCH /api/config`.
-    ///
     /// Reads operations from the given file, or from stdin when path is `-` or omitted.
     /// Supported ops: `add`, `replace`, `remove`, `test`. `move` and `copy` are rejected.
     Patch {
@@ -2443,12 +2931,6 @@ enum ConfigCommands {
     },
     /// Print the API explorer URL (plus a hint if the daemon isn't running).
     Docs,
-    /// Generate a canonical config at any supported schema version to stdout.
-    ///
-    /// Runs the embedded V1 fixture through the typed migration chain and
-    /// emits the result at the requested version. Useful for repros, doc
-    /// snippets, and seeding test installs. Valid versions are
-    /// `1..=CURRENT_SCHEMA_VERSION` — invalid inputs error out.
     Generate {
         /// Target schema version (e.g. 1, 2, 3). Defaults to current.
         version: Option<u32>,
@@ -2464,6 +2946,21 @@ enum ConfigCommands {
     Complete {
         /// Partial path to complete
         partial: Option<String>,
+    },
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Show security posture for the default or selected agent risk profile
+    Status {
+        /// Agent alias whose effective runtime security posture should be inspected.
+        #[arg(long)]
+        agent: String,
+
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2490,9 +2987,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2502,13 +2999,13 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
         /// Import an existing auth.json file instead of starting a new login flow.
-        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        /// Supports `openai-codex` (`~/.codex/auth.json`) and `xai` (`~/.grok/auth.json`).
         #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
         import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -2542,9 +3039,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh OAuth access token using refresh token
     Refresh {
-        /// ModelProvider (`openai-codex`)
+        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name or profile id
@@ -2573,6 +3070,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Authenticate an email channel via OAuth2 device-code flow
+    EmailLogin {
+        /// Email channel alias from `[channels.email.<alias>]` (e.g. 'hotmail')
+        #[arg(long)]
+        channel: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2591,11 +3097,15 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a model_provider
+    /// List the models configured in config.toml
     List {
-        /// ModelProvider name (defaults to configured default model_provider)
+        /// ModelProvider name (defaults to all configured entries)
         #[arg(long)]
         model_provider: Option<String>,
+
+        /// Verify each configured model against the provider's live catalog
+        #[arg(long)]
+        check: bool,
     },
     /// Set the default model in config
     Set {
@@ -2633,6 +3143,16 @@ enum DoctorCommands {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
+    /// Update context_window in config.toml from provider /models endpoints
+    UpdateContextWindows {
+        /// Update a specific model_provider only (default: all known model_providers)
+        #[arg(long)]
+        model_provider: Option<String>,
+
+        /// Show what would be updated without writing to config
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2649,7 +3169,9 @@ enum MemoryCommands {
         offset: usize,
     },
     /// Get a specific memory entry by key
-    Get { key: String },
+    Get {
+        key: String,
+    },
     /// Show memory backend statistics and health
     Stats,
     /// Clear memories by category, by key, or clear all
@@ -2663,12 +3185,34 @@ enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Rebuild backend indexes: FTS tables + any missing embedding vectors.
-    ///
-    /// Run after `zeroclaw migrate openclaw` or other bulk writes that land
-    /// rows with `embedding = NULL`. Safe to re-run; only touches entries
-    /// whose vector is missing. No-op for backends without a vector index.
     Reindex,
+}
+
+/// Bootstrap the value of the global `--config-dir` flag before clap renders
+/// localized help. The command comes from [`Cli::command`], so clap remains
+/// responsible for option ownership, external-subcommand payloads, value
+/// parsing, and the option terminator.
+fn probe_config_dir(
+    command: &clap::Command,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<String> {
+    // Help and version normally return display errors before exposing matches.
+    // In this bootstrap view, make them ordinary parse boundaries and retain
+    // the matches clap accumulated before the boundary.
+    let matches = command
+        .clone()
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .disable_version_flag(true)
+        .ignore_errors(true)
+        .try_get_matches_from(args)
+        .ok()?;
+
+    matches
+        .try_get_one::<String>("config_dir")
+        .ok()
+        .flatten()
+        .cloned()
 }
 
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
@@ -2707,11 +3251,6 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
     cmd
 }
 
-/// Validate a locale code against the embedded `locales.toml` registry (the
-/// build's known locales, available in-memory — no file read, no network), so a
-/// fetch can never be coerced to a path/host outside the known set. Also
-/// enforces a strict syntactic allowlist as a belt-and-suspenders guard against
-/// path traversal.
 #[cfg(feature = "agent-runtime")]
 fn validated_locale(locale: &str) -> Result<String> {
     let ok_shape = !locale.is_empty()
@@ -2733,14 +3272,6 @@ fn validated_locale(locale: &str) -> Result<String> {
     Ok(locale.to_string())
 }
 
-/// Fetch translated FTL catalogues for `locale` from upstream and install them
-/// under `<config-dir>/data/ftl/<locale>/`. `catalog` is an optional
-/// comma-separated subset of {cli, tools, zerocode}; `None` fetches all.
-///
-/// Security: `locale` is validated against the upstream `locales.toml` registry
-/// and a strict syntactic allowlist; the destination path is built from
-/// `ftl_locale_dir` and canonicalized to confirm it stays under the data dir,
-/// so neither the locale nor catalog can drive a write outside the FTL store.
 #[cfg(feature = "agent-runtime")]
 async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     let locale = validated_locale(locale)?;
@@ -2856,9 +3387,26 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn main() -> Result<()> {
+    let command = Cli::command();
+
+    // Locale detection runs while clap builds localized help, so expose the CLI
+    // override through the bootstrap env before either i18n or Tokio starts.
+    // Empty values remain for clap's canonical parse/validation path below.
+    if let Some(config_dir) = probe_config_dir(&command, std::env::args_os())
+        && !config_dir.trim().is_empty()
+    {
+        // SAFETY: this synchronous bootstrap runs before the Tokio runtime (and
+        // therefore its worker threads) is constructed.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+    }
+
+    async_main(command)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn async_main(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -2874,10 +3422,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
-    crate::i18n::init(&crate::i18n::detect_locale());
-
-    let cmd = apply_i18n_to_command(Cli::command());
+    let cmd = apply_i18n_to_command(command);
 
     if std::env::args_os().len() <= 1 {
         return print_no_command_help(cmd);
@@ -2885,13 +3430,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
 
-    if let Some(config_dir) = &cli.config_dir {
-        if config_dir.trim().is_empty() {
-            bail!("--config-dir cannot be empty");
-        }
-        // SAFETY: called early in main before any threads are spawned.
-        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+    if let Some(config_dir) = &cli.config_dir
+        && config_dir.trim().is_empty()
+    {
+        bail!("--config-dir cannot be empty");
     }
+
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
 
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.
@@ -2923,26 +3469,6 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Two independent, immutable-for-the-process logging axes:
-    //
-    //   --log-level  recording floor → runtime trace + capture layer.
-    //                Precedence: flag > RUST_LOG env > per-command
-    //                default. matrix_sdk crates stay pinned to warn
-    //                regardless (extremely noisy at info+). To restore
-    //                SDK output for Matrix debugging, set RUST_LOG
-    //                explicitly with no --log-level flag, e.g.
-    //                  RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info
-    //
-    //   --verbose    display gate → stderr fmt layer only. Off by
-    //                default: logs go to the trace file, the terminal
-    //                shows only command output (println!/stdout, which
-    //                never routes through tracing). On: the fmt layer
-    //                surfaces events down to the recording floor.
-    //
-    // Per-command floor defaults: ephemeral daemon → debug (tool spans
-    // visible); ACP / agent REPL → warn (kept for parity; verbose-off
-    // already mutes the terminal so conversation/stdio output is never
-    // interleaved). Everything else → info.
     let default_floor = match &cli.command {
         Commands::Daemon {
             ephemeral: true, ..
@@ -2969,11 +3495,6 @@ async fn main() -> Result<()> {
         cli.verbose,
     );
 
-    // `zeroclaw onboard` is deprecated. The legacy section-by-section
-    // wizard is gone; new installs run `zeroclaw quickstart`. Any old
-    // flags (`--api-key`, `--model-provider`, `--quick`, `--<section>-only`,
-    // positional section subcommands) error so scripted callers fail
-    // loudly rather than silently doing the wrong thing.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         section,
@@ -3025,10 +3546,70 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunLaunchdDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+        ..
+    } = &cli.command
+    {
+        return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    for section in config
+        .degraded_sections
+        .iter()
+        .chain(config.degraded_security.iter())
+    {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-degraded",
+                &[
+                    ("section", section),
+                    ("path", &config.config_path.display().to_string()),
+                ],
+                "warning: config section is malformed and was reset to defaults \
+                 for this run. Values in that section are NOT in effect. Run \
+                 `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            )
+        );
+    }
+    for section in &config.retired_wati_config_sections {
+        let fallback = format!(
+            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+        );
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-retired-wati",
+                &[("section", section)],
+                &fallback,
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Must follow the trace sink init above, or the record has no destination.
+    // The daemon reload arm calls the same helper against its reloaded config.
+    #[cfg(feature = "agent-runtime")]
+    warn_verifiable_intent_withheld(&config);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -3125,24 +3706,39 @@ async fn main() -> Result<()> {
                     .unwrap_or("default");
                 match message {
                     Some(msg) => {
-                        let response = model_provider
-                            .simple_chat(&msg, model_name, Some(final_temperature))
-                            .await?;
+                        let response =
+                            zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
+                                .simple_chat(&msg, model_name, Some(final_temperature))
+                                .await?;
                         println!("{response}");
                     }
                     None => {
-                        // Interactive mode
-                        let stdin = std::io::stdin();
-                        let mut line = String::new();
                         loop {
                             eprint!("> ");
-                            line.clear();
-                            if stdin.read_line(&mut line)? == 0 {
-                                break;
-                            }
-                            let response = model_provider
-                                .simple_chat(line.trim(), model_name, Some(final_temperature))
-                                .await?;
+                            let line = {
+                                let stdin = std::io::stdin().lock();
+                                match read_capped_line(stdin, STDIN_LINE_CAP) {
+                                    Ok(CappedLine::Eof) => break,
+                                    Ok(CappedLine::Line(s)) => s,
+                                    Ok(CappedLine::Truncated) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!(
+                                            "\nWarning: input line exceeds {} bytes and was discarded.",
+                                            STDIN_LINE_CAP
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!("\nError reading input: {e}\n");
+                                        break;
+                                    }
+                                }
+                            };
+                            let response =
+                                zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
+                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
+                                    .await?;
                             println!("{response}");
                         }
                     }
@@ -3162,14 +3758,6 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     {
-        // Wire cron delivery to the channels orchestrator. Registered before
-        // dispatch so that *any* command path that may execute cron jobs —
-        // `daemon`, `gateway start`, or a one-shot `cron run` — has a working
-        // delivery handler. Previously this lived only inside the daemon
-        // branch, which left `zeroclaw gateway start` unable to deliver
-        // manually-triggered cron announcements ("no delivery handler
-        // registered"). `register_delivery_fn` is idempotent (backed by
-        // `OnceLock::set`), so calling it once here is safe.
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
             |config, channel, target, thread_id, output| {
                 Box::pin(async move {
@@ -3196,7 +3784,7 @@ async fn main() -> Result<()> {
             agent,
         } => {
             Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
-            return Ok(());
+            Ok(())
         }
 
         Commands::Agent {
@@ -3254,6 +3842,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Interactive,
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
             ))
             .await
@@ -3414,11 +4003,11 @@ async fn main() -> Result<()> {
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
                             );
                             println!();
-                            if let Some(message) = message.as_deref() {
-                                if rotating {
-                                    println!("  ✅ {message}");
-                                    println!();
-                                }
+                            if let Some(message) = message.as_deref()
+                                && rotating
+                            {
+                                println!("  ✅ {message}");
+                                println!();
                             }
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
@@ -3441,37 +4030,18 @@ async fn main() -> Result<()> {
                             );
                         }
                         Ok(PaircodeResult::NoCode { message }) => {
-                            if let Some(message) = message {
-                                println!("⚠️  {message}");
-                            } else if config.gateway.require_pairing {
-                                println!(
-                                    "🔐 Gateway pairing is enabled, but no active pairing code available."
-                                );
-                                println!(
-                                    "   The gateway may already be paired, or the code has been used."
-                                );
-                                println!(
-                                    "{}",
-                                    t(
-                                        "cli-pairing-restart",
-                                        "   Restart the gateway to generate a new pairing code."
-                                    )
-                                );
-                            } else {
-                                println!(
-                                    "{}",
-                                    t(
-                                        "cli-pairing-disabled",
-                                        "⚠️  Gateway pairing is disabled in config."
-                                    )
-                                );
-                                println!(
-                                    "   All requests will be accepted without authentication."
-                                );
-                                println!(
-                                    "   To enable pairing, set [gateway] require_pairing = true"
-                                );
-                            }
+                            println!(
+                                "{}",
+                                paircode_no_code_message(
+                                    &host,
+                                    port,
+                                    &config.gateway.host,
+                                    config.gateway.port,
+                                    &action,
+                                    config.gateway.require_pairing,
+                                    message.as_deref(),
+                                )
+                            );
                         }
                         Err(e) => {
                             println!(
@@ -3582,7 +4152,8 @@ async fn main() -> Result<()> {
                     .filter(|(_, a)| a.enabled)
                     .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
                     .any(|p| matches!(p.sandbox_config().backend, SandboxBackend::Docker));
-                let runtime_docker_mem = config.runtime.kind == "docker"
+                let runtime_docker_mem = config.runtime.kind
+                    == zeroclaw_config::schema::RuntimeKind::Docker
                     && config
                         .runtime
                         .docker
@@ -3625,27 +4196,33 @@ async fn main() -> Result<()> {
             // Cron delivery is registered earlier (before the command match)
             // so it works for both `daemon` and `gateway start`.
 
-            // Single canvas store shared between the gateway HTTP / WebSocket
-            // surface and the channel-server agents so canvas frames pushed
-            // from Telegram / Discord / Slack reach the same subscribers the
-            // web UI serves. Without this, channels build an orphaned
-            // CanvasStore::default() and frames are silently dropped.
             let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
+            // Capture the launch command now, before any in-app upgrade can
+            // swap the binary on disk (after which `current_exe()` resolves to a
+            // "(deleted)" path on Linux). Used by the post-loop self-respawn.
+            zeroclaw_runtime::restart::record_launch();
+
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
-            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
-            // (loop re-reads config from disk and re-runs). The PID stays
-            // the same across reloads — only the in-process subsystems
-            // tear down + re-instantiate.
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload after a
+            // `POST /admin/reload` request (loop re-reads config from disk and
+            // re-runs). The PID stays the same across reloads — only the
+            // in-process subsystems tear down + re-instantiate.
             let mut current_config = config;
             // Nag task for the degraded-security warning, scoped to the
             // current config. Re-evaluated each reload iteration so a repaired
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            let startup_feedback_enabled = !cli.verbose;
             loop {
+                if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
+                }
+
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -3653,71 +4230,122 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
+                // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
+                // (or empty) by default, so SOP runtime behavior is off until an
+                // operator opts in by setting a directory.
+                let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
+                    );
+                    let sop_adapters = build_sop_adapters(&current_config);
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        current_config.sop.clone(),
+                        &current_config.data_dir,
+                        &current_config.install_root_dir(),
+                        mem,
+                        sop_adapters,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+
+                // EPIC A1 + SOP cron: drive periodic maintenance and cron
+                // triggers against the shared engine for this daemon iteration.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    current_config.sop.maintenance_interval_secs,
+                );
+
                 #[cfg(feature = "gateway")]
-                registry.register_gateway(Box::new(
-                    move |host, port, config, tx, reload_tx, tui_registry| {
+                registry.register_gateway(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
                                 port,
                                 config,
                                 tx,
-                                reload_tx,
+                                reload_controls,
                                 tui_registry,
                                 Some(canvas_store),
+                                sop_engine,
+                                sop_audit,
+                                ready_tx,
                             ))
-                            .await
-                        })
-                    },
-                ));
-
-                registry.register_channels(Box::new(move |config, cancel| {
-                    let canvas_store = canvas_store_for_channels.clone();
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                            config,
-                            Some(canvas_store),
-                            cancel,
-                        ))
-                        .await
-                    })
-                }));
-
-                #[cfg(feature = "channel-mqtt")]
-                registry.register_mqtt(Box::new({
-                    use std::sync::{Arc, Mutex};
-                    use zeroclaw_config::schema::SopConfig;
-                    use zeroclaw_memory::NoneMemory;
-                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                    let sop_config = current_config.sop.clone();
-                    let workspace_dir = current_config.data_dir.clone();
-                    move |mqtt_config| {
-                        let engine = if sop_config.sops_dir.is_some() {
-                            let mut e = SopEngine::new(sop_config.clone());
-                            e.reload(&workspace_dir);
-                            e
-                        } else {
-                            SopEngine::new(SopConfig::default())
-                        };
-                        let engine = Arc::new(Mutex::new(engine));
-                        let audit =
-                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
-                        Box::pin(async move {
-                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                &mqtt_config,
-                                engine,
-                                audit,
-                            )
                             .await
                         })
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
-                    Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
+                registry.register_channels(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
+                    move |config, cancel| {
+                        let canvas_store = canvas_store_for_channels.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                                config,
+                                Some(canvas_store),
+                                cancel,
+                                sop_engine,
+                                sop_audit,
+                            ))
                             .await
+                        })
+                    }
+                }));
+
+                #[cfg(feature = "channel-mqtt")]
+                registry.register_mqtt(Box::new({
+                    let engine = sop_engine.clone();
+                    let audit = sop_audit.clone();
+                    move |mqtt_config| {
+                        let engine = engine.clone();
+                        let audit = audit.clone();
+                        Box::pin(async move {
+                            if let (Some(engine), Some(audit)) = (engine, audit) {
+                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                    &mqtt_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            } else {
+                                // No SOPs directory configured — this is a valid
+                                // user state, not a misconfiguration. Skip the
+                                // listener gracefully.
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Skip
+                                    ),
+                                    "MQTT SOP listener skipped — no SOPs directory configured"
+                                );
+                                Ok(())
+                            }
+                        })
+                    }
+                }));
+
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
+                    Box::pin(async move {
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
@@ -3745,14 +4373,24 @@ async fn main() -> Result<()> {
                         .await
                     })
                 }));
+
+                // Pass the shared SOP engine through the registry so
+                // RpcContext (RPC/TUI agent sessions) can share it.
+                registry.set_sop_engine(sop_engine, sop_audit);
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
                     port,
                     registry,
                     ephemeral,
+                    startup_feedback_enabled,
                 ))
-                .await?;
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -3765,11 +4403,16 @@ async fn main() -> Result<()> {
                             "🔄 Daemon reload — re-reading config from disk"
                         );
                         current_config = Box::pin(Config::load_or_init()).await?;
-                        // Stop the stale nag and re-gate against the fresh
-                        // config: a repaired posture silences the warning, a
-                        // newly-degraded one (still allowed) restarts it. A
-                        // newly-degraded posture without the allow flag set
-                        // hard-fails the reload, same as first boot.
+                        #[cfg(feature = "agent-runtime")]
+                        observability::runtime_trace::init_from_config(
+                            &current_config.observability,
+                            &current_config.data_dir,
+                        );
+                        // A reload applies config the process has not seen, so an
+                        // operator who just enabled the section learns why the tool
+                        // is still absent without having to restart.
+                        #[cfg(feature = "agent-runtime")]
+                        warn_verifiable_intent_withheld(&current_config);
                         if let Some(handle) = degraded_nag.take() {
                             handle.abort();
                         }
@@ -3782,6 +4425,11 @@ async fn main() -> Result<()> {
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
             }
+            // Bare-process auto-restart: the daemon has now torn down (the
+            // gateway listener is released), so launch the upgraded binary as a
+            // detached child before we exit. No-op unless an in-app upgrade
+            // requested a self-respawn.
+            zeroclaw_runtime::restart::respawn_if_requested();
             Ok(())
         }
 
@@ -3875,13 +4523,23 @@ async fn main() -> Result<()> {
                 "{}",
                 ta(
                     "cli-status-observability",
-                    &[("v", &config.observability.backend.to_string())],
+                    &[("v", config.observability.backend.as_wire())],
                     "Observability"
                 )
             );
-            println!(
+            let trace_storage_mode = config.observability.log_persistence.as_wire().to_string();
+            let trace_storage_path = config.observability.log_persistence_path.to_string();
+            let trace_storage_fallback = format!(
                 "🧾 Trace storage:  {} ({})",
-                config.observability.log_persistence, config.observability.log_persistence_path
+                trace_storage_mode, trace_storage_path
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-status-trace-storage",
+                    &[("mode", &trace_storage_mode), ("path", &trace_storage_path),],
+                    &trace_storage_fallback
+                )
             );
             // Per-agent autonomy: each enabled agent picks its own
             // risk_profile, so list them rather than collapsing to one.
@@ -3917,11 +4575,11 @@ async fn main() -> Result<()> {
                 "{}",
                 ta(
                     "cli-status-runtime",
-                    &[("v", &config.runtime.kind.to_string())],
+                    &[("v", config.runtime.kind.as_wire())],
                     "Runtime"
                 )
             );
-            if service::is_running() {
+            if service::is_running(&config) {
                 println!(
                     "{}",
                     t("cli-status-service-running", "🟢 Service:       running")
@@ -3933,18 +4591,46 @@ async fn main() -> Result<()> {
                 );
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
+            let heartbeat_value = if config.heartbeat.enabled {
+                let interval_minutes = config.heartbeat.interval_minutes.to_string();
+                let heartbeat_every_fallback = format!("every {}min", interval_minutes);
+                ta(
+                    "cli-status-heartbeat-every-minutes",
+                    &[("minutes", &interval_minutes)],
+                    &heartbeat_every_fallback,
+                )
+            } else {
+                t("cli-status-word-disabled", "disabled")
+            };
+            let heartbeat_fallback = format!("💓 Heartbeat:      {}", heartbeat_value);
             println!(
-                "💓 Heartbeat:      {}",
-                if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
-                } else {
-                    "disabled".into()
-                }
+                "{}",
+                ta(
+                    "cli-status-heartbeat",
+                    &[("v", &heartbeat_value)],
+                    &heartbeat_fallback
+                )
+            );
+            let memory_backend = effective_memory_backend.to_string();
+            let memory_auto_save = if config.memory.auto_save {
+                t("cli-status-word-on", "on")
+            } else {
+                t("cli-status-word-off", "off")
+            };
+            let memory_fallback = format!(
+                "🧠 Memory:         {} (auto-save: {})",
+                memory_backend, memory_auto_save
             );
             println!(
-                "🧠 Memory:         {} (auto-save: {})",
-                effective_memory_backend,
-                if config.memory.auto_save { "on" } else { "off" }
+                "{}",
+                ta(
+                    "cli-status-memory",
+                    &[
+                        ("backend", &memory_backend),
+                        ("auto_save", &memory_auto_save),
+                    ],
+                    &memory_fallback
+                )
             );
 
             println!();
@@ -3973,17 +4659,30 @@ async fn main() -> Result<()> {
                         "Workspace only"
                     )
                 );
+                let allowed_roots = if profile.allowed_roots.is_empty() {
+                    t("cli-status-word-none", "(none)")
+                } else {
+                    profile.allowed_roots.join(", ")
+                };
+                let allowed_roots_fallback = format!("  Allowed roots:     {}", allowed_roots);
                 println!(
-                    "  Allowed roots:     {}",
-                    if profile.allowed_roots.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        profile.allowed_roots.join(", ")
-                    }
+                    "{}",
+                    ta(
+                        "cli-status-allowed-roots",
+                        &[("v", &allowed_roots)],
+                        &allowed_roots_fallback
+                    )
                 );
+                let allowed_commands = profile.allowed_commands.join(", ");
+                let allowed_commands_fallback =
+                    format!("  Allowed commands:  {}", allowed_commands);
                 println!(
-                    "  Allowed commands:  {}",
-                    profile.allowed_commands.join(", ")
+                    "{}",
+                    ta(
+                        "cli-status-allowed-commands",
+                        &[("v", &allowed_commands)],
+                        &allowed_commands_fallback
+                    )
                 );
                 let actions_cap = config
                     .runtime_profile_for_agent(alias)
@@ -3997,13 +4696,19 @@ async fn main() -> Result<()> {
                     )
                 );
             }
+            let cost_tracking = if config.cost.enabled {
+                t("cli-status-word-enabled", "enabled")
+            } else {
+                t("cli-status-word-disabled", "disabled")
+            };
+            let cost_tracking_fallback = format!("  Cost tracking:     {}", cost_tracking);
             println!(
-                "  Cost tracking:     {}",
-                if config.cost.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                "{}",
+                ta(
+                    "cli-status-cost-tracking",
+                    &[("v", &cost_tracking)],
+                    &cost_tracking_fallback
+                )
             );
             println!(
                 "{}",
@@ -4025,13 +4730,29 @@ async fn main() -> Result<()> {
                 match cost::CostTracker::new(config.cost.clone(), &config.data_dir) {
                     Ok(tracker) => match tracker.get_summary() {
                         Ok(summary) => {
+                            let spent_today = format!("{:.4}", summary.daily_cost_usd);
+                            let daily_limit = format!("{:.2}", config.cost.daily_limit_usd);
+                            let spent_today_fallback =
+                                format!("  Spent today:       ${spent_today} / ${daily_limit}");
                             println!(
-                                "  Spent today:       ${:.4} / ${:.2}",
-                                summary.daily_cost_usd, config.cost.daily_limit_usd
+                                "{}",
+                                ta(
+                                    "cli-status-spent-today",
+                                    &[("spent", &spent_today), ("limit", &daily_limit)],
+                                    &spent_today_fallback
+                                )
                             );
+                            let spent_month = format!("{:.4}", summary.monthly_cost_usd);
+                            let monthly_limit = format!("{:.2}", config.cost.monthly_limit_usd);
+                            let spent_month_fallback =
+                                format!("  Spent this month:  ${spent_month} / ${monthly_limit}");
                             println!(
-                                "  Spent this month:  ${:.4} / ${:.2}",
-                                summary.monthly_cost_usd, config.cost.monthly_limit_usd
+                                "{}",
+                                ta(
+                                    "cli-status-spent-month",
+                                    &[("spent", &spent_month), ("limit", &monthly_limit)],
+                                    &spent_month_fallback
+                                )
                             );
                         }
                         Err(e) => {
@@ -4077,25 +4798,64 @@ async fn main() -> Result<()> {
             println!("{}", t("cli-status-channels", "Channels:"));
             println!("{}", t("cli-status-cli-always", "  CLI:      ✅ always"));
             for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
+                let channel_status = if entry.configured {
+                    t("cli-status-word-configured", "configured")
+                } else {
+                    t("cli-status-word-not-configured", "not configured")
+                };
                 println!(
                     "  {:9} {}",
                     entry.name,
                     if entry.configured {
-                        "✅ configured"
+                        format!("✅ {}", channel_status)
                     } else {
-                        "❌ not configured"
+                        format!("❌ {}", channel_status)
                     }
+                );
+            }
+            let uncompiled =
+                zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+            if !uncompiled.is_empty() {
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-not-compiled-header",
+                        "  Configured but not compiled in this binary:"
+                    )
+                );
+                for entry in &uncompiled {
+                    println!(
+                        "  {:9} {}",
+                        entry.name,
+                        t(
+                            "cli-status-channel-not-compiled",
+                            "🚫 configured, not compiled"
+                        )
+                    );
+                }
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-build-hint",
+                        "  Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature."
+                    )
                 );
             }
             println!();
             println!("{}", t("cli-status-peripherals", "Peripherals:"));
+            let peripherals_enabled = if config.peripherals.enabled {
+                t("cli-status-word-yes", "yes")
+            } else {
+                t("cli-status-word-no", "no")
+            };
+            let peripherals_enabled_fallback = format!("  Enabled:   {}", peripherals_enabled);
             println!(
-                "  Enabled:   {}",
-                if config.peripherals.enabled {
-                    "yes"
-                } else {
-                    "no"
-                }
+                "{}",
+                ta(
+                    "cli-status-peripherals-enabled",
+                    &[("v", &peripherals_enabled)],
+                    &peripherals_enabled_fallback
+                )
             );
             println!(
                 "{}",
@@ -4109,6 +4869,19 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        #[cfg(feature = "agent-runtime")]
+        Commands::Security {
+            security_command: SecurityCommands::Status { agent, json },
+        } => {
+            let report = security_status::build_report(&config, &agent)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                security_status::print_report(&report);
+            }
+            Ok(())
+        }
+
         Commands::Estop {
             estop_command,
             level,
@@ -4119,15 +4892,31 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            let (model_provider, show_names) = match &model_command {
-                ModelCommands::Refresh { model_provider, .. } => (model_provider.as_deref(), false),
-                ModelCommands::List { model_provider } => (model_provider.as_deref(), true),
-                _ => (None, false),
-            };
-            doctor::run_models(&config, model_provider, false, show_names).await
+            #[cfg(feature = "agent-runtime")]
+            {
+                dispatch_models_command(model_command, &mut config).await
+            }
+            #[cfg(not(feature = "agent-runtime"))]
+            {
+                match model_command {
+                    ModelCommands::List {
+                        model_provider,
+                        check,
+                    } => {
+                        doctor::run_configured_models(&config, model_provider.as_deref(), check)
+                            .await
+                    }
+                    ModelCommands::Refresh { model_provider, .. } => {
+                        doctor::run_models(&config, model_provider.as_deref(), false, false).await
+                    }
+                    _ => doctor::run_models(&config, None, false, false).await,
+                }
+            }
         }
 
-        Commands::Providers => {
+        Commands::Providers {
+            providers_command: None,
+        } => {
             let model_providers = zeroclaw_providers::list_model_providers();
             let configured_types: std::collections::HashSet<&str> = config
                 .providers
@@ -4165,6 +4954,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Providers {
+            providers_command: Some(providers_command),
+        } => Box::pin(alias_cli::handle_providers(providers_command, &mut config)).await,
+
         Commands::Service {
             service_command,
             service_init,
@@ -4176,8 +4969,8 @@ async fn main() -> Result<()> {
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {
                 model_provider,
-                use_cache,
-            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache, false).await,
+                use_cache: _,
+            }) => doctor::run_configured_models(&config, model_provider.as_deref(), true).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,
@@ -4190,6 +4983,19 @@ async fn main() -> Result<()> {
                 contains.as_deref(),
                 limit,
             ),
+            Some(DoctorCommands::UpdateContextWindows {
+                model_provider,
+                dry_run,
+            }) => {
+                Box::pin(doctor::update_context_windows(
+                    &mut config,
+                    model_provider.as_deref(),
+                    dry_run,
+                    None,
+                ))
+                .await?;
+                Ok(())
+            }
             None => doctor::run(&config).await,
         },
 
@@ -4203,11 +5009,46 @@ async fn main() -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                Box::pin(channels::start_channels(config, None, cancel)).await
+                let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
+                    let sop_adapters = build_sop_adapters(&config);
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        config.sop.clone(),
+                        &config.data_dir,
+                        &config.install_root_dir(),
+                        mem,
+                        sop_adapters,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+                // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    config.sop.maintenance_interval_secs,
+                );
+                let result = Box::pin(channels::start_channels(
+                    config, None, cancel, sop_engine, sop_audit,
+                ))
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                result
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
+
+        Commands::Agents { agents_command } => {
+            Box::pin(alias_cli::handle_agents(agents_command, &mut config)).await
+        }
+        Commands::Channels { channels_command } => {
+            Box::pin(alias_cli::handle_channels(channels_command, &mut config)).await
+        }
 
         Commands::Integrations {
             integration_command,
@@ -4217,7 +5058,15 @@ async fn main() -> Result<()> {
 
         Commands::Browse { path } => browse::handle_browse(path, &config),
 
-        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+        Commands::Sop { sop_command } => match sop_command {
+            // Out-of-band approval verbs talk to the running daemon over the
+            // gateway (they must see the daemon's runs, not a throwaway local
+            // engine). List/Validate/Show stay local + synchronous.
+            cmd @ (SopCommands::Approve { .. }
+            | SopCommands::Deny { .. }
+            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            other => sop::handle_command(other, &config),
+        },
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -4321,12 +5170,12 @@ async fn main() -> Result<()> {
                 }
 
                 // 2. Same directory as the current executable
-                if found.is_none() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let sibling = exe.with_file_name("zeroclaw-desktop");
-                        if sibling.is_file() {
-                            found = Some(sibling);
-                        }
+                if found.is_none()
+                    && let Ok(exe) = std::env::current_exe()
+                {
+                    let sibling = exe.with_file_name("zeroclaw-desktop");
+                    if sibling.is_file() {
+                        found = Some(sibling);
                     }
                 }
 
@@ -4334,38 +5183,37 @@ async fn main() -> Result<()> {
                 //    Uses directories::UserDirs so HOME (Unix) and USERPROFILE (Windows)
                 //    are both resolved correctly. On Windows the binary is .exe — try
                 //    both names since which::which (step 4) only catches PATH entries.
-                if found.is_none() {
-                    if let Some(home) =
+                if found.is_none()
+                    && let Some(home) =
                         directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
-                    {
-                        let bin_names: &[&str] = if cfg!(windows) {
-                            &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
-                        } else {
-                            &["zeroclaw-desktop"]
-                        };
-                        // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
-                        let dirs: &[&str] = if cfg!(windows) {
-                            &[".cargo/bin"]
-                        } else {
-                            &[".cargo/bin", ".local/bin"]
-                        };
-                        'outer: for dir in dirs {
-                            for name in bin_names {
-                                let candidate = home.join(dir).join(name);
-                                if candidate.is_file() {
-                                    found = Some(candidate);
-                                    break 'outer;
-                                }
+                {
+                    let bin_names: &[&str] = if cfg!(windows) {
+                        &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
+                    } else {
+                        &["zeroclaw-desktop"]
+                    };
+                    // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
+                    let dirs: &[&str] = if cfg!(windows) {
+                        &[".cargo/bin"]
+                    } else {
+                        &[".cargo/bin", ".local/bin"]
+                    };
+                    'outer: for dir in dirs {
+                        for name in bin_names {
+                            let candidate = home.join(dir).join(name);
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break 'outer;
                             }
                         }
                     }
                 }
 
                 // 4. Fallback to PATH lookup
-                if found.is_none() {
-                    if let Ok(path) = which::which("zeroclaw-desktop") {
-                        found = Some(path);
-                    }
+                if found.is_none()
+                    && let Ok(path) = which::which("zeroclaw-desktop")
+                {
+                    found = Some(path);
                 }
 
                 found
@@ -4426,20 +5274,42 @@ async fn main() -> Result<()> {
         Commands::Locales { locales_command } => {
             let LocalesCommands::Fetch { locale, catalog } = locales_command;
             fetch_locales(&locale, catalog.as_deref()).await?;
-            return Ok(());
+            Ok(())
         }
 
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
+            json,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
-                if info.is_newer {
+                if json {
+                    // Machine-readable shape consumed by the gateway's
+                    // `GET /api/version/check`. Keep field names stable.
                     println!(
-                        "Update available: v{} -> v{}",
-                        info.current_version, info.latest_version
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "current_version": info.current_version,
+                            "latest_version": info.latest_version,
+                            "is_newer": info.is_newer,
+                            "release_url": info.release_url,
+                            "release_notes": info.release_notes,
+                            "published_at": info.published_at,
+                        }))?
+                    );
+                } else if info.is_newer {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-update-available",
+                            &[
+                                ("current", &info.current_version),
+                                ("latest", &info.latest_version)
+                            ],
+                            "Update available"
+                        )
                     );
                 } else {
                     println!(
@@ -4453,7 +5323,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                commands::update::run(version.as_deref(), force).await
             }
         }
 
@@ -4471,6 +5341,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Eval { eval_command } => match eval_command {
+            EvalCommands::Run {
+                suite,
+                mode,
+                format,
+            } => {
+                let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
+                let mode: zeroclaw_eval::Mode =
+                    mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
+                let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
+                commands::eval::print_report(&report, format);
+                if !report.all_passed() {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+        },
+
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema { path } => {
                 #[cfg(feature = "schema-export")]
@@ -4482,11 +5370,6 @@ async fn main() -> Result<()> {
                         Some(prop_path) => {
                             let full = serde_json::to_value(&schema)
                                 .context("failed to serialize JSON Schema")?;
-                            // Embed the requested path so consumers see the same hint
-                            // shape that OPTIONS /api/config/prop returns. Per-path
-                            // subtree extraction is a follow-up that walks the schema
-                            // by JSON Pointer; for now we attach the hint and return
-                            // the whole-config schema, mirroring the HTTP behavior.
                             let mut out = full;
                             if let serde_json::Value::Object(ref mut map) = out {
                                 map.insert(
@@ -4521,10 +5404,10 @@ async fn main() -> Result<()> {
                     if secrets && !entry.is_secret {
                         continue;
                     }
-                    if let Some(ref f) = filter {
-                        if !entry.name.starts_with(f.as_str()) {
-                            continue;
-                        }
+                    if let Some(ref f) = filter
+                        && !entry.name.starts_with(f.as_str())
+                    {
+                        continue;
                     }
                     if entry.category != current_category {
                         if !current_category.is_empty() {
@@ -4655,10 +5538,12 @@ async fn main() -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = dialoguer::Password::new()
-                        .with_prompt(format!("Enter value for {path}"))
-                        .interact()?;
-                    let secret_value = secret_value.trim().to_string();
+                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
+                        .trim()
+                        .to_string();
+                    if !secret_value.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -4666,15 +5551,18 @@ async fn main() -> Result<()> {
                 } else if let Some(val) = value {
                     config.set_prop_persistent(&path, &val)?;
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
-                    // `config set providers.models.<type>.<alias>.model`
-                    // with no value: fetch the live catalog and offer a
-                    // FuzzySelect, mirroring the quickstart picker UX so
-                    // the operator doesn't need to remember model ids by
-                    // hand. Falls back to free text on `live=false`
-                    // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
+                    let provider_ref = path
+                        .split('.')
+                        .nth(3)
+                        .map(|alias| format!("{provider_type}.{alias}"));
+                    let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
                     let (models, _pricing, live) =
-                        zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
+                        zeroclaw_runtime::quickstart::model_catalog_with_config(
+                            Some(&config),
+                            catalog_selector,
+                        )
+                        .await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();
                         let default = models.iter().position(|m| m == &current).unwrap_or(0);
@@ -4781,15 +5669,24 @@ async fn main() -> Result<()> {
             }
             ConfigCommands::Init { section, json } => {
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
-                let initialized: Vec<String> = config
+                let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
                     .map(str::to_string)
                     .collect();
+                for section in &initialized {
+                    config.mark_dirty(section);
+                }
+                // `init_defaults` only instantiates nested struct sections. A
+                // `<section>.<alias>` argument names a dynamic-map entry, which
+                // has to be materialized through `create_map_key` instead.
+                if let Some(arg) = section.as_deref()
+                    && let Some(created) = init_map_alias(&mut config, arg)?
+                {
+                    mark_new_map_alias_dirty(&mut config, &created);
+                    initialized.push(created);
+                }
                 if !initialized.is_empty() {
-                    for section in &initialized {
-                        config.mark_dirty(section);
-                    }
                     Box::pin(config.save_dirty()).await?;
                 }
                 if json {
@@ -4848,12 +5745,24 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => {
+                        let strict_error = std::fs::read_to_string(&config.config_path)
+                            .ok()
+                            .and_then(|raw| {
+                                crate::config::migration::migrate_to_current(&raw)
+                                    .err()
+                                    .map(|e| format!("{e:#}"))
+                            });
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": false,
                                 "schema_version": crate::config::migration::CURRENT_SCHEMA_VERSION,
+                                "valid": strict_error.is_none(),
+                                "error": strict_error,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
+                            if strict_error.is_some() {
+                                std::process::exit(1);
+                            }
                         } else {
                             println!(
                                 "{}",
@@ -4862,6 +5771,14 @@ async fn main() -> Result<()> {
                                     "Config already at current schema version."
                                 )
                             );
+                            if let Some(error) = strict_error {
+                                anyhow::bail!(
+                                    "config at {} does not deserialize strictly; the resilient \
+                                     loader is substituting defaults for the failing section. \
+                                     Parse error: {error}",
+                                    config.config_path.display()
+                                );
+                            }
                         }
                     }
                 }
@@ -4979,6 +5896,19 @@ async fn main() -> Result<()> {
                     } else {
                         raw_path.to_string()
                     };
+                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    {
+                        let err = ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            "alias `default` is reserved and cannot be created",
+                        )
+                        .with_path(&path)
+                        .with_op_index(idx);
+                        let human = format!(
+                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
+                        );
+                        config_patch_fail_json_or_human(json, err, human)?;
+                    }
                     let comment = match object.get("comment") {
                         Some(value) => match value.as_str() {
                             Some(comment) => Some(comment),
@@ -5000,33 +5930,49 @@ async fn main() -> Result<()> {
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
-                            let value = op.get("value").ok_or_else(|| {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Reject
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "op": op_name,
-                                            "op_index": idx,
-                                            "path": path,
-                                        })
-                                    ),
-                                    "config patch op rejected: missing `value` field"
-                                );
-                                anyhow::Error::msg(format!(
-                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                ))
-                            })?;
-                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config
-                                .set_prop_persistent(&path, &value_str)
-                                .with_context(|| {
-                                    format!("op[{idx}] `{op_name}` on `{path}` failed")
-                                })?;
+                            let value = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "op": op_name,
+                                                "op_index": idx,
+                                                "path": path,
+                                            })
+                                        ),
+                                        "config patch op rejected: missing `value` field"
+                                    );
+                                    let message = format!(
+                                        "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                    );
+                                    let api_err = config_patch_json_value_type_error(
+                                        message.clone(),
+                                        Some(path.clone()),
+                                        Some(idx),
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, message)?
+                                }
+                            };
+                            let value_str =
+                                json_value_to_setprop_string(value, &config, &path, idx, json)?;
+                            match config.set_prop_persistent(&path, &value_str) {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `{op_name}` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -5042,9 +5988,17 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop_persistent(&path, "").with_context(|| {
-                                format!("op[{idx}] `remove` on `{path}` failed")
-                            })?;
+                            match config.set_prop_persistent(&path, "") {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `remove` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -5152,9 +6106,14 @@ async fn main() -> Result<()> {
                     results.push(result_entry);
                 }
 
-                config
-                    .validate()
-                    .context("validation failed after applying patch \u{2014} no changes saved")?;
+                if let Err(err) = config.validate() {
+                    let api_err = ConfigApiError::from_validation(err);
+                    let human = format!(
+                        "validation failed after applying patch \u{2014} no changes saved: {}",
+                        api_err.message
+                    );
+                    config_patch_fail_json_or_human(json, api_err, human)?;
+                }
                 Box::pin(config.save_dirty()).await?;
 
                 if json {
@@ -5249,7 +6208,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let host = plugin_host_with_configured_security(&config)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5264,23 +6223,125 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                let target = config.plugins.resolved_plugins_dir().display().to_string();
+                for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-plugin-legacy-detected",
+                            &[("path", &legacy.display().to_string()), ("target", &target)],
+                            "Note: plugins in a legacy location are not loaded by the agent — \
+                             run `zeroclaw plugin migrate` to move them.",
+                        )
+                    );
+                }
                 Ok(())
             }
-            PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
-                host.install(&source)?;
-                println!(
-                    "{}",
-                    ta(
-                        "cli-plugin-installed-from",
-                        &[("source", &source)],
-                        "Plugin installed"
+            PluginCommands::Search { query, registry } => {
+                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                zeroclaw::plugins::registry::write_cached_registry_index(
+                    &config.data_dir,
+                    &registry_url,
+                    &index,
+                )?;
+                let matches = plugin_registry::search_entries(&index, &query);
+                if matches.is_empty() {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-none",
+                            &[("query", &query)],
+                            "No matching plugins."
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-search-results",
+                            &[("query", &query), ("count", &matches.len().to_string())],
+                            "Plugins matching query:"
+                        )
+                    );
+                    for plugin in &matches {
+                        let missing_description;
+                        let description = if let Some(description) = plugin.description.as_deref() {
+                            description
+                        } else {
+                            missing_description =
+                                t("cli-plugin-no-description", "(no description)");
+                            &missing_description
+                        };
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-search-result",
+                                &[
+                                    ("name", &plugin.name),
+                                    ("version", &plugin.version),
+                                    ("description", description),
+                                ],
+                                "Plugin search result"
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Install { source, registry } => {
+                if plugin_registry::looks_like_url(&source) {
+                    bail!(
+                        "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
+                    );
+                }
+                let mut host = plugin_host_with_configured_security(&config)?;
+                if plugin_registry::is_local_plugin_source(&source) {
+                    let name = host.install(&source)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-from",
+                            &[("source", &source)],
+                            "Plugin installed"
+                        )
+                    );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                } else {
+                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-install-resolving",
+                            &[("source", &source)],
+                            "Resolving plugin from registry..."
+                        )
+                    );
+                    let downloaded = plugin_registry::download_registry_plugin(
+                        &registry_url,
+                        &source,
+                        Some(&config.data_dir),
                     )
-                );
+                    .await?;
+                    let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    let name = host.install(&plugin_dir)?;
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-installed-name-version",
+                            &[
+                                ("name", &downloaded.manifest().name),
+                                ("version", &downloaded.manifest().version),
+                            ],
+                            "Plugin installed"
+                        )
+                    );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let mut host = plugin_host_with_configured_security(&config)?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5289,7 +6350,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let host = plugin_host_with_configured_security(&config)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(
@@ -5348,6 +6409,34 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
+            PluginCommands::Migrate => {
+                let target = config.plugins.resolved_plugins_dir();
+                let target_str = target.display().to_string();
+                let legacy_dirs = crate::config::schema::legacy_plugin_dirs_with_entries(&config);
+                let mut total = 0usize;
+                for legacy in &legacy_dirs {
+                    let moved = zeroclaw::plugins::host::migrate_plugins_dir(legacy, &target)?;
+                    if moved > 0 {
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-migrated",
+                                &[
+                                    ("count", &moved.to_string()),
+                                    ("path", &legacy.display().to_string()),
+                                    ("target", &target_str),
+                                ],
+                                "Migrated plugins from a legacy location.",
+                            )
+                        );
+                    }
+                    total += moved;
+                }
+                if total == 0 {
+                    println!("{}", t("cli-plugin-migrate-none", "Nothing to migrate."));
+                }
+                Ok(())
+            }
         },
     }
 }
@@ -5390,10 +6479,10 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
-                    let entered = Password::new()
-                        .with_prompt("Enter OTP code")
-                        .allow_empty_password(false)
-                        .interact()?;
+                    let entered = secret_prompt("Enter OTP code", false)?;
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -5695,11 +6784,148 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
     }
 }
 
-/// What the `get-paircode` CLI command should do against the running gateway.
-///
-/// Keeps the "add another client" path distinct from the destructive
-/// "rotate after compromise" paths (#6984) without resorting to bare flag
-/// booleans threaded through the fetch helper.
+/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
+/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
+/// without it these verbs cannot reach the daemon, so they error clearly.
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        sop_admin_request(cmd, config).await
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        let _ = (cmd, config);
+        anyhow::bail!(
+            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+        )
+    }
+}
+
+/// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
+/// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
+/// never builds a throwaway local engine, which cannot see the daemon's runs.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    let host = config.gateway.host.clone();
+    let port = config.gateway.port;
+    let prefix = config.gateway.path_prefix.as_deref();
+    let client = reqwest::Client::new();
+    match cmd {
+        SopCommands::Pending => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
+            let resp = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            let pending = body
+                .get("pending")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if pending.is_empty() {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-none", "No SOP runs waiting for approval.")
+                );
+            } else {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-header", "SOP runs waiting for approval:")
+                );
+                for r in pending {
+                    let run_id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sop_name = r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let step = r
+                        .get("step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    let total = r
+                        .get("total_steps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-sop-pending-row",
+                            &[
+                                ("run_id", run_id),
+                                ("sop_name", sop_name),
+                                ("step", &step),
+                                ("total", &total),
+                            ],
+                            "  (sop run)",
+                        )
+                    );
+                }
+            }
+            Ok(())
+        }
+        SopCommands::Approve { run_id } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
+            sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
+        }
+        SopCommands::Deny { run_id, reason } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny");
+            sop_admin_post(
+                &client,
+                &url,
+                serde_json::json!({ "run_id": run_id, "reason": reason }),
+            )
+            .await
+        }
+        // List/Validate/Show are dispatched on the local synchronous path.
+        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+    }
+}
+
+/// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+    let status = resp.status();
+    let out: serde_json::Value = resp.json().await.unwrap_or_default();
+    if status.is_success() {
+        println!(
+            "{}",
+            out.get("outcome").and_then(|v| v.as_str()).unwrap_or("ok")
+        );
+        Ok(())
+    } else {
+        // Non-2xx bodies from the SOP routes carry the typed `outcome` label
+        // (e.g. not_waiting -> 404, rejected_self_approval -> 403), not `error`;
+        // prefer it so the operator sees why, falling back to `error`.
+        let detail = out
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .or_else(|| out.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("request failed");
+        anyhow::bail!("Gateway responded {status}: {detail}");
+    }
+}
+
 #[cfg(feature = "agent-runtime")]
 enum PaircodeAction {
     /// GET the current code; do not mint or revoke anything.
@@ -5750,11 +6976,6 @@ enum PaircodeResult {
     NoCode { message: Option<String> },
 }
 
-/// Fetch or generate the gateway pairing code from a running gateway.
-///
-/// `Show` issues a GET; the other actions POST to `/admin/paircode/new`,
-/// optionally carrying a `rotate` query so the gateway revokes the matching
-/// tokens before minting the new code.
 #[cfg(feature = "agent-runtime")]
 async fn fetch_paircode(
     host: &str,
@@ -5795,11 +7016,6 @@ async fn fetch_paircode(
         anyhow::Error::msg(format!("Failed to connect to gateway: {e}"))
     })?;
 
-    // A rotation that revoked tokens but could not issue a code (registry
-    // disabled, device not found, persist failure) returns a non-2xx with an
-    // explanatory message in the body. Surface that message rather than
-    // collapsing it into a bare status line, so the operator knows what
-    // state the gateway is in after the revoke attempt.
     let status = response.status();
     let json: serde_json::Value = response.json().await.map_err(|e| {
         ::zeroclaw_log::record!(
@@ -5847,6 +7063,134 @@ fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_pat
     format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
+#[cfg(feature = "agent-runtime")]
+fn paircode_no_code_message(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    action: &PaircodeAction,
+    require_pairing: bool,
+    gateway_message: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(message) = gateway_message.filter(|m| !m.trim().is_empty()) {
+        lines.push(format!("⚠️  {message}"));
+    } else if require_pairing {
+        lines
+            .push("🔐 Gateway pairing is enabled, but no active pairing code is available.".into());
+    } else {
+        lines.push(t(
+            "cli-pairing-disabled",
+            "⚠️  Gateway pairing is disabled in config.",
+        ));
+        lines.push("All requests will be accepted without authentication.".into());
+        lines.push("To enable pairing, set [gateway] require_pairing = true.".into());
+        return indent_paircode_lines(lines);
+    }
+
+    lines.push(String::new());
+    match action {
+        PaircodeAction::Show => {
+            lines.push(
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one."
+                    .into(),
+            );
+            lines.push("To pair another device, run:".into());
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
+            lines.push(String::new());
+            lines.push("To revoke existing pairings and mint a replacement code, run:".into());
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--rotate"),
+            ));
+        }
+        PaircodeAction::AddClient => {
+            lines.push(
+                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset."
+                    .into(),
+            );
+            lines.push(
+                "Try again shortly, or revoke existing pairings and mint a replacement code:"
+                    .into(),
+            );
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--rotate"),
+            ));
+        }
+        PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
+            lines.push("The rotate request completed without returning a replacement code.".into());
+            lines.push("Check whether pairing is enabled, then request a new device code:".into());
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("To inspect the running gateway:".into());
+    lines.push(format!(
+        "    open http://{}:{port}",
+        gateway_browser_host(host)
+    ));
+    indent_paircode_lines(lines)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn paircode_command(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    flag: Option<&str>,
+) -> String {
+    let mut command = "    zeroclaw gateway get-paircode".to_string();
+    if let Some(flag) = flag {
+        command.push(' ');
+        command.push_str(flag);
+    }
+    if port != default_port {
+        write!(command, " --port {port}").expect("writing to String cannot fail");
+    }
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
+}
+
+#[cfg(feature = "agent-runtime")]
+fn indent_paircode_lines(lines: Vec<String>) -> String {
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.starts_with("    ") || line.is_empty() {
+                line
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // Interactive CLI input helpers used by `auth paste-token` /
 // `auth setup-token` / `auth paste-redirect`. The dialoguer dep belongs
 // to the binary; auth/mod.rs in zeroclaw-providers shouldn't pull it in,
@@ -5854,10 +7198,10 @@ fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_pat
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
+    let input = secret_prompt(prompt, false)?;
+    if !input.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
     Ok(input.trim().to_string())
 }
 
@@ -5889,10 +7233,164 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InlineProviderAuth {
+    Codex,
+    AnthropicSetupToken { alias: String },
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_field_value_eq(
+    fields: &std::collections::HashMap<String, String>,
+    key: &str,
+    expected: &str,
+) -> bool {
+    fields
+        .get(key)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_inline_auth(
+    kind: &str,
+    alias: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<InlineProviderAuth> {
+    if kind == "openai" && quickstart_field_value_eq(fields, "auth_mode", "codex") {
+        return Some(InlineProviderAuth::Codex);
+    }
+    if kind == "anthropic" && quickstart_field_value_eq(fields, "auth_mode", "setup_token") {
+        return Some(InlineProviderAuth::AnthropicSetupToken {
+            alias: alias.to_string(),
+        });
+    }
+    None
+}
+
+/// `~/.codex/auth.json` — the credential file the upstream Codex CLI writes.
+/// When present, offer a direct import instead of starting a fresh browser flow.
+#[cfg(feature = "agent-runtime")]
+fn codex_auth_json_path() -> Option<std::path::PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().join(".codex").join("auth.json"))
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &mut Config) {
+    use dialoguer::Confirm;
+
+    let codex_import = match &auth {
+        InlineProviderAuth::Codex => codex_auth_json_path().filter(|path| path.exists()),
+        InlineProviderAuth::AnthropicSetupToken { .. } => None,
+    };
+    let (prompt, skip_hint) = match &auth {
+        InlineProviderAuth::Codex => (
+            if codex_import.is_some() {
+                t(
+                    "cli-quickstart-auth-codex-import-prompt",
+                    "Found an existing Codex login (~/.codex/auth.json) — import it now?",
+                )
+            } else {
+                t(
+                    "cli-quickstart-auth-codex-prompt",
+                    "Sign in to OpenAI Codex with your ChatGPT account now?",
+                )
+            },
+            t(
+                "cli-quickstart-auth-codex-skip-hint",
+                "  Finish later with: zeroclaw auth login --model-provider openai-codex",
+            ),
+        ),
+        InlineProviderAuth::AnthropicSetupToken { alias } => (
+            ta(
+                "cli-quickstart-auth-anthropic-prompt",
+                &[("alias", alias)],
+                "Run `claude setup-token` for this Anthropic provider now?",
+            ),
+            ta(
+                "cli-quickstart-auth-anthropic-skip-hint",
+                &[("alias", alias)],
+                "  Finish later with: claude setup-token",
+            ),
+        ),
+    };
+    if !Confirm::new()
+        .with_prompt(prompt)
+        .default(true)
+        .interact()
+        .unwrap_or(false)
+    {
+        println!("{skip_hint}");
+        return;
+    }
+
+    let result = match auth {
+        InlineProviderAuth::Codex => {
+            let cmd = AuthCommands::Login {
+                model_provider: "openai-codex".to_string(),
+                profile: "default".to_string(),
+                device_code: false,
+                import: codex_import,
+            };
+            handle_auth_command(cmd, config).await
+        }
+        InlineProviderAuth::AnthropicSetupToken { alias } => {
+            Box::pin(run_anthropic_setup_token_inline(&alias, config)).await
+        }
+    };
+    if let Err(error) = result {
+        let error = error.to_string();
+        eprintln!(
+            "{}",
+            ta(
+                "cli-quickstart-auth-failed",
+                &[("error", &error)],
+                "  Auth setup didn't complete.",
+            )
+        );
+        println!("{skip_hint}");
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> Result<()> {
+    let status = tokio::process::Command::new("claude")
+        .arg("setup-token")
+        .status()
+        .await
+        .context("failed to run `claude setup-token`; is the Claude CLI installed and on PATH?")?;
+    if !status.success() {
+        bail!("`claude setup-token` exited with status {status}");
+    }
+
+    let token = read_auth_input(&t(
+        "cli-quickstart-auth-anthropic-token-prompt",
+        "Paste the token from `claude setup-token`",
+    ))?;
+    if token.trim().is_empty() {
+        bail!("Token cannot be empty");
+    }
+
+    let path = format!("providers.models.anthropic.{alias}.api_key");
+    config.set_prop_persistent(&path, token.trim())?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-quickstart-auth-anthropic-saved",
+            &[("alias", alias)],
+            "  Saved Claude setup token.",
+        )
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -5907,6 +7405,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -5925,6 +7424,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6021,6 +7521,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
@@ -6145,22 +7646,75 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             Ok(())
         }
+
+        AuthCommands::EmailLogin { channel, profile } => {
+            let email_cfg = config.channels.email.get(&channel).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "No [channels.email.{channel}] block found in config. \
+                     Add the block with an [channels.email.{channel}.oauth2] section first."
+                ))
+            })?;
+
+            let oauth2 = email_cfg.oauth2.as_ref().ok_or_else(|| anyhow::Error::msg(format!(
+                "[channels.email.{channel}] exists but has no [channels.email.{channel}.oauth2] block."
+            )))?;
+
+            let client = reqwest::Client::new();
+            let device = auth::email_oauth2::start_device_code_flow(
+                &client,
+                &oauth2.device_code_url,
+                &oauth2.client_id,
+                &oauth2.scopes,
+            )
+            .await?;
+
+            println!("Email OAuth2 device-code login started."); // i18n-exempt: interactive device-code CLI prompt
+            println!("Visit:  {}", device.verification_uri); // i18n-exempt: interactive device-code CLI prompt
+            println!("Code:   {}", device.user_code); // i18n-exempt: interactive device-code CLI prompt
+            if let Some(ref uri) = device.verification_uri_complete {
+                println!("Or open directly: {uri}"); // i18n-exempt: interactive device-code CLI prompt
+            }
+            println!("Waiting for authorization…"); // i18n-exempt: interactive device-code CLI prompt
+
+            let token_set = auth::email_oauth2::poll_device_code_tokens(
+                &client,
+                &oauth2.token_url,
+                &oauth2.client_id,
+                &device,
+            )
+            .await?;
+
+            let channel_alias = format!("email.{channel}");
+            auth_service
+                .store_email_oauth2_tokens(&channel_alias, &profile, token_set)
+                .await?;
+            println!("Saved profile {profile} for {channel_alias}"); // i18n-exempt: interactive device-code CLI prompt
+            Ok(())
+        }
     }
 }
 
-/// Gate every serving entry point on the loaded security posture.
+/// Tell the operator that `vi_verify` is withheld from the model-visible
+/// registry while no credential chain verifier exists.
 ///
-/// `Config.degraded_security` lists security-critical sections (`security`,
-/// `risk_profiles`, `peer_groups`) that failed to parse and were reset to
-/// their defaults during load — the running posture may then be WEAKER than
-/// intended. "Secure by default" must fail loud here (FND-006 §4.5), so every
-/// path that brings up the serving surface (daemon, `gateway start`,
-/// `gateway restart`) routes through this before binding.
-///
-/// Returns `Err` when degraded and `allow_degraded` is false (the caller
-/// propagates and the process never serves). When degraded and explicitly
-/// allowed, boots but returns the `JoinHandle` of a repeating-WARN nag task so
-/// the caller can abort it on reload; `Ok(None)` means a clean posture.
+/// Called once per config application: at process config load, and again when
+/// the daemon reload arm re-reads config from disk. Registry assembly is the
+/// wrong home for it, because that runs on ordinary gateway requests and on
+/// nested SOP and delegation rebuilds. Each call site must sit after its
+/// `runtime_trace::init_from_config`, or the record has no sink.
+#[cfg(feature = "agent-runtime")]
+fn warn_verifiable_intent_withheld(config: &Config) {
+    if !config.verifiable_intent.enabled {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+    );
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -6194,13 +7748,307 @@ fn gate_security_posture(
                 &format!(
                     "Running with DEGRADED security: sections ({sections}) were reset to \
                      defaults and `--allow-degraded-security` was set. The posture may be \
-                     weaker than intended — repair {config_path} and reload \
-                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                     weaker than intended — repair {config_path} and restart \
+                     the process as soon as possible."
                 )
             );
         }
     });
     Ok(Some(handle))
+}
+
+/// Build the SOP channel-backed adapters from one shared channel map:
+/// - the approval ROUTE adapter, so a SOP that parks at a policied gate (or later
+///   times out) can deliver its approval request / escalation notice to a real
+///   channel (Discord, Slack, ...);
+/// - the FORGE-WRITE adapter, so an approved `forge.comment` capability step can
+///   post its comment back to the forge by driving the git channel's normal
+///   outbound path.
+///
+/// - the LLM adapter, so an `llm.generate` capability step can run one bounded
+///   model call on the default agent's resolved provider.
+///
+/// Each field is `None` when not applicable (no channels at all; no git channel
+/// for the forge half; no resolvable default model provider for the llm half), in
+/// which case `build_sop_engine` falls back to the log-only no-op route adapter
+/// and the fail-closed `forge.comment` / `llm.generate` placeholders (unchanged
+/// behavior). MUST be called from within the tokio runtime: it captures
+/// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
+/// to the async channel/provider calls.
+#[cfg(feature = "agent-runtime")]
+fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
+    // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
+    // daemon-level model of record. No resolvable provider = fail-closed.
+    let llm: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>> =
+        config
+            .resolved_model_provider_for_agent("default")
+            .and_then(|(provider_type, alias, entry)| {
+                // Alias-aware factory WITH the alias's runtime options: the options
+                // carry zeroclaw_dir (auth-profile store) and per-alias runtime
+                // knobs — without them, OAuth/subscription providers (codex,
+                // opencode) sit unauthenticated and never answer. This mirrors the
+                // delegate tool's provider construction.
+                let options = zeroclaw::providers::provider_runtime_options_for_alias(
+                    config,
+                    provider_type,
+                    alias,
+                );
+                let provider = match zeroclaw::providers::create_model_provider_for_alias(
+                    config,
+                    provider_type,
+                    alias,
+                    entry.api_key.as_deref(),
+                    &options,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "SOP llm.generate adapter unavailable: default model provider failed to build"
+                        );
+                        return None;
+                    }
+                };
+                let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
+                Some(std::sync::Arc::new(
+                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+                        std::sync::Arc::from(provider),
+                        model,
+                    ),
+                ) as _)
+            });
+
+    let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
+    // Startup validation: this send-only adapter's channel map omits channels that
+    // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
+    // configured approval route whose channel is absent here, so a `request_route` /
+    // `escalation_route` that would silently fail to deliver at gate time is caught up
+    // front rather than on the first parked gate. This runs BEFORE the empty-map return:
+    // when there are no deliverable channels at all, EVERY configured route is
+    // undeliverable and must still be surfaced.
+    // A route target must be a channel that can actually deliver OUTBOUND; an
+    // inbound-only channel (e.g. AMQP, whose `send` is a no-op) in the map cannot send
+    // an approval notice, so it is not a resolvable route target.
+    let deliverable_keys: std::collections::HashSet<String> = channels
+        .iter()
+        .filter(|(_, ch)| ch.supports_outbound_send())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for issue in zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
+        &config.sop.approval,
+        &deliverable_keys,
+    ) {
+        match issue {
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::Malformed {
+                policy,
+                route_kind,
+                route,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                        })),
+                    "SOP approval route is malformed; use the required channel:recipient format"
+                );
+            }
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::UndeliverableChannel {
+                policy,
+                route_kind,
+                route,
+                channel_key,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                            "channel": channel_key,
+                        })),
+                    "SOP approval route names a channel the route adapter cannot deliver to; \
+                     its approval notices will not be sent (the channel may require runtime SOP \
+                     handles this send-only adapter lacks)"
+                );
+            }
+        }
+    }
+    if channels.is_empty() {
+        return zeroclaw_runtime::sop::SopEngineAdapters {
+            llm,
+            ..Default::default()
+        };
+    }
+    let handle = tokio::runtime::Handle::current();
+    let route: std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter> =
+        std::sync::Arc::new(zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
+            channels.clone(),
+            handle.clone(),
+        ));
+    // Only offer the forge adapter when a git channel actually exists, so
+    // `forge.comment` stays fail-closed on daemons without a forge.
+    let has_git = channels.keys().any(|k| k == "git" || k.starts_with("git."));
+    let forge: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::ForgeCommentAdapter>> =
+        has_git.then(|| {
+            std::sync::Arc::new(zeroclaw_runtime::sop::capability::ChannelForgeAdapter::new(
+                channels,
+            )) as _
+        });
+    zeroclaw_runtime::sop::SopEngineAdapters {
+        route: Some(route),
+        forge,
+        llm,
+    }
+}
+
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
+#[cfg(feature = "agent-runtime")]
+fn spawn_sop_maintenance(
+    sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let engine = sop_engine.cloned()?;
+    let audit = sop_audit.cloned();
+    let cron_cache = audit
+        .as_ref()
+        .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
+    Some(::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_cron_check = chrono::Utc::now();
+        loop {
+            ticker.tick().await;
+            let Some(report) = run_sop_maintenance_tick(
+                &engine,
+                audit.as_ref(),
+                cron_cache.as_ref(),
+                &mut last_cron_check,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !report.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "timed_out": report.maintenance.timed_out,
+                            "reaped_claims": report.maintenance.reaped_claims,
+                            "pruned_runs": report.maintenance.pruned_runs,
+                            "cron_started": report.cron_started,
+                            "cron_skipped": report.cron_skipped,
+                            "cron_no_match": report.cron_no_match,
+                        })),
+                    "SOP maintenance tick"
+                );
+            }
+        }
+    }))
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Default)]
+struct SopMaintenanceTickReport {
+    maintenance: zeroclaw_runtime::sop::MaintenanceSummary,
+    cron_started: usize,
+    cron_skipped: usize,
+    cron_blocked_unsafe: usize,
+    cron_no_match: usize,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenanceTickReport {
+    fn is_empty(&self) -> bool {
+        self.maintenance.is_empty()
+            && self.cron_started == 0
+            && self.cron_skipped == 0
+            && self.cron_blocked_unsafe == 0
+            && self.cron_no_match == 0
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_sop_maintenance_tick(
+    engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
+    last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+) -> Option<SopMaintenanceTickReport> {
+    let maintenance = match engine.lock() {
+        Ok(mut e) => e.run_maintenance_tick(),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP maintenance tick: engine lock poisoned; skipping this pass"
+            );
+            return None;
+        }
+    };
+
+    let mut report = SopMaintenanceTickReport {
+        maintenance,
+        ..SopMaintenanceTickReport::default()
+    };
+
+    if let (Some(audit), Some(cache)) = (audit, cron_cache) {
+        let results = zeroclaw_runtime::sop::dispatch::check_sop_cron_triggers(
+            engine,
+            audit,
+            cache,
+            last_cron_check,
+        )
+        .await;
+        for result in &results {
+            match result {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                    report.cron_started += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced { .. } => {
+                    // A2: deferred (backpressure) / coalesced triggers did not start a
+                    // run this tick; the cron schedule re-fires them next pass. The
+                    // precise outcome is logged by process_headless_results below.
+                    report.cron_skipped += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
+                    report.cron_blocked_unsafe += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {
+                    report.cron_no_match += 1;
+                }
+            }
+        }
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    }
+
+    Some(report)
 }
 
 #[cfg(feature = "gateway")]
@@ -6210,14 +8058,34 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
+    let default_host = config.gateway.host.clone();
+    let default_port = config.gateway.port;
+    // Capture the launch command before the gateway starts so in-app upgrade
+    // can self-respawn after the listener is released. Must mirror the same
+    // call in the Daemon branch.
+    zeroclaw_runtime::restart::record_launch();
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
-    Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None,
+    let result = Box::pin(gateway::run_gateway(
+        host, port, config, tx, None, None, None, None, None, None,
     ))
-    .await
+    .await;
+    // Self-respawn after the listener is released, if an in-app upgrade
+    // requested it. No-op when no respawn was requested or on supervised
+    // restart modes.
+    zeroclaw_runtime::restart::respawn_if_requested();
+    match result {
+        Err(err) if is_addr_in_use_error(&err) => {
+            let restart_port = available_gateway_restart_hint_port(host, port);
+            anyhow::bail!(
+                "{}",
+                gateway_addr_in_use_message(host, port, &default_host, default_port, restart_port)
+            );
+        }
+        other => other,
+    }
 }
 
 #[cfg(not(feature = "gateway"))]
@@ -6231,15 +8099,425 @@ async fn run_gateway_if_enabled(
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
 
+fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == ErrorKind::AddrInUse)
+    })
+}
+
+fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
+    host == default_host && port == default_port
+}
+
+fn gateway_browser_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        _ => host,
+    }
+}
+
+fn gateway_addr_in_use_message(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    restart_port: Option<u16>,
+) -> String {
+    let mut lines = vec![
+        format!("Port {port} is already in use, so the gateway could not start."),
+        String::new(),
+        "A ZeroClaw daemon or another service may already be running on this port.".to_string(),
+        "Try one of:".to_string(),
+        String::new(),
+    ];
+
+    if is_default_gateway_addr(host, port, default_host, default_port) {
+        lines.push(format!(
+            "    open http://{}:{port}",
+            gateway_browser_host(host)
+        ));
+    }
+
+    lines.push(gateway_paircode_recovery_command(
+        host,
+        port,
+        default_host,
+        default_port,
+    ));
+    if let Some(restart_port) = restart_port {
+        lines.push(gateway_restart_recovery_command(
+            host,
+            restart_port,
+            default_host,
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "To inspect the listener:".to_string(),
+        format!("    lsof -nP -iTCP:{port} -sTCP:LISTEN"),
+    ]);
+    lines.join("\n")
+}
+
+fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
+    let mut command = format!("    zeroclaw gateway start --port {port}");
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
+}
+
+fn gateway_paircode_recovery_command(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+) -> String {
+    if host == default_host && port == default_port {
+        return "    zeroclaw gateway get-paircode".to_string();
+    }
+
+    let mut command = format!("    zeroclaw gateway get-paircode --port {port}");
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
+}
+
+fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
+    const SCAN_LIMIT: u16 = 20;
+
+    for offset in 1..=SCAN_LIMIT {
+        let Some(candidate) = port.checked_add(offset) else {
+            break;
+        };
+        if std::net::TcpListener::bind(zeroclaw_infra::effective_gateway_bind_socket_addr(
+            host, candidate,
+        ))
+        .is_ok()
+        {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Persist `model` as the default for the first configured provider.
+#[cfg(feature = "agent-runtime")]
+async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+    let (type_key, alias) = {
+        let entry = config
+            .providers
+            .models
+            .iter_entries()
+            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "No model provider configured. Run `zeroclaw config init` first.",
+                )
+            })?;
+        (entry.0, entry.1.to_string())
+    };
+    let prop_path = format!("providers.models.{type_key}.{alias}.model");
+    config.set_prop_persistent(&prop_path, model)?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-models-set-ok",
+            &[
+                ("model", model),
+                ("provider", &format!("{type_key}.{alias}")),
+            ]
+        )
+    );
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn dispatch_models_command(model_command: ModelCommands, config: &mut Config) -> Result<()> {
+    match model_command {
+        ModelCommands::List {
+            model_provider,
+            check,
+        } => doctor::run_configured_models(config, model_provider.as_deref(), check).await,
+        ModelCommands::Refresh { model_provider, .. } => {
+            doctor::run_models(config, model_provider.as_deref(), false, false).await
+        }
+        ModelCommands::Set { model } => handle_models_set(config, &model).await,
+        ModelCommands::Status => {
+            match config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            {
+                Some((ty, alias, entry)) => {
+                    let model = entry.model.as_deref().unwrap_or("unknown");
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-models-status-current",
+                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
+                        )
+                    );
+                }
+                None => {
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string("cli-models-status-none")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use std::net::TcpListener;
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn openrc_log_writer_cli_maps_only_known_streams() {
+        for (value, expected) in [
+            ("stdout", ServiceLogStream::Stdout),
+            ("stderr", ServiceLogStream::Stderr),
+        ] {
+            let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", value])
+                .expect("internal OpenRC logger should parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Service {
+                    service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+                    ..
+                } if stream == expected
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "service",
+                "run-openrc-log-writer",
+                "/tmp/arbitrary.log"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn probe_config_dir_extracts_global_flag_in_all_forms() {
+        fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
+            parts
+                .iter()
+                .map(|s| std::ffi::OsString::from(*s))
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+
+        let command = Cli::command();
+
+        // argv[0] is consumed by clap as the binary name.
+        // Space form.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "/x"])),
+            Some("/x".to_string())
+        );
+        // Equals form.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir=/y"])),
+            Some("/y".to_string())
+        );
+        // Global arg: may appear *after* a subcommand.
+        assert_eq!(
+            probe_config_dir(
+                &command,
+                argv(&["zeroclaw", "status", "--config-dir", "/z"])
+            ),
+            Some("/z".to_string())
+        );
+        // Absent.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "status"])),
+            None
+        );
+        // `--` ends option parsing; later values must never redirect config.
+        assert_eq!(
+            probe_config_dir(
+                &command,
+                argv(&[
+                    "zeroclaw",
+                    "config",
+                    "set",
+                    "locale",
+                    "--",
+                    "--config-dir=/ignored",
+                ])
+            ),
+            None
+        );
+        // Present but empty — returned verbatim for clap's validation path.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", ""])),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn probe_config_dir_follows_clap_token_ownership() {
+        fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
+            parts
+                .iter()
+                .map(|s| std::ffi::OsString::from(*s))
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+
+        let command = Cli::command();
+        let external_payload = [
+            "zeroclaw",
+            "props",
+            "legacy-command",
+            "--config-dir=/unintended",
+        ];
+
+        // The external subcommand owns every remaining token, including one
+        // that looks like a global option.
+        let cli = Cli::try_parse_from(external_payload)
+            .expect("the deprecated external-subcommand path is valid clap input");
+        assert!(cli.config_dir.is_none());
+        assert_eq!(probe_config_dir(&command, argv(&external_payload)), None);
+
+        // Option-looking and terminating tokens cannot satisfy the spaced
+        // form's required value.
+        assert!(Cli::try_parse_from(["zeroclaw", "--config-dir", "--help"]).is_err());
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--help"])),
+            None
+        );
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--"])),
+            None
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "lmstudio".into(),
+            display_name: "LM Studio".into(),
+            local: true,
+            default_runtime_profile: Some("local_small".into()),
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("lmstudio", &providers, "unbounded"),
+            "local_small"
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_advertised_remote_provider_runtime_default() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            local: false,
+            default_runtime_profile: Some("unbounded".into()),
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("anthropic", &providers, "unbounded"),
+            "unbounded"
+        );
+    }
+
+    #[test]
+    fn cli_quickstart_uses_state_fallback_when_provider_has_no_override() {
+        let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
+            kind: "ollama".into(),
+            display_name: "Ollama".into(),
+            local: true,
+            default_runtime_profile: None,
+        }];
+
+        assert_eq!(
+            quickstart_runtime_profile_for_provider("ollama", &providers, "unbounded"),
+            "unbounded"
+        );
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {
+        // Neutral multi-byte placeholder text; each CJK char is 3 bytes, so a
+        // byte cap can land inside a character. Pre-fix this panicked via the
+        // raw `String::truncate(cap)`.
+        let mut line = "语言".repeat(64); // 128 chars, 384 bytes, all 3-byte
+        let cap = 10; // byte index 10 is mid-character (10 % 3 != 0)
+        assert!(
+            !line.is_char_boundary(cap),
+            "precondition: cap splits a char"
+        );
+        cap_line_utf8_safe(&mut line, cap);
+        assert!(line.len() <= cap, "must not exceed the byte cap");
+        assert!(
+            line.is_char_boundary(line.len()),
+            "result must end on a valid UTF-8 char boundary"
+        );
+        // cap 10 floors to byte 9 = three whole 3-byte chars.
+        assert_eq!(
+            line, "语言语",
+            "should keep whole chars up to the floored cap"
+        );
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_is_noop_when_within_cap() {
+        let mut line = String::from("héllo"); // 6 bytes
+        cap_line_utf8_safe(&mut line, 1024);
+        assert_eq!(line, "héllo");
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_ascii_exact_cap() {
+        let mut line = String::from("abcdefgh");
+        cap_line_utf8_safe(&mut line, 4);
+        assert_eq!(line, "abcd");
+    }
 
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_inline_auth_uses_auth_mode_field() {
+        let fields =
+            std::collections::HashMap::from([("auth_mode".to_string(), " codex ".to_string())]);
+        assert_eq!(
+            quickstart_inline_auth("openai", "codex", &fields),
+            Some(InlineProviderAuth::Codex)
+        );
+
+        let fields =
+            std::collections::HashMap::from([("auth_mode".to_string(), "setup_token".to_string())]);
+        assert_eq!(
+            quickstart_inline_auth("anthropic", "max", &fields),
+            Some(InlineProviderAuth::AnthropicSetupToken {
+                alias: "max".to_string()
+            })
+        );
+
+        assert_eq!(quickstart_inline_auth("openai", "api", &fields), None);
     }
 
     #[test]
@@ -6458,9 +8736,27 @@ mod tests {
         }
     }
 
-    /// `--rotate` parses and is mutually exclusive with `--new` and
-    /// `--rotate-device` so the destructive path cannot be silently combined
-    /// with "add another client".
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn security_status_cli_requires_agent_and_parses_json_form() {
+        let err = Cli::try_parse_from(["zeroclaw", "security", "status"])
+            .expect_err("security status requires --agent");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "security", "status", "--agent", "ops", "--json"])
+                .expect("security status --agent --json should parse");
+        match cli.command {
+            Commands::Security {
+                security_command: SecurityCommands::Status { agent, json },
+            } => {
+                assert_eq!(agent, "ops");
+                assert!(json);
+            }
+            other => panic!("expected security status command, got {other:?}"),
+        }
+    }
+
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn gateway_get_paircode_rotate_flags_parse_and_conflict() {
@@ -6507,11 +8803,6 @@ mod tests {
         );
     }
 
-    /// Regression for PR #6192: when the user passes `--port`/`--host` to
-    /// `gateway get-paircode`, the override must compose with the configured
-    /// `path_prefix` rather than bypass it. `fetch_paircode` threads
-    /// `path_prefix` through `gateway_admin_url`; this test pins that the URL
-    /// we'd actually send still hits `<prefix>/admin/paircode/new`.
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn paircode_url_combines_host_port_override_with_configured_path_prefix() {
@@ -6528,6 +8819,258 @@ mod tests {
             gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
             "http://192.168.1.20:42617/gw/admin/paircode",
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_explains_bare_command_does_not_mint() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            Some("Pairing is active but no new code available (already paired or code expired)"),
+        );
+
+        assert!(msg.contains("only displays an existing active code; it does not mint"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --new"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+        assert!(msg.contains("open http://127.0.0.1:42617"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_host_port_on_suggestions() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "192.168.1.20",
+            9001,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+
+        assert!(
+            msg.contains("zeroclaw gateway get-paircode --new --port 9001 --host 192.168.1.20")
+        );
+        assert!(
+            msg.contains("zeroclaw gateway get-paircode --rotate --port 9001 --host 192.168.1.20")
+        );
+        assert!(msg.contains("open http://192.168.1.20:9001"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
+        let default = config::GatewayConfig::default();
+
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = paircode_no_code_message(
+                host,
+                9001,
+                &default.host,
+                default.port,
+                &PaircodeAction::Show,
+                true,
+                None,
+            );
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_omits_configured_default_host_port() {
+        let msg = paircode_no_code_message(
+            "192.168.1.20",
+            9001,
+            "192.168.1.20",
+            9001,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+
+        assert!(msg.contains("zeroclaw gateway get-paircode --new\n"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate\n"));
+        assert!(!msg.contains("--port 9001"));
+        assert!(!msg.contains("--host 192.168.1.20"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_for_new_suggests_rotate() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            &PaircodeAction::AddClient,
+            true,
+            Some("Pairing is active but no new code available (already paired or code expired)"),
+        );
+
+        assert!(msg.contains("did not mint a new pairing code"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_guides_default_gateway_recovery() {
+        let default = config::GatewayConfig::default();
+        let msg = gateway_addr_in_use_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            Some(42618),
+        );
+
+        assert!(msg.contains("Port 42617 is already in use"));
+        assert!(msg.contains("open http://127.0.0.1:42617"));
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(msg.contains("zeroclaw gateway start --port 42618"));
+        assert!(msg.contains("lsof -nP -iTCP:42617 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_keeps_non_default_host_context() {
+        let default = config::GatewayConfig::default();
+        let msg =
+            gateway_addr_in_use_message("0.0.0.0", 9001, &default.host, default.port, Some(9002));
+
+        assert!(!msg.contains("open http://127.0.0.1:42617"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 0.0.0.0"));
+        assert!(msg.contains("zeroclaw gateway start --port 9002 --host 0.0.0.0"));
+        assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
+            let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
+
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
+            assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
+        }
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_omits_restart_when_no_available_port() {
+        let default = config::GatewayConfig::default();
+        let msg =
+            gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port, None);
+
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(!msg.contains("zeroclaw gateway start --port"));
+        assert!(msg.contains("lsof -nP -iTCP:42617 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_skips_occupied_restart_hint_port() {
+        let default = config::GatewayConfig::default();
+        let (port, mut listeners) = reserve_consecutive_local_ports(3);
+        let available_port = port + 2;
+        drop(listeners.pop());
+
+        let restart_port = available_gateway_restart_hint_port("127.0.0.1", port);
+        let msg = gateway_addr_in_use_message(
+            "127.0.0.1",
+            port,
+            &default.host,
+            default.port,
+            restart_port,
+        );
+
+        assert!(
+            !msg.contains(&format!("zeroclaw gateway start --port {}", port + 1)),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("zeroclaw gateway start --port {available_port}")),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_configured_default_gateway_recovery() {
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001, None);
+
+        assert!(msg.contains("open http://192.168.1.20:9001"));
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(!msg.contains("get-paircode --port 9001"));
+    }
+
+    #[test]
+    fn gateway_restart_hint_uses_gateway_bind_fallback_for_hostnames() {
+        let (port, mut listeners) = reserve_consecutive_local_ports(3);
+        let available_port = port + 2;
+        drop(listeners.pop());
+
+        assert_eq!(
+            available_gateway_restart_hint_port("localhost", port),
+            Some(available_port)
+        );
+    }
+
+    #[test]
+    fn gateway_bind_addr_resolver_accepts_bracketed_ipv6_hosts() {
+        let addr = zeroclaw_infra::effective_gateway_bind_socket_addr("[::1]", 9001);
+
+        assert_eq!(addr.port(), 9001);
+        assert!(addr.is_ipv6());
+    }
+
+    #[test]
+    fn gateway_addr_in_use_detector_recognizes_nested_io_error() {
+        let err = std::io::Error::from(ErrorKind::AddrInUse);
+        let err = anyhow::Error::new(err).context("gateway bind failed");
+
+        assert!(is_addr_in_use_error(&err));
+    }
+
+    fn reserve_consecutive_local_ports(count: u16) -> (u16, Vec<TcpListener>) {
+        for _ in 0..100 {
+            let Ok(first) = TcpListener::bind(("127.0.0.1", 0)) else {
+                continue;
+            };
+            let port = first.local_addr().expect("listener has local addr").port();
+            if port > u16::MAX - count {
+                continue;
+            }
+
+            let mut listeners = vec![first];
+            let mut reserved_all = true;
+            for offset in 1..count {
+                match TcpListener::bind(("127.0.0.1", port + offset)) {
+                    Ok(listener) => listeners.push(listener),
+                    Err(_) => {
+                        reserved_all = false;
+                        break;
+                    }
+                }
+            }
+
+            if reserved_all {
+                return (port, listeners);
+            }
+        }
+
+        panic!("could not reserve {count} consecutive local ports");
     }
 
     #[test]
@@ -6556,11 +9099,6 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_positional_sections_parse() {
-        // Drive from the canonical const so adding a section forces
-        // parser coverage here. clap subcommand names are the
-        // section's `as_str()` keys (snake_case) verbatim, set via
-        // `#[command(name = $key)]` inside the `sections!` macro that
-        // also defines the enum.
         for w in zeroclaw_config::sections::QUICKSTART_SECTIONS {
             let cli = Cli::try_parse_from(["zeroclaw", "onboard", w.as_str()])
                 .unwrap_or_else(|_| panic!("onboard {} should parse", w.as_str()));
@@ -6931,12 +9469,330 @@ mod tests {
             &mut config,
             "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
         )
-        .expect("non-provider map paths should be ignored, not rejected");
+        .expect("resource-key map paths should be ignored, not rejected");
 
         assert!(
             !created,
-            "auto-materialization must stay scoped to typed provider aliases"
+            "auto-materialization must stay scoped to alias-keyed sections, excluding #[resource_key] sections"
         );
+        assert!(
+            config.cost.rates.providers.models.openai.is_empty(),
+            "no bogus model-id key should have been materialized under cost.rates",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_materializes_non_provider_alias_sections() {
+        for (path, value) in [
+            ("risk_profiles.newprofile.level", "supervised"),
+            ("channels.telegram.main.enabled", "true"),
+            ("channels.telegram.main.bot_token", "tok"),
+            ("peer_groups.pi400_owner.channel", "telegram.main"),
+        ] {
+            let mut config = Config::default();
+            assert!(
+                config.set_prop(path, value).is_err(),
+                "precondition: {path} should be unknown on a fresh config"
+            );
+            let created = ensure_map_key_for_prop_path(&mut config, path)
+                .expect("newly-widened alias sections should materialize");
+            assert!(created, "{path}'s alias should be created");
+            assert!(
+                config.set_prop(path, value).is_ok(),
+                "{path} must be settable after map-key materialization"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.default.enabled")
+            .expect("agents is a known map-keyed section; refusal is not an error");
+        assert!(
+            !created,
+            "must refuse to auto-create the reserved `default` agent alias"
+        );
+        assert!(
+            config.agents.is_empty(),
+            "no `agents.default` entry should have been left behind by the refused create"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
+            .expect("non-reserved agent aliases should still materialize");
+        assert!(
+            created,
+            "agents.<non-default> must still auto-materialize like every other widened section"
+        );
+        assert!(
+            config.agents.contains_key("researcher"),
+            "researcher alias should have been created"
+        );
+    }
+
+    #[test]
+    fn config_set_materializes_agent_workspace_path() {
+        let mut config = Config::default();
+        let raw = "agents.assistant.workspace.path";
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        let mut path = zeroclaw_config::helpers::resolve_field_path(&known, raw);
+        let created = ensure_map_key_for_prop_path(&mut config, &path)
+            .expect("agent alias and workspace path should materialize");
+        assert!(created, "missing agent alias should be created");
+
+        let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        path = zeroclaw_config::helpers::resolve_field_path(&known, &path);
+        config
+            .set_prop_persistent(&path, "/srv/zeroclaw/assistant")
+            .expect("agent workspace path should be writable");
+
+        assert_eq!(path, raw);
+        assert_eq!(
+            config
+                .agents
+                .get("assistant")
+                .and_then(|agent| agent.workspace.path.as_deref()),
+            Some(std::path::Path::new("/srv/zeroclaw/assistant"))
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        let path = "risk_profiles.newprofile.not_a_real_field";
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("section resolves; only the tail field is bogus");
+        assert!(
+            !created,
+            "must not report success when the tail field doesn't resolve"
+        );
+        assert!(
+            config
+                .get_map_keys("risk_profiles")
+                .unwrap_or_default()
+                .is_empty(),
+            "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
+        let mut config = Config::default();
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
+            .expect("an existing loaded alias must never be rejected by the create grammar");
+        assert!(
+            !created,
+            "the existing `morning-brief` alias must not be reported as newly created"
+        );
+        assert!(
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
+            "setting a field on an existing hyphenated cron alias must succeed"
+        );
+        assert_eq!(
+            config.get_prop("cron.morning-brief.name").ok(),
+            Some("Morning brief".to_string())
+        );
+
+        let err = ensure_map_key_for_prop_path(&mut config, "cron.bad-alias.name")
+            .expect_err("creating a NEW hyphenated alias must still be rejected");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "new-alias grammar must be preserved: {err}"
+        );
+    }
+
+    // `config init` alias tests. Every test in this module builds a bare
+    // `Config::default()`, whose `config_path` points at the developer's real
+    // `~/.zeroclaw/config.toml`, and no gate catches a write from `src/`. These
+    // stay safe only by calling `init_map_alias` and in-memory readers such as
+    // `get_map_keys` — never `save()`, `save_dirty()`, a persisting `set_prop`,
+    // `ensure_disk_at_current_version`, or the real `ConfigCommands::Init` arm.
+    // End-to-end coverage of the handler lives in `tests/component/`.
+
+    #[test]
+    fn config_init_materializes_new_map_alias() {
+        for (arg, section) in [
+            ("risk_profiles.strict", "risk_profiles"),
+            ("peer_groups.pi400_owner", "peer_groups"),
+        ] {
+            let mut config = Config::default();
+            let created = init_map_alias(&mut config, arg)
+                .expect("alias-shaped section arguments should materialize");
+            assert_eq!(created.as_deref(), Some(arg));
+            let alias = arg.rsplit('.').next().expect("alias segment");
+            assert!(
+                config
+                    .get_map_keys(section)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|k| k == alias),
+                "{arg} should be present under {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_init_alias_is_idempotent() {
+        let mut config = Config::default();
+        init_map_alias(&mut config, "risk_profiles.strict").expect("first create");
+        let again = init_map_alias(&mut config, "risk_profiles.strict").expect("second create");
+        assert!(again.is_none(), "an existing alias is not re-reported");
+        assert_eq!(
+            config.get_map_keys("risk_profiles").unwrap_or_default(),
+            vec!["strict".to_string()],
+        );
+    }
+
+    #[test]
+    fn config_init_ignores_plain_section_prefixes() {
+        let mut config = Config::default();
+        for arg in ["channels.telegram", "gateway"] {
+            assert!(
+                init_map_alias(&mut config, arg)
+                    .expect("plain prefixes are not an error")
+                    .is_none(),
+                "{arg} has no trailing alias segment; init_defaults keeps ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn config_init_ignores_resource_keyed_sections() {
+        let mut config = Config::default();
+        assert!(
+            init_map_alias(&mut config, "cost.rates.providers.models.openai.gpt-5")
+                .expect("resource-keyed sections are ignored, not rejected")
+                .is_none()
+        );
+        assert!(config.cost.rates.providers.models.openai.is_empty());
+    }
+
+    #[test]
+    fn config_init_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+        let err = init_map_alias(&mut config, "agents.default")
+            .expect_err("the reserved agent guard must surface, not exit 0");
+        assert!(
+            err.to_string().contains("reserved"),
+            "message should name the reserved alias: {err}"
+        );
+        assert!(config.agents.is_empty());
+
+        assert_eq!(
+            init_map_alias(&mut config, "agents.researcher")
+                .expect("non-reserved agent aliases still materialize")
+                .as_deref(),
+            Some("agents.researcher"),
+        );
+    }
+
+    #[test]
+    fn config_init_rejects_invalid_alias_key() {
+        let mut config = Config::default();
+        assert!(
+            init_map_alias(&mut config, "risk_profiles.Bad-Name").is_err(),
+            "validate_alias_key's refusal must propagate"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_missing_channel_alias() {
+        let mut config = Config::default();
+        let path = "channels.telegram.default.bot_token";
+
+        assert!(
+            !config.channels.telegram.contains_key("default"),
+            "fresh config should not already contain the default channel alias"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known channel path should be materialized");
+
+        assert!(created, "missing channel alias should be created");
+        config
+            .set_prop_persistent(path, "test-token")
+            .expect("materialized channel path should be writable");
+        assert_eq!(
+            config
+                .channels
+                .telegram
+                .get("default")
+                .unwrap()
+                .bot_token
+                .as_str(),
+            "test-token"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_memory::traits::Memory;
+        use zeroclaw_runtime::sop::{
+            Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "cron-sop".into(),
+            description: "cron regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Supervised,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
+        let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report =
+            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
+                .await
+                .expect("maintenance tick should complete");
+
+        assert_eq!(report.cron_started, 1);
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
     }
 
     #[test]
@@ -6992,6 +9848,93 @@ mod tests {
         assert!(
             gate_security_posture(&whole, false).is_err(),
             "whole-config loss must fail closed when not explicitly allowed"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
+        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-opus-4-7".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // ── Test 1: Normal model ID persists via the dispatch boundary ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "claude-sonnet-4-6".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("normal model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("claude-sonnet-4-6"),
+            "normal model ID must be persisted to config.toml; got:\n{contents}"
+        );
+
+        // ── Test 2: Slash-bearing model ID preserved as-is ──
+        dispatch_models_command(
+            ModelCommands::Set {
+                model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            },
+            &mut config,
+        )
+        .await
+        .expect("slash-bearing model ID must persist");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("anthropic/claude-sonnet-4-20250514"),
+            "slash-bearing model ID must be stored as-is; got:\n{contents}"
+        );
+
+        // ── Test 3: No configured provider → error surfaced by dispatch ──
+        let mut empty_config = Config {
+            config_path: tmp.path().join("empty.toml"),
+            data_dir: tmp.path().join("empty_workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        let err = dispatch_models_command(
+            ModelCommands::Set {
+                model: "any-model".to_string(),
+            },
+            &mut empty_config,
+        )
+        .await
+        .expect_err("empty config must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No model provider configured"),
+            "error must mention missing provider; got: {msg}"
         );
     }
 }

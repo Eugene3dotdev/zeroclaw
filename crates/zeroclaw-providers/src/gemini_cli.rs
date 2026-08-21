@@ -30,7 +30,6 @@
 //!
 //! Authentication is handled by Antigravity itself. Direct Google AI Studio,
 //! Gemini API, and Vertex credentials are not accepted by this model_provider.
-//!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -39,6 +38,25 @@ use tokio::time::{Duration, timeout};
 
 /// Default Antigravity binary name (resolved via `PATH`).
 const DEFAULT_ANTIGRAVITY_CLI_BINARY: &str = "agy";
+
+/// Environment variables safe to pass through to the `agy` subprocess.
+/// Antigravity authenticates via its own approved session, so direct Google
+/// AI Studio / Gemini API / Vertex credentials are never inherited.
+const SAFE_ENV_VARS: &[&str] = &[
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SystemRoot",
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+];
 
 /// Model name used to signal "use the model_provider's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
@@ -61,20 +79,49 @@ pub struct GeminiCliModelProvider {
     binary_path: PathBuf,
 }
 
-impl GeminiCliModelProvider {
-    /// Create a new `GeminiCliModelProvider`. Pass `None` to use the default
-    /// `"agy"` (PATH lookup); pass an explicit path to override.
-    pub fn new(alias: &str, binary_path: Option<&str>) -> Self {
-        let binary_path = binary_path
+/// Typed builder for [`GeminiCliModelProvider`].
+///
+/// Only `alias` is required; the binary path defaults to the module's
+/// `DEFAULT_ANTIGRAVITY_CLI_BINARY` (PATH lookup) when unset.
+#[must_use]
+pub struct GeminiCliBuilder {
+    alias: String,
+    binary_path: Option<String>,
+}
+
+impl GeminiCliBuilder {
+    /// Override the Antigravity CLI binary path. Whitespace-only inputs
+    /// fall back to the default (PATH lookup).
+    pub fn binary_path(mut self, path: Option<&str>) -> Self {
+        self.binary_path = path
             .map(str::trim)
             .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> GeminiCliModelProvider {
+        let binary_path = self
+            .binary_path
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_ANTIGRAVITY_CLI_BINARY));
-        Self {
-            alias: alias.to_string(),
+        GeminiCliModelProvider {
+            alias: self.alias,
             binary_path,
         }
     }
+}
+
+impl GeminiCliModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`GeminiCliBuilder`].
+    pub fn builder(alias: &str) -> GeminiCliBuilder {
+        GeminiCliBuilder {
+            alias: alias.to_string(),
+            binary_path: None,
+        }
+    }
+
     /// Returns true if the model argument should be forwarded to the CLI.
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
@@ -115,12 +162,16 @@ impl GeminiCliModelProvider {
 
     /// Build the argv tail (excluding the binary itself) for a CLI invocation.
     ///
+    /// Antigravity's headless print mode takes the prompt as the trailing
+    /// positional argument. Model flags are emitted first so a parser that
+    /// stops option parsing at the first positional still receives `--model`.
+    /// The CLI has no stdin-fed prompt form.
     fn build_cli_args(message: &str, model: &str) -> Vec<String> {
-        let mut args = vec!["-p".to_string(), message.to_string()];
+        let mut args: Vec<String> = Vec::new();
         if Self::should_forward_model(model) {
-            args.push("--model".to_string());
-            args.push(model.to_string());
+            args.extend(["--model".to_string(), model.to_string()]);
         }
+        args.extend(["-p".to_string(), message.to_string()]);
         args
     }
 
@@ -129,6 +180,16 @@ impl GeminiCliModelProvider {
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(Self::build_cli_args(message, model));
+
+        // Direct Google AI Studio / Gemini API / Vertex credentials in the
+        // parent process must not reach the session-auth runtime. Restore
+        // only the safe process variables the CLI needs.
+        cmd.env_clear();
+        for var in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(*var) {
+                cmd.env(*var, val);
+            }
+        }
 
         cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::null());
@@ -280,19 +341,25 @@ mod tests {
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = GeminiCliModelProvider::new("test", Some("/usr/local/bin/agy"));
+        let p = GeminiCliModelProvider::builder("test")
+            .binary_path(Some("/usr/local/bin/agy"))
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("/usr/local/bin/agy"));
     }
 
     #[test]
     fn new_defaults_to_antigravity() {
-        let p = GeminiCliModelProvider::new("test", None);
+        let p = GeminiCliModelProvider::builder("test")
+            .binary_path(None)
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("agy"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = GeminiCliModelProvider::new("test", Some("   "));
+        let p = GeminiCliModelProvider::builder("test")
+            .binary_path(Some("   "))
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("agy"));
     }
 
@@ -337,15 +404,15 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_args_forwards_explicit_model_after_print_prompt() {
+    fn build_cli_args_places_explicit_model_before_print_prompt() {
         let args = GeminiCliModelProvider::build_cli_args("hello", "gemini-2.5-pro");
         assert_eq!(
             args,
             vec![
-                "-p".to_string(),
-                "hello".to_string(),
                 "--model".to_string(),
                 "gemini-2.5-pro".to_string(),
+                "-p".to_string(),
+                "hello".to_string(),
             ]
         );
     }

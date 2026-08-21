@@ -1,14 +1,16 @@
 //! System prompt construction for the agent loop and channel subsystem.
-//!
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
+use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
+pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -40,22 +42,11 @@ fn load_openclaw_bootstrap_files(
     }
 }
 
-/// Load workspace identity files and build a system prompt.
+/// Build the default system prompt.
 ///
-/// Follows the `OpenClaw` framework structure by default:
-/// 1. Tooling — tool list + descriptions
-/// 2. Safety — guardrail reminder
-/// 3. Skills — full skill instructions and tool metadata
-/// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
-/// 6. Date — timezone offset for cache stability
-/// 7. Runtime — host, OS, model
-///
-/// When `identity_config` is set to AIEOS format, the bootstrap files section
-/// is replaced with the AIEOS identity data loaded from file or inline JSON.
-///
-/// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
-/// on-demand via `memory_recall` / `memory_search` tools.
+/// Reports no shell: callers that know their runtime adapter should use
+/// [`build_system_prompt_with_mode_and_autonomy`] and pass its
+/// `shell_profile` so the model is told which dialect to write.
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -72,8 +63,37 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
         AutonomyLevel::default(),
+    )
+}
+
+/// Like [`build_system_prompt`] but accepts `show_tool_calls` to control
+/// whether the system prompt instructs the model to hide tool narration.
+pub fn build_system_prompt_with_tool_calls(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[Skill],
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    show_tool_calls: bool,
+) -> String {
+    build_system_prompt_with_mode_and_autonomy(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+        false,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+        false,
+        0,
+        true,
+        show_tool_calls,
+        None,
     )
 }
 
@@ -84,7 +104,7 @@ pub fn build_system_prompt_with_mode(
     skills: &[Skill],
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
-    native_tools: bool,
+    native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
@@ -100,11 +120,13 @@ pub fn build_system_prompt_with_mode(
         identity_config,
         bootstrap_max_chars,
         Some(&autonomy_cfg),
-        native_tools,
+        native_tool_specs_present,
         skills_prompt_mode,
         false,
         0,
         true,
+        false,
+        None,
     )
 }
 
@@ -117,20 +139,35 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
-    native_tools: bool,
+    native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
     // When `false`, `MEMORY.md` is omitted from the injected bootstrap files.
     // Set to `false` for isolated / ACP sessions that use `exclude_memory`.
     inject_memory: bool,
+    // When `true`, the model is allowed to narrate tool usage in its
+    // response. When `false` (default), the system prompt instructs
+    // the model to treat tool calls as invisible infrastructure.
+    show_tool_calls: bool,
+    // The shell the runtime adapter will actually spawn, or `None` for a
+    // shell-less runtime (which omits the `Shell:` field and the dialect
+    // guidance entirely). Resolved from `RuntimeAdapter::shell_profile` so the
+    // reported shell cannot drift from the executed one.
+    shell_profile: Option<&ShellProfile>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
-    let has_tools = !tools.is_empty();
+    let has_tools = !tools.is_empty() || native_tool_specs_present;
+    let skills_prompt_mode = crate::skills::skills_prompt_mode_with_loader_fallback(
+        skills_prompt_mode,
+        tools.iter().any(|(name, _)| *name == "read_skill"),
+    );
 
     // ── 0. Anti-narration (top priority) ───────────────────────
-    if has_tools {
+    // When show_tool_calls is true, the model is allowed to describe
+    // its tool usage so channel users see what tools are being called.
+    if has_tools && !show_tool_calls {
         prompt.push_str(
             "## CRITICAL: No Tool Narration\n\n\
              NEVER narrate, announce, describe, or explain your tool usage to the user. \
@@ -153,7 +190,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() && !native_tools {
+    if !tools.is_empty() && !native_tool_specs_present {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
@@ -191,18 +228,55 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         );
     }
 
+    // ── 1d. Tool Authorization (Full autonomy) ──────────────────────
+    // At Full autonomy the user has explicitly opted into letting the model
+    // act without per-call approval. The generic Safety block alone isn't
+    // enough to overcome model safety-priors that produce simulated
+    // refusal text without ever dispatching a tool call.
+    // Name the power tools the autonomy policy authorizes and tell the model
+    // it is authorized to *call/attempt* them (not that they are exempt from
+    // policy): command policy, forbidden_commands, forbidden_paths, and OS
+    // sandboxing may still reject a real call, so the model must not
+    // self-refuse merely because the request uses these tools.
+    if has_tools && autonomy_config.map(|cfg| cfg.level) == Some(AutonomyLevel::Full) {
+        let power_tools: Vec<&str> = ["shell", "file_write", "file_edit"]
+            .into_iter()
+            .filter(|name| tools.iter().any(|(t, _)| t == name))
+            .collect();
+        if !power_tools.is_empty() {
+            prompt.push_str(
+                "## Tool Authorization\n\n\
+                 The runtime autonomy policy is set to `full`. The user has granted the agent permission to act without per-call approval, so the following tools are registered and authorized to call (to attempt) under Full autonomy: ",
+            );
+            prompt.push_str(&power_tools.join(", "));
+            prompt.push_str(
+                ".\n\
+                 When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
+                 Full autonomy removes the approval prompt, not the runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
+            );
+        }
+    }
+
     // ── 1c. Action instruction (avoid meta-summary) ───────────────
     if !has_tools {
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, respond naturally and answer directly from conversation context.\n\
-             No tools are available for this turn, so do not emit tool calls or describe unavailable actions.\n\
+             ",
+        );
+        prompt.push_str(NO_TOOLS_TASK_FRAMING);
+        prompt.push_str(
+            ", so do not emit tool calls or describe unavailable actions.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
-    } else if native_tools {
+    } else if native_tool_specs_present {
         prompt.push_str(
             "## Your Task\n\n\
-             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+             When the user sends a message, respond naturally. ",
+        );
+        prompt.push_str(NATIVE_TOOLS_TASK_FRAMING);
+        prompt.push_str(
+            " (running commands, reading files, etc.).\n\
              For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
@@ -224,7 +298,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - Do not bypass oversight or approval mechanisms.\n",
         );
     }
-    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
+    // Deletion advice follows the dialect: `trash` exists only on POSIX, so
+    // recommending it to a PowerShell or `cmd.exe` session would name a
+    // command that is not there. Shell-less runtimes keep the POSIX default,
+    // which is what they rendered before this was dialect-aware.
+    prompt.push_str(shell_profile.map_or(
+        POSIX_DELETION_GUIDANCE,
+        ShellProfile::safe_deletion_guidance,
+    ));
     prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
@@ -241,6 +322,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+
+    // ── 2b. Shell dialect ───────────────────────────────────────
+    // Only when a registered tool takes a model-authored command: the syntax
+    // list is dead weight otherwise. Skipped in compact_context for the same
+    // reason the tool catalog is trimmed there. The `## Runtime` line still
+    // names the shell in both cases.
+    if !compact_context
+        && zeroclaw_api::runtime_traits::needs_shell_dialect_guidance(
+            tools.iter().map(|(name, _)| *name),
+        )
+        && let Some(profile) = shell_profile
+    {
+        prompt.push_str(&profile.prompt_section());
+        prompt.push('\n');
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -322,11 +418,27 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    let _ = writeln!(
-        prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-        std::env::consts::OS,
-    );
+    // The shell is reported next to the OS because the OS alone does not
+    // determine it: on Windows `cmd.exe` and PowerShell are both reachable.
+    // Omitted entirely for shell-less runtimes, which read no worse than
+    // before. See `RuntimeAdapter::shell_profile`.
+    match shell_profile {
+        Some(profile) => {
+            let _ = writeln!(
+                prompt,
+                "## Runtime\n\nHost: {host} | OS: {} | Shell: {} | Model: {model_name}\n",
+                std::env::consts::OS,
+                profile.name,
+            );
+        }
+        None => {
+            let _ = writeln!(
+                prompt,
+                "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
+                std::env::consts::OS,
+            );
+        }
+    }
 
     // ── 8. Channel Capabilities (skipped in compact_context mode) ──
     if !compact_context {
@@ -351,7 +463,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
         prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
         prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+        if !show_tool_calls {
+            prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+        }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (Channel Capabilities)
 
@@ -417,5 +531,406 @@ fn inject_workspace_file(
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    /// Helper: build the prompt with a given shell profile and one registered
+    /// tool, named by `tool_name` so a caller can pick which command-taking
+    /// tool the surface holds.
+    fn build_with_shell(
+        shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
+        tool_name: &str,
+    ) -> String {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[(tool_name, "a registered tool")],
+            &[],
+            None,
+            Some(512),
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            shell_profile,
+        )
+    }
+
+    // ── Acceptance criteria from issue 9788 ────────────────────────────
+    //
+    // AC-1: ## Runtime includes `Shell: <name>` derived from shell_profile,
+    //       and omits the field cleanly for None.
+    // AC-2: POSIX runtimes report the configured shell name (`bash`, `zsh`…).
+    // AC-3: Windows reports `cmd` or `powershell`/`pwsh`.
+    // AC-4: Tests cover each dialect variant including the omitted case.
+
+    #[test]
+    fn ac1_runtime_line_includes_shell_field_when_profile_is_present() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        let runtime_line = prompt
+            .lines()
+            .find(|l| l.starts_with("Host:"))
+            .expect("Runtime line present");
+        assert!(
+            runtime_line.contains("Shell: bash"),
+            "expected Shell field: {runtime_line}"
+        );
+    }
+
+    #[test]
+    fn ac1_runtime_line_omits_shell_field_when_profile_is_none() {
+        let prompt = build_with_shell(None, "shell");
+        let runtime_line = prompt
+            .lines()
+            .find(|l| l.starts_with("Host:"))
+            .expect("Runtime line present");
+        assert!(
+            !runtime_line.contains("Shell:"),
+            "unexpected Shell field in shell-less prompt: {runtime_line}"
+        );
+    }
+
+    #[test]
+    fn ac2_posix_reports_configured_shell_name() {
+        for (configured, expected) in [("bash", "bash"), ("zsh", "zsh"), ("sh", "sh")] {
+            let profile = zeroclaw_api::runtime_traits::ShellProfile {
+                name: configured.to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            };
+            let prompt = build_with_shell(Some(&profile), "shell");
+            let runtime_line = prompt
+                .lines()
+                .find(|l| l.starts_with("Host:"))
+                .expect("Runtime line present");
+            assert!(
+                runtime_line.contains(&format!("Shell: {expected}")),
+                "configured {configured}: {runtime_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac3_windows_reports_cmd_or_powershell_variant() {
+        for (name, dialect) in [
+            (
+                "cmd",
+                zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+            ),
+            (
+                "powershell",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+            (
+                "pwsh",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+        ] {
+            let profile = zeroclaw_api::runtime_traits::ShellProfile {
+                name: name.to_string(),
+                dialect,
+            };
+            let prompt = build_with_shell(Some(&profile), "shell");
+            let runtime_line = prompt
+                .lines()
+                .find(|l| l.starts_with("Host:"))
+                .expect("Runtime line present");
+            assert!(
+                runtime_line.contains(&format!("Shell: {name}")),
+                "configured {name}: {runtime_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_section_present_for_a_cron_only_tool_surface() {
+        // `cron_add`/`cron_update`/`schedule` take a model-authored `command`
+        // that runs through the same interpreter as `shell`, so an agent
+        // holding only those is exactly as exposed to a dialect mismatch.
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        for tool in ["cron_add", "cron_update", "schedule"] {
+            let prompt = build_with_shell(Some(&profile), tool);
+            assert!(
+                prompt.contains("## Shell"),
+                "{tool} writes commands and needs the dialect: {prompt}"
+            );
+            assert!(prompt.contains("Get-ChildItem"), "{tool}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn shell_section_absent_without_shell_tool() {
+        // The dialect guidance is dead weight when no registered tool takes a
+        // model-authored command.
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "powershell".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[("file_read", "read a file")],
+            &[],
+            None,
+            Some(512),
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            Some(&profile),
+        );
+        assert!(
+            !prompt.contains("## Shell"),
+            "Shell section must be absent when shell tool is not registered"
+        );
+        // Runtime line still reports the shell name.
+        let runtime_line = prompt.lines().find(|l| l.starts_with("Host:")).unwrap();
+        assert!(runtime_line.contains("Shell: powershell"), "{runtime_line}");
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_powershell() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "powershell".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(prompt.contains("## Shell"), "Shell section missing");
+        assert!(
+            prompt.contains("Get-ChildItem"),
+            "PowerShell syntax table missing"
+        );
+        // POSIX tool names must be ruled out as a class.
+        assert!(
+            prompt.contains("POSIX tools"),
+            "POSIX steer missing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_pwsh() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(
+            prompt.contains("PowerShell 7+"),
+            "pwsh must note PS 7+: {prompt}"
+        );
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_cmd() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile::from_dialect(
+            zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+        )
+        .unwrap();
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(prompt.contains("## Shell"), "Shell section missing");
+        assert!(
+            prompt.contains("dir /a"),
+            "cmd syntax table missing: {prompt}"
+        );
+        assert!(prompt.contains("findstr"), "{prompt}");
+    }
+
+    #[test]
+    fn posix_shell_section_has_no_syntax_table() {
+        // POSIX tool names don't need correction; emitting a table wastes tokens.
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        // The ## Shell section heading is still emitted (name is useful).
+        assert!(prompt.contains("## Shell"), "{prompt}");
+        assert!(
+            !prompt.contains("Get-ChildItem"),
+            "no PS table in POSIX prompt"
+        );
+        assert!(!prompt.contains("dir /a"), "no cmd table in POSIX prompt");
+    }
+
+    #[test]
+    fn deletion_guidance_follows_dialect_not_hardcoded() {
+        // `trash` is only POSIX. PowerShell and cmd must get their own advice.
+        let posix_prompt = build_with_shell(
+            Some(&zeroclaw_api::runtime_traits::ShellProfile {
+                name: "bash".to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            }),
+            "shell",
+        );
+        assert!(posix_prompt.contains("trash"), "POSIX must mention trash");
+
+        let ps_prompt = build_with_shell(
+            Some(&zeroclaw_api::runtime_traits::ShellProfile {
+                name: "powershell".to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            }),
+            "shell",
+        );
+        assert!(!ps_prompt.contains("trash"), "PS must not mention trash");
+        assert!(ps_prompt.contains("-WhatIf"), "PS must mention -WhatIf");
+
+        let cmd_prompt = build_with_shell(
+            Some(
+                &zeroclaw_api::runtime_traits::ShellProfile::from_dialect(
+                    zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+                )
+                .unwrap(),
+            ),
+            "shell",
+        );
+        assert!(!cmd_prompt.contains("trash"), "cmd must not mention trash");
+        assert!(
+            cmd_prompt.contains("rmdir /s"),
+            "cmd must name the destructive tool"
+        );
+    }
+
+    fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let autonomy = zeroclaw_config::schema::RiskProfileConfig {
+            level,
+            ..Default::default()
+        };
+        build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            tools,
+            &[],
+            None,
+            Some(512),
+            Some(&autonomy),
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            None,
+        )
+    }
+
+    #[test]
+    fn full_autonomy_authorizes_shell_when_registered() {
+        let tools = [
+            ("shell", "Run a shell command"),
+            ("file_read", "Read a file"),
+        ];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        assert!(
+            prompt.contains("## Tool Authorization"),
+            "expected Tool Authorization section at Full autonomy when shell is registered"
+        );
+        assert!(prompt.contains("shell"));
+        assert!(prompt.contains("authorized to call"));
+        assert!(prompt.contains("simulated"));
+    }
+
+    #[test]
+    fn full_autonomy_authorization_is_attempt_scoped_not_unconditional() {
+        // Regression guard: the Full-autonomy block must authorize the model to
+        // *attempt* the registered tools without self-refusing, but must NOT
+        // claim the tools are exempt from security policy. Full autonomy removes
+        // the approval prompt, not forbidden_commands/forbidden_paths/sandbox.
+        let tools = [
+            ("shell", "Run a shell command"),
+            ("file_write", "Write a file"),
+        ];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        let auth = prompt
+            .split("## Tool Authorization")
+            .nth(1)
+            .expect("Tool Authorization section present");
+        let auth = auth.split("\n## ").next().unwrap_or(auth);
+
+        // Must authorize attempting, not exempt from policy.
+        assert!(
+            auth.contains("authorized to call") || auth.contains("authorized to call (to attempt)"),
+            "Full-autonomy block must authorize *attempting* the tool"
+        );
+        assert!(
+            auth.contains("not self-refuse") || auth.contains("do NOT self-refuse"),
+            "block must tell the model not to self-refuse merely for using shell/file tooling"
+        );
+        // Must keep the runtime safeguards explicit.
+        assert!(
+            auth.contains("forbidden_commands") && auth.contains("forbidden_paths"),
+            "block must state forbidden_commands/forbidden_paths still apply"
+        );
+        assert!(
+            auth.contains("sandbox"),
+            "block must state OS sandboxing still applies"
+        );
+        // Must NOT regress to the overbroad claim.
+        assert!(
+            !auth.contains("NOT blocked by any security policy")
+                && !auth.contains("not blocked by any security policy"),
+            "block must not claim the tools are exempt from all security policy"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_authorization_lists_only_registered_power_tools() {
+        let tools = [("shell", "Run a shell command")];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        let auth_section = prompt
+            .split("## Tool Authorization")
+            .nth(1)
+            .expect("Tool Authorization section present");
+        let auth_section = auth_section.split("## ").next().unwrap_or(auth_section);
+        assert!(auth_section.contains("shell"));
+        assert!(
+            !auth_section.contains("file_write"),
+            "file_write should not be named when it isn't registered"
+        );
+        assert!(
+            !auth_section.contains("file_edit"),
+            "file_edit should not be named when it isn't registered"
+        );
+    }
+
+    #[test]
+    fn non_full_autonomy_skips_tool_authorization_block() {
+        let tools = [("shell", "Run a shell command")];
+        for level in [AutonomyLevel::Supervised, AutonomyLevel::ReadOnly] {
+            let prompt = build_with_autonomy(&tools, level);
+            assert!(
+                !prompt.contains("## Tool Authorization"),
+                "Tool Authorization should not appear at {level:?} autonomy"
+            );
+        }
+    }
+
+    #[test]
+    fn full_autonomy_skips_block_when_no_power_tools_registered() {
+        let tools = [("file_read", "Read a file"), ("calculator", "Math")];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        assert!(
+            !prompt.contains("## Tool Authorization"),
+            "Tool Authorization should be skipped when no power tools (shell/file_write/file_edit) are registered"
+        );
     }
 }

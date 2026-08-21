@@ -5,9 +5,13 @@ use anyhow::Result;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.data_dir;
+    // SOP definitions resolve against the install root, so the documented
+    // `shared/sops` lands at `<install>/shared/sops` — the same root the web/RPC
+    // author writes to. Loading them from `data_dir` instead would never see
+    // authored SOPs.
+    let install_root = config.install_root_dir();
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
-    let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
+    let sops = load_sops(&install_root, config.sop.sops_dir.as_deref(), default_mode);
 
     match command {
         crate::SopCommands::List => {
@@ -144,6 +148,20 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                     &[("value", &sop.max_concurrent.to_string())]
                 )
             );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-admission-policy",
+                    &[("value", &sop.admission_policy.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-max-pending-approvals",
+                    &[("value", &sop.max_pending_approvals.to_string())]
+                )
+            );
             if let Some(loc) = &sop.location {
                 println!(
                     "{}",
@@ -189,6 +207,37 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 }
             }
             println!();
+            Ok(())
+        }
+        // Approve/Deny/Pending talk to the running daemon and are dispatched over
+        // the gateway in main.rs; they never reach this local handler.
+        crate::SopCommands::Approve { .. }
+        | crate::SopCommands::Deny { .. }
+        | crate::SopCommands::Pending => anyhow::bail!(
+            "This command talks to the running daemon over the gateway; \
+             it is not handled by the local SOP CLI."
+        ),
+        crate::SopCommands::Graph { name, format } => {
+            let sop = sops
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| anyhow::Error::msg(format!("SOP not found: {name}")))?;
+            let graph = SopGraph::from_sop(sop);
+            let fmt = match format {
+                crate::SopGraphFormat::Outline => TextGraphFormat::Outline,
+                crate::SopGraphFormat::Adjacency => TextGraphFormat::Adjacency,
+                crate::SopGraphFormat::Json => TextGraphFormat::Json,
+            };
+            print!("{}", render_graph_text(&graph, &fmt));
+            Ok(())
+        }
+        crate::SopCommands::Delete { name } => {
+            let dir = resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
+            delete_sop(&dir, &name)?;
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-sop-deleted", &[("name", &name)])
+            );
             Ok(())
         }
     }
@@ -401,6 +450,9 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -427,11 +479,15 @@ type = "manual"
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -440,15 +496,16 @@ type = "manual"
 
     #[test]
     fn resolve_sops_dir_default() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
-        let dir = resolve_sops_dir(ws, None);
-        assert_eq!(dir, ws.join("sops"));
+        // Unset falls back to the canonical `<install>/shared/sops`.
+        let install_root = Path::new("/test/install");
+        let dir = resolve_sops_dir(install_root, None);
+        assert_eq!(dir, install_root.join("shared").join("sops"));
     }
 
     #[test]
     fn resolve_sops_dir_override() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
-        let dir = resolve_sops_dir(ws, Some("/custom/sops"));
+        let install_root = Path::new("/test/install");
+        let dir = resolve_sops_dir(install_root, Some("/custom/sops"));
         assert_eq!(dir, PathBuf::from("/custom/sops"));
     }
 

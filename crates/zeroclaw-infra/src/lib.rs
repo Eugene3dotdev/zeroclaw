@@ -1,32 +1,37 @@
 //! Channel infrastructure: session backends, debouncing, and stall watchdog.
-//!
 //! These are cross-cutting utilities used by multiple channel implementations.
 
 pub mod acp_session_store;
 pub mod debounce;
+pub mod net_guard;
 pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::session_backend::SessionBackend;
 
-/// Construct the configured session-persistence backend.
-///
-/// `backend` is the value of `[channels].session_backend` from config:
-/// `"sqlite"` (default) opens `{workspace}/sessions/sessions.db`, `"jsonl"`
-/// opens `{workspace}/sessions/*.jsonl`. Unknown values fall back to
-/// SQLite with a warning so a typo in config never silently disables
-/// persistence. The `Arc<dyn SessionBackend>` return type keeps every
-/// call site (channel orchestrator, runtime tools) reading from the
-/// same store.
-///
-/// Errors propagate from the underlying backend constructor (typically
-/// filesystem permissions on the sessions directory).
+pub fn effective_gateway_bind_socket_addr(host: &str, port: u16) -> SocketAddr {
+    parse_gateway_bind_socket_addr(host, port)
+        .unwrap_or_else(|_| fallback_gateway_bind_socket_addr(port))
+}
+
+pub fn parse_gateway_bind_socket_addr(
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr, std::net::AddrParseError> {
+    format!("{host}:{port}").parse()
+}
+
+pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
 pub fn make_session_backend(
     workspace_dir: &Path,
     backend: &str,
@@ -51,13 +56,6 @@ pub fn make_session_backend(
     }
 }
 
-/// Open the SQLite backend and, on first open, import any pre-existing
-/// `sessions/*.jsonl` files left over from the legacy JSONL store. Renames
-/// the imported files to `*.jsonl.migrated` so re-runs are no-ops; preserves
-/// them on disk so an operator can roll back without data loss. Errors from
-/// the import path are logged and skipped — the SQLite backend itself still
-/// opens, since blocking startup on a best-effort migration would be worse
-/// than a partial migration.
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {

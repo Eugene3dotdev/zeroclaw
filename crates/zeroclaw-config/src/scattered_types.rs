@@ -71,11 +71,7 @@ pub use zeroclaw_api::model_provider::{
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
-    /// Opt-in flag for provider-native extended thinking. When `true`, the
-    /// provider sends a dedicated `thinking` parameter with `budget_tokens`
-    /// instead of relying solely on prompt-based reasoning. Defaults to
-    /// `false` so existing High/Max users keep their prior prompt-based
-    /// behavior (cost, latency, transport path) until they explicitly migrate.
+    /// Enables provider-native thinking parameters when the selected level has a budget.
     #[serde(default)]
     pub native_thinking: bool,
     #[serde(default)]
@@ -93,11 +89,6 @@ impl Default for ThinkingConfig {
 }
 
 impl ThinkingConfig {
-    /// Resolve the effective `budget_tokens` for a given level.
-    ///
-    /// Only levels with a built-in default (`High`, `Max`) are eligible for
-    /// native thinking. Config overrides for levels Off–Medium are ignored
-    /// to prevent accidentally forcing `temperature = 1.0` on low levels.
     pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
         // Guard: only levels that have a built-in budget can use native thinking.
         let default = level.default_budget_tokens()?;
@@ -219,8 +210,39 @@ impl Default for EvalConfig {
     }
 }
 
+fn default_eval_suite_dir() -> String {
+    "evals".to_string()
+}
+fn default_eval_mode() -> String {
+    "replay".to_string()
+}
+
+/// Configuration for the agent evaluation harness (`[eval]`), surfaced via the
+/// `zeroclaw eval` command. Distinct from `[agent.eval]`, which is the in-loop
+/// response-quality scorer.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "eval"]
+pub struct EvalHarnessConfig {
+    /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    #[serde(default = "default_eval_suite_dir")]
+    pub suite_dir: String,
+    /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
+    #[serde(default = "default_eval_mode")]
+    pub mode: String,
+}
+
+impl Default for EvalHarnessConfig {
+    fn default() -> Self {
+        Self {
+            suite_dir: default_eval_suite_dir(),
+            mode: default_eval_mode(),
+        }
+    }
+}
+
 fn default_cc_enabled() -> bool {
-    true
+    false
 }
 fn default_threshold_ratio() -> f64 {
     0.50
@@ -254,6 +276,11 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
+    /// The runtime context compressor was removed; no runtime execution path
+    /// consumes this flag, so setting it to `true` currently has no effect.
+    /// Defaults to `false` to match actual runtime behavior;
+    /// `Config::collect_warnings` reads an explicit `true` only to report
+    /// `context_compression_unsupported`.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
@@ -270,6 +297,10 @@ pub struct ContextCompressionConfig {
     pub source_max_chars: usize,
     #[serde(default = "default_cc_timeout_secs")]
     pub timeout_secs: u64,
+    /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
+    #[serde(default)]
+    pub summary_provider: crate::providers::ModelProviderRef,
+    /// DEPRECATED bare model id retained as a compatibility fallback.
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
@@ -291,6 +322,7 @@ impl Default for ContextCompressionConfig {
             summary_max_chars: default_summary_max_chars(),
             source_max_chars: default_source_max_chars(),
             timeout_secs: default_cc_timeout_secs(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
             summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
@@ -306,18 +338,7 @@ fn default_precheck_timeout_secs() -> u64 {
     5
 }
 
-/// Channel reply-intent precheck configuration.
-///
-/// The precheck runs a lightweight `REPLY` / `NO_REPLY` classifier before the
-/// main agent loop so group-chat messages that are not addressed to the
-/// assistant do not trigger a full tool-using turn.
-///
-/// In V3 multi-agent configs this block is configured inside each agent as
-/// `[agents.<alias>.precheck]`. Defaults preserve the current behavior: the
-/// classifier is enabled, model/provider selection follows the agent's
-/// `classifier_provider` ref when configured and otherwise reuses the active
-/// route model, and provider errors or timeouts fail open to REPLY.
-/// `timeout_secs` must be greater than zero.
+/// Per-channel reply-intent precheck configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.precheck"]
@@ -454,6 +475,24 @@ fn default_max_attachment_bytes() -> usize {
     25 * 1024 * 1024
 }
 
+/// OAuth2 settings for IMAP email authentication (XOAUTH2 / RFC 8628).
+/// Populate these to use OAuth2 bearer tokens instead of plain-password LOGIN.
+/// All major providers (Microsoft, Google) support this flow via device code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct EmailOAuth2Config {
+    /// OAuth2 application client ID (public client; no secret required for device flow).
+    pub client_id: String,
+    /// Token endpoint for refresh and device-code polling
+    /// (e.g. `https://login.microsoftonline.com/consumers/oauth2/v2.0/token`).
+    pub token_url: String,
+    /// Device-code initiation endpoint
+    /// (e.g. `https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode`).
+    pub device_code_url: String,
+    /// OAuth2 scopes to request (must include `offline_access` for refresh tokens).
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
@@ -502,6 +541,14 @@ pub struct EmailConfig {
     /// Set to `false` to send plain-text emails instead.
     #[serde(default = "default_true")]
     pub html_body: bool,
+    /// OAuth2 settings for IMAP authentication. When present, IMAP uses
+    /// XOAUTH2 instead of plain LOGIN. Required for providers like
+    /// Outlook/Hotmail that have deprecated password auth.
+    #[serde(default)]
+    pub oauth2: Option<EmailOAuth2Config>,
+    /// When true, the daemon observes new mail but never modifies any IMAP flag.
+    #[serde(default)]
+    pub observer_mode: bool,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -534,6 +581,8 @@ impl Default for EmailConfig {
             max_attachment_bytes: default_max_attachment_bytes(),
             excluded_tools: Vec::new(),
             html_body: true,
+            oauth2: None,
+            observer_mode: false,
         }
     }
 }
@@ -702,6 +751,20 @@ impl crate::traits::ChannelConfig for VoiceCallConfig {
     }
 }
 
+impl VoiceCallConfig {
+    /// Whether all required credentials (`account_id`, `auth_token`,
+    /// `from_number`) are present. Mirrors `WhatsAppConfig::is_cloud_config`'s
+    /// role: the channel orchestrator uses this bool to decide whether to
+    /// build the channel at all, skipping (with a warning) an
+    /// enabled-but-uncredentialed alias instead of building a listener that
+    /// can never connect and crashloops its per-channel supervisor.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.account_id)
+            && !crate::traits::is_unset_display_value(&self.auth_token)
+            && !crate::traits::is_unset_display_value(&self.from_number)
+    }
+}
+
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
@@ -718,5 +781,150 @@ impl Default for VoiceCallConfig {
             webhook_base_url: None,
             excluded_tools: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_call_has_required_credentials_true_when_all_set() {
+        let vc = VoiceCallConfig {
+            account_id: "AC123".into(),
+            auth_token: "tok".into(),
+            from_number: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(vc.has_required_credentials());
+    }
+
+    #[test]
+    fn voice_call_has_required_credentials_false_when_any_blank() {
+        let base = VoiceCallConfig {
+            account_id: "AC123".into(),
+            auth_token: "tok".into(),
+            from_number: "+15551234567".into(),
+            ..Default::default()
+        };
+
+        assert!(
+            !VoiceCallConfig {
+                account_id: "   ".into(),
+                ..base.clone()
+            }
+            .has_required_credentials()
+        );
+        assert!(
+            !VoiceCallConfig {
+                auth_token: "   ".into(),
+                ..base.clone()
+            }
+            .has_required_credentials()
+        );
+        assert!(
+            !VoiceCallConfig {
+                from_number: "   ".into(),
+                ..base
+            }
+            .has_required_credentials()
+        );
+        assert!(!VoiceCallConfig::default().has_required_credentials());
+    }
+
+    #[test]
+    fn thinking_level_from_str_canonical_aliases() {
+        let cases = [
+            ("off", ThinkingLevel::Off),
+            ("none", ThinkingLevel::Off),
+            ("minimal", ThinkingLevel::Minimal),
+            ("min", ThinkingLevel::Minimal),
+            ("low", ThinkingLevel::Low),
+            ("medium", ThinkingLevel::Medium),
+            ("med", ThinkingLevel::Medium),
+            ("default", ThinkingLevel::Medium),
+            ("high", ThinkingLevel::High),
+            ("max", ThinkingLevel::Max),
+            ("maximum", ThinkingLevel::Max),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(
+                ThinkingLevel::from_str_insensitive(s),
+                Some(expected),
+                "input={s}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_level_from_str_case_insensitive() {
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("OFF"),
+            Some(ThinkingLevel::Off)
+        );
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("HIGH"),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("MAX"),
+            Some(ThinkingLevel::Max)
+        );
+        assert_eq!(
+            ThinkingLevel::from_str_insensitive("Medium"),
+            Some(ThinkingLevel::Medium)
+        );
+    }
+
+    #[test]
+    fn thinking_level_from_str_unknown_returns_none() {
+        assert_eq!(ThinkingLevel::from_str_insensitive("unknown"), None);
+        assert_eq!(ThinkingLevel::from_str_insensitive(""), None);
+        assert_eq!(ThinkingLevel::from_str_insensitive("ultra"), None);
+        assert_eq!(ThinkingLevel::from_str_insensitive("123"), None);
+    }
+
+    #[test]
+    fn thinking_level_as_str_roundtrips() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let s = level.as_str();
+            assert_eq!(
+                ThinkingLevel::from_str_insensitive(s),
+                Some(level),
+                "roundtrip failed for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_level_budget_tokens_only_high_and_max() {
+        assert_eq!(ThinkingLevel::Off.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::Minimal.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::Low.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::Medium.default_budget_tokens(), None);
+        assert_eq!(ThinkingLevel::High.default_budget_tokens(), Some(10_000));
+        assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
+    }
+
+    // The runtime context compressor was removed; nothing reads
+    // `context_compression` at runtime anymore, so the default must be
+    // `false` (a `true` default would mislead users into thinking the
+    // knob does something). See `context_compression_unsupported` in
+    // `schema.rs` for the companion validation warning.
+    #[test]
+    fn context_compression_config_defaults_to_disabled() {
+        assert!(!ContextCompressionConfig::default().enabled);
+    }
+
+    #[test]
+    fn thinking_level_default_is_medium() {
+        assert_eq!(ThinkingLevel::default(), ThinkingLevel::Medium);
     }
 }

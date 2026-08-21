@@ -40,8 +40,34 @@
         nixosModuleEvalTests = import ./nix/eval-tests.nix {
           inherit nixpkgs system;
         };
+        # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
+        # Default feature set: canonical lean Dist.
+        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
+        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
+          (pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          }).buildRustPackage {
+            inherit pname;
+            version = "0.8.4";
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = builtins.fromJSON (builtins.readFile ./nix/hashes.json);
+            };
+            cargoBuildFlags =
+              [ "-p" cargoPkg "--no-default-features" ]
+              ++ pkgs.lib.optionals (features != [])
+                [ "--features" (pkgs.lib.concatStringsSep "," features) ];
+            doCheck = false;
+            buildInputs = [ pkgs.stdenv.cc.cc ];
+          };
+        # >>> end generated:flake-packages <<<
       in {
-        packages.default = fenix.packages.${system}.stable.toolchain;
+        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; };
+        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; };
+        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; };
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
             builtins.toJSON nixosModuleEvalTests
@@ -51,12 +77,22 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.nix-prefetch-git
+            pkgs.jq
           ];
           buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
           ];
         };
       }) // {
+      # The `services.zeroclaw` NixOS module (multi-instance; see nix/module.nix
+      # and nix/README.md). Exposed as the default so `nixosModules.default` can
+      # be imported directly into a system configuration.
+      nixosModules.default = import ./nix/module.nix;
+
+      # Toolchain test systems used to evaluate the dev-shell module on both
+      # supported Linux architectures; not a deployment target. The `checks`
+      # output evaluates these in CI.
       nixosConfigurations = {
         nixos = nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";

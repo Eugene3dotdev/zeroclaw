@@ -1,20 +1,38 @@
 use crate::cron::{self, JobType};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronRunTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
 }
 
 impl CronRunTool {
+    pub fn new_with_runtime(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            runtime,
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
-        Self { config, security }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, runtime)
     }
 }
 
@@ -47,7 +65,7 @@ impl Tool for CronRunTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
@@ -57,7 +75,7 @@ impl Tool for CronRunTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
                 });
             }
@@ -70,7 +88,7 @@ impl Tool for CronRunTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
             });
         }
@@ -78,7 +96,7 @@ impl Tool for CronRunTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -88,73 +106,55 @@ impl Tool for CronRunTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
         };
 
         if matches!(job.job_type, JobType::Shell)
-            && let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
+            && let Err(reason) = cron::validate_shell_command_with_security(
+                self.runtime.as_ref(),
+                &self.security,
+                &job.command,
+                approved,
+            )
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
-                error: Some(reason),
+                output: ToolOutput::default(),
+                error: Some(reason.to_string()),
             });
         }
 
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
-        let started_at = Utc::now();
-        let (mut success, output) =
-            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
-        let finished_at = Utc::now();
-        let duration_ms = (finished_at - started_at).num_milliseconds();
-        let outcome = cron::scheduler::deliver_and_classify_run_result(
+        let result = cron::scheduler::run_manual_job_with_runtime(
             &self.config,
             &job,
-            success,
-            output,
             cron::scheduler::CronDeliveryContext::ToolManual,
+            &None,
+            self.runtime.as_ref(),
+            approved,
         )
         .await;
-        success = outcome.success;
-
-        let _ = cron::record_run(
-            &self.config,
-            &job.id,
-            started_at,
-            finished_at,
-            &outcome.status,
-            Some(&outcome.output),
-            duration_ms,
-        );
-        let _ = cron::record_last_run_with_status(
-            &self.config,
-            &job.id,
-            finished_at,
-            &outcome.status,
-            &outcome.output,
-        );
 
         Ok(ToolResult {
-            success,
+            success: result.success,
             output: serde_json::to_string_pretty(&json!({
-                "job_id": job.id,
-                "status": outcome.status,
-                "duration_ms": duration_ms,
-                "output": outcome.output
-            }))?,
-            error: if success {
+                "job_id": result.job_id,
+                "status": result.status,
+                "duration_ms": result.duration_ms,
+                "output": result.output
+            }))?
+            .into(),
+            error: if result.success {
                 None
             } else {
                 Some("cron job execution failed".to_string())
@@ -200,8 +200,8 @@ mod tests {
         config.agents.entry(TEST_AGENT.to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );

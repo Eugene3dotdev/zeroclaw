@@ -1,18 +1,4 @@
-//! Alias-bound attribution surface used by every emission in the
-//! workspace. Each "thing" that participates in an event (channel,
-//! agent, tool, cron job, model provider, memory backend, peer group,
-//! skill bundle, MCP bundle, session) implements [`Attributable`].
-//! Entry points open `attribution_span!(thing)` once at the start of
-//! their work; the `LogCaptureLayer` in `zeroclaw-log` walks the span
-//! scope and fills the typed attribution slots automatically.
-//!
-//! Adding a new variant: extend the relevant `Kind` enum (the variant
-//! name's snake_case form is the canonical `<type>` string via
-//! `strum::IntoStaticStr`), and — only if a new role family is needed —
-//! update the [`Role::composite_prefix`] / [`Role::attribution_field`]
-//! / [`Role::default_category`] match arms. No call-site changes.
-
-use strum_macros::IntoStaticStr;
+use strum_macros::{EnumIter, EnumString, IntoStaticStr};
 
 /// Trait every alias-bound "thing" implements once next to its struct.
 pub trait Attributable {
@@ -66,7 +52,7 @@ pub enum Role {
 }
 
 /// Channel implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumIter, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChannelKind {
     #[strum(serialize = "acp")]
@@ -81,6 +67,8 @@ pub enum ChannelKind {
     DingTalk,
     Discord,
     Email,
+    Filesystem,
+    Git,
     GmailPush,
     #[strum(serialize = "imessage")]
     IMessage,
@@ -104,6 +92,8 @@ pub enum ChannelKind {
     Twitter,
     VoiceCall,
     VoiceWake,
+    /// Retained after the WATI channel was removed so historical
+    /// attribution records that name it still deserialize.
     Wati,
     #[strum(serialize = "wecom")]
     WeCom,
@@ -113,6 +103,56 @@ pub enum ChannelKind {
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
+    Plugin,
+}
+
+impl ChannelKind {
+    /// Whether this channel can deliver inbound events that fan into an SOP.
+    /// `Cli` is a local interactive session, `Plugin` is a synthetic attribution
+    /// bucket, and `Wati` is retained only for historical attribution records;
+    /// none is a live background event source. Every other kind is a real inbound
+    /// channel a SOP can trigger on.
+    #[must_use]
+    pub fn inbound_capable(self) -> bool {
+        !matches!(self, Self::Cli | Self::Plugin | Self::Wati)
+    }
+
+    /// Canonical snake_case wire string, single-sourced from `IntoStaticStr`.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// Serde adapter for `Option<ChannelKind>` that routes through the strum
+/// string form, so the wire token is single-sourced from the enum's
+/// `IntoStaticStr`/`EnumString` derives instead of a parallel serde map.
+pub mod channel_kind_opt_serde {
+    use super::ChannelKind;
+    use core::str::FromStr;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<ChannelKind>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(kind) => serializer.serialize_some(kind.as_wire()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ChannelKind>, D::Error> {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            Some(s) => ChannelKind::from_str(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Built-in tool implementations. Closed set — plugins that need their
@@ -194,7 +234,6 @@ pub enum ModelProviderKind {
     KiloCli,
     Kilo,
     Router,
-    Reliable,
     Moonshot,
     Qwen,
     Minimax,
@@ -229,6 +268,7 @@ pub enum ModelProviderKind {
     Avian,
     Deepmyst,
     Venice,
+    Nearai,
     Novita,
     Nvidia,
     Vercel,
@@ -345,6 +385,7 @@ impl Role {
             Self::Mcp => Some("mcp_bundle"),
             Self::Sop => Some("sop_name"),
             Self::Session => Some("session_key"),
+            Self::System => Some("system_alias"),
             _ => None,
         }
     }
@@ -385,13 +426,10 @@ impl Role {
             Self::Channel(_) => "channel",
             Self::Tool(_) => "tool",
             Self::Cron(_) => "cron",
-            Self::Provider(ProviderKind::Model(_)) => "model_provider",
-            Self::Provider(ProviderKind::Tts(_)) => "tts_provider",
-            Self::Provider(ProviderKind::Transcription(_)) => "transcription_provider",
-            Self::Provider(ProviderKind::Tunnel(_)) => "tunnel_provider",
+            Self::Provider(_) => "provider",
             Self::Memory(_) => "memory",
             Self::Session => "session",
-            Self::Sop => "sop",
+            Self::Sop => "system",
             Self::PeerGroup | Self::Skill | Self::Mcp | Self::System => "system",
         }
     }
@@ -408,6 +446,20 @@ mod tests {
             <&'static str>::from(ChannelKind::WhatsappBusiness),
             "whatsapp_business"
         );
+    }
+
+    #[test]
+    fn retired_wati_kind_still_deserializes_from_historical_attribution() {
+        #[derive(serde::Deserialize)]
+        struct StoredAttribution {
+            #[serde(default, with = "super::channel_kind_opt_serde")]
+            channel_type: Option<ChannelKind>,
+        }
+
+        let stored: StoredAttribution = serde_json::from_str(r#"{"channel_type":"wati"}"#)
+            .expect("historical WATI attribution must remain readable");
+        assert_eq!(stored.channel_type, Some(ChannelKind::Wati));
+        assert!(!ChannelKind::Wati.inbound_capable());
     }
 
     #[test]
@@ -447,5 +499,41 @@ mod tests {
                 .attribution_field()
                 .is_none()
         );
+        assert_eq!(Role::System.attribution_field(), Some("system_alias"));
+    }
+
+    #[test]
+    fn role_family_str_returns_stable_tags() {
+        assert_eq!(Role::Agent.family_str(), "agent");
+        assert_eq!(Role::Swarm.family_str(), "swarm");
+        assert_eq!(Role::Channel(ChannelKind::Discord).family_str(), "channel");
+        assert_eq!(Role::Tool(ToolKind::Shell).family_str(), "tool");
+        assert_eq!(Role::Cron(CronKind::Interval).family_str(), "cron");
+        assert_eq!(
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic)).family_str(),
+            "provider.model"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tts(TtsProviderKind::ElevenLabs)).family_str(),
+            "provider.tts"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Transcription(
+                TranscriptionProviderKind::Whisper
+            ))
+            .family_str(),
+            "provider.transcription"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tunnel(TunnelProviderKind::Ngrok)).family_str(),
+            "provider.tunnel"
+        );
+        assert_eq!(Role::Memory(MemoryKind::Sqlite).family_str(), "memory");
+        assert_eq!(Role::PeerGroup.family_str(), "peer_group");
+        assert_eq!(Role::Skill.family_str(), "skill");
+        assert_eq!(Role::Mcp.family_str(), "mcp");
+        assert_eq!(Role::Sop.family_str(), "sop");
+        assert_eq!(Role::Session.family_str(), "session");
+        assert_eq!(Role::System.family_str(), "system");
     }
 }

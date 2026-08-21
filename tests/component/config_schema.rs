@@ -1,5 +1,4 @@
 //! Config Schema Boundary Tests
-//!
 //! Validates: config defaults, backward compatibility, invalid input rejection,
 //! and gateway/security/agent config boundary conditions.
 
@@ -14,9 +13,6 @@ fn migrate(toml_str: &str) -> Config {
 // Invalid value fail-fast
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Regression test for #5414, #5320, #5483, #5507: Option<T> fields
-/// (api_key) and serde aliases (model_provider) must not be flagged as
-/// unknown config keys.
 #[test]
 fn config_valid_keys_not_flagged_as_unknown() {
     // api_key: Option<T> defaulting to None — TOML omits it.
@@ -82,18 +78,24 @@ fn config_out_of_range_temperature_fails() {
     // Temperature validation now happens at the model_provider level.
     let toml_str = r#"
 [providers.models.openai.default]
+api_key = "sk-test"
 temperature = 99.0
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
     // Out-of-range temperature is stored but caught by validate().
-    assert!(
+    assert_eq!(
         config
             .providers
             .models
             .find("openai", "default")
             .expect("entry exists")
-            .temperature
-            == Some(99.0)
+            .temperature,
+        Some(99.0)
+    );
+    let err = config.validate().expect_err("temperature 99.0 should fail");
+    assert!(
+        err.to_string().contains("temperature"),
+        "expected temperature validation error, got: {err}"
     );
 }
 
@@ -101,17 +103,23 @@ temperature = 99.0
 fn config_negative_temperature_fails() {
     let toml_str = r#"
 [providers.models.openai.default]
+api_key = "sk-test"
 temperature = -0.5
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
-    assert!(
+    assert_eq!(
         config
             .providers
             .models
             .find("openai", "default")
             .expect("entry exists")
-            .temperature
-            == Some(-0.5)
+            .temperature,
+        Some(-0.5)
+    );
+    let err = config.validate().expect_err("temperature -0.5 should fail");
+    assert!(
+        err.to_string().contains("temperature"),
+        "expected temperature validation error, got: {err}"
     );
 }
 
@@ -568,12 +576,12 @@ allowed_users = ["@user:example.com"]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #3456 – top-level [cli] section must not clash with channels.cli
+// – top-level [cli] section must not clash with channels.cli
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn config_toplevel_cli_section_with_whatsapp_parses() {
-    // Exact config from issue #3456
+    // Exact config from
     let toml_str = r#"
 [cli]
 

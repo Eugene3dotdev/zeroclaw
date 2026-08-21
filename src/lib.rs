@@ -34,7 +34,7 @@
     clippy::unnecessary_wraps
 )]
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "agent-runtime")]
@@ -213,8 +213,23 @@ Examples:
 }
 
 /// Service management subcommands
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceLogStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
+    /// Internal launchd runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunLaunchdDaemon,
+    /// Internal OpenRC logger that drains one daemon stream into bounded storage
+    #[command(hide = true)]
+    RunOpenrcLogWriter {
+        #[arg(value_enum)]
+        stream: ServiceLogStream,
+    },
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
@@ -280,12 +295,22 @@ Adds a Telegram username (without the '@' prefix) or numeric user \
 ID to the channel allowlist so the agent will respond to messages \
 from that identity.
 
+Use --alias to target a non-default Telegram channel — it must match \
+the alias in the channels.telegram.<alias> section the agent uses. \
+Without it the identity is bound to the `default` alias and a \
+non-default agent will keep asking for approval.
+
 Examples:
   zeroclaw channel bind-telegram zeroclaw_user
-  zeroclaw channel bind-telegram 123456789")]
+  zeroclaw channel bind-telegram 123456789
+  zeroclaw channel bind-telegram 123456789 --alias alerts")]
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
+        /// Telegram channel alias to bind to (the `<alias>` in
+        /// `channels.telegram.<alias>`). Defaults to `default`.
+        #[arg(long, default_value = "default")]
+        alias: String,
     },
     /// Send a message to a configured channel
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -315,11 +340,123 @@ Examples:
     },
 }
 
+/// Alias CRUD for agents (`[agents.<alias>]`). Distinct from the `agent`
+/// run command. Rename/delete cascade config references; for agents they also
+/// re-point owned state (memory / cron / acp / session) and move the workspace.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentsCommands {
+    /// List configured agent aliases
+    List,
+    /// Create a new agent alias with default config
+    Create {
+        /// New agent alias (lowercase alphanumeric + single underscore)
+        alias: String,
+    },
+    /// Rename an agent alias, rewriting every reference to it
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
+    },
+    /// Delete an agent alias, scrubbing references and cascading owned state
+    Delete {
+        /// Alias to delete
+        alias: String,
+        /// Show the impact (references that would be scrubbed) without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for providers (`[providers.<category>.<family>.<alias>]`).
+/// `category` is one of `models`, `tts`, `transcription`.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProvidersCommands {
+    /// List provider aliases (optionally filtered by category)
+    List {
+        /// Category: models | tts | transcription
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Create a new provider alias with default config
+    Create {
+        /// Category: models | tts | transcription
+        category: String,
+        /// Provider family (e.g. anthropic, openai, elevenlabs)
+        family: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a provider alias, rewriting every reference
+    Rename {
+        category: String,
+        family: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a provider alias, scrubbing references
+    Delete {
+        category: String,
+        family: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for channels (`[channels.<type>.<alias>]`).
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChannelsCommands {
+    /// List channel aliases (optionally filtered by type)
+    List {
+        /// Channel type, e.g. discord, telegram
+        #[arg(long)]
+        channel_type: Option<String>,
+    },
+    /// Create a new channel alias with default config
+    Create {
+        /// Channel type (discord, telegram, slack, …)
+        channel_type: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a channel alias, rewriting every reference
+    Rename {
+        channel_type: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a channel alias, scrubbing references
+    Delete {
+        channel_type: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
     /// List all installed skills
-    List,
+    List {
+        /// Show exactly what this agent loads at runtime (its workspace +
+        /// open-skills + plugins + assigned bundles). --bundle takes precedence
+        /// when both are passed.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Restrict to a single bundle. Omit to list across all bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+    },
     /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -384,15 +521,31 @@ Examples:
     Install {
         /// Source URL or local path
         source: String,
+        /// Install into this agent's assigned bundle (defaults to the active
+        /// agent). When the agent has no bundle, falls back to the global dir.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Install into this bundle directly. Takes precedence over --agent.
+        #[arg(long)]
+        bundle: Option<String>,
         /// Suppress only the install-time tier banner; other install
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// Remove an installed skill
     Remove {
         /// Skill name to remove
         name: String,
+        /// Limit the search to this agent's assigned bundles.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Remove from this bundle directly (disambiguates duplicates).
+        #[arg(long)]
+        bundle: Option<String>,
     },
     /// Run TEST.sh validation for a skill (or all skills)
     Test {
@@ -418,10 +571,21 @@ pub enum SkillBundleCommands {
         #[arg(long)]
         directory: Option<String>,
     },
-    /// Remove a configured skill bundle
+    /// Remove a configured skill bundle (archives its directory + strips it
+    /// from every agent's `skill_bundles` list)
     Remove {
         /// Bundle alias
         alias: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a skill bundle (moves its directory + rewrites agent references)
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
     },
     /// Show metadata + skill list for a bundle
     Show {
@@ -442,7 +606,103 @@ pub enum MigrateCommands {
         /// Validate and preview migration without writing any data
         #[arg(long)]
         dry_run: bool,
+
+        /// Rebuild backend indexes after importing entries
+        #[arg(long)]
+        reindex: bool,
     },
+}
+
+/// Reject a `--to` value that is shaped like a flag.
+///
+/// `--to` opts into `allow_hyphen_values` so hyphen-led recipients parse, which
+/// otherwise lets a forgotten value consume the next flag: `--to --thread t-1`
+/// would take `--thread` as the recipient and then fail on the positional
+/// argument. Rejecting a `--` prefix keeps that mistake legible while leaving
+/// every real recipient shape (`-100…`, `-100…:42`) accepted.
+///
+/// The rejection is unconditional. A value parser runs on the parsed value
+/// whichever syntax supplied it, so `--to=--thread` is rejected identically and
+/// the message must not offer that as a workaround. No supported channel has a
+/// recipient beginning with `--`.
+fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
+    if raw.starts_with("--") {
+        return Err(format!(
+            "`{raw}` looks like a flag, not a recipient; \
+             recipient values beginning with `--` are not supported"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+/// Shared delivery flags for the cron creation and update subcommands.
+///
+/// Flattened into `add`, `add-at`, `add-every`, `once`, and `update` so a job's
+/// output can be routed to a channel. When none of these are set the job keeps
+/// delivery mode `"none"` (output is computed but not announced anywhere).
+///
+/// On `update` these are a patch: only the fields given are changed, and the
+/// rest are carried over from the job's stored delivery config.
+#[derive(clap::Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CronDeliveryArgs {
+    /// Announce job output to this channel (e.g. telegram, discord, slack).
+    #[arg(long = "channel")]
+    pub delivery_channel: Option<String>,
+    /// Target chat/recipient id for the channel (e.g. a Telegram chat id).
+    ///
+    /// `allow_hyphen_values` is required because supported recipients start with
+    /// a hyphen: Telegram group and channel ids are negative (`-100…`), and a
+    /// forum topic target is `chat:thread` (`-100…:42`), which is hyphen-led but
+    /// not a number. Without it clap treats the value as a flag and exits before
+    /// any delivery validation runs, leaving only the undocumented `--to=<value>`
+    /// form working.
+    ///
+    /// `allow_negative_numbers` is not enough: it accepts `-100…` but still
+    /// rejects the `chat:thread` form. The broader setting alone would let a
+    /// forgotten value swallow the following flag, so `parse_delivery_recipient`
+    /// rejects `--`-prefixed values and names the offending token.
+    #[arg(long = "to", allow_hyphen_values = true, value_parser = parse_delivery_recipient)]
+    pub delivery_to: Option<String>,
+    /// Optional thread/conversation id, for channels that route on it (webhook).
+    #[arg(long = "thread")]
+    pub delivery_thread: Option<String>,
+    /// Fail the job if delivery fails (default: delivery errors are non-fatal).
+    #[arg(long = "no-best-effort", conflicts_with = "best_effort")]
+    pub no_best_effort: bool,
+    /// Keep the job succeeding when delivery fails. Restores the default after
+    /// a previous `--no-best-effort`.
+    #[arg(long = "best-effort")]
+    pub best_effort: bool,
+}
+
+impl CronDeliveryArgs {
+    /// The requested best-effort setting, or `None` when neither flag is given.
+    ///
+    /// The two flags are mutually exclusive at the clap layer, so at most one
+    /// is ever set.
+    #[must_use]
+    pub fn best_effort_override(&self) -> Option<bool> {
+        if self.no_best_effort {
+            Some(false)
+        } else if self.best_effort {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the user supplied any delivery flag.
+    ///
+    /// This drives the `update` no-field guard and decides whether the stored
+    /// job has to be loaded for a merge, so it must count the boolean flags
+    /// too: `--no-best-effort` on its own is a real request, not an absence.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.delivery_channel.is_some()
+            || self.delivery_to.is_some()
+            || self.delivery_thread.is_some()
+            || self.best_effort_override().is_some()
+    }
 }
 
 /// Cron subcommands
@@ -460,9 +720,9 @@ When --tz is omitted, cron schedules use the runtime local timezone. \
 For user-facing schedules, pass --tz with an explicit IANA timezone.
 
 Examples:
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'")]
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel")]
     Add {
         /// Cron expression
         expression: String,
@@ -479,6 +739,14 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -488,11 +756,11 @@ Examples:
 Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
 The timestamp must include an explicit Z or numeric offset \
-(e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
+(e.g. 2099-01-15T14:00:00Z or 2099-01-15T09:00:00-05:00).
 
 Examples:
-  zeroclaw cron add-at --agent morning-shift 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2099-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
@@ -505,6 +773,13 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -516,8 +791,8 @@ Add a task that repeats at a fixed interval.
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  zeroclaw cron add-every --agent triage 60000 'Ping heartbeat'
-  zeroclaw cron add-every --agent triage 3600000 'Hourly report'")]
+  zeroclaw cron add-every --agent triage --prompt 60000 'Ping heartbeat'
+  zeroclaw cron add-every --agent triage --prompt 3600000 'Hourly report'")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
@@ -530,6 +805,13 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -542,7 +824,7 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  zeroclaw cron once --agent ops-bot 30m 'Run backup in 30 minutes'
+  zeroclaw cron once --agent ops-bot --prompt 30m 'Run backup in 30 minutes'
   zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
     Once {
         /// Delay duration
@@ -556,6 +838,13 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -597,6 +886,13 @@ Examples:
         /// Replace the agent job allowlist with the specified tool names (repeatable)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
     },
     /// Pause a scheduled task
     Pause {
@@ -781,4 +1077,44 @@ pub enum SopCommands {
         /// Name of the SOP to show
         name: String,
     },
+    /// Approve a SOP run waiting for out-of-band approval (talks to the running daemon)
+    Approve {
+        /// The run ID to approve
+        run_id: String,
+    },
+    /// Deny (cancel) a SOP run waiting for approval (talks to the running daemon)
+    Deny {
+        /// The run ID to deny
+        run_id: String,
+        /// Optional reason recorded in the approval ledger
+        reason: Option<String>,
+    },
+    /// List SOP runs currently waiting for approval (talks to the running daemon)
+    Pending,
+    /// Render an SOP's node graph as text
+    Graph {
+        /// Name of the SOP to render
+        name: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = SopGraphFormat::Outline)]
+        format: SopGraphFormat,
+    },
+    /// Delete an SOP definition from disk
+    Delete {
+        /// Name of the SOP to delete
+        name: String,
+    },
+}
+
+/// Text output format for `sop graph`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum SopGraphFormat {
+    /// One line per node with its outbound flow edges.
+    Outline,
+    /// `from -> to [role]` adjacency, one edge per line.
+    Adjacency,
+    /// Pretty-printed JSON of the whole projection.
+    Json,
 }

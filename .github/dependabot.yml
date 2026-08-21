@@ -5,6 +5,8 @@ updates:
     directory: "/"
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
     target-branch: master
     open-pull-requests-limit: 3
     labels:
@@ -17,10 +19,30 @@ updates:
           - minor
           - patch
 
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    labels:
+      - "dependencies"
+      - "web"
+    groups:
+      web-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
     target-branch: master
     open-pull-requests-limit: 1
     labels:
@@ -38,6 +60,8 @@ updates:
     directory: "/"
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
     target-branch: master
     open-pull-requests-limit: 1
     labels:

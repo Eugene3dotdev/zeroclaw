@@ -1,13 +1,4 @@
 //! PostgreSQL-backed memory implementation.
-//!
-//! Compiled in only when the crate is built with `--features memory-postgres`.
-//! Selected at runtime by setting `[memory].backend = "postgres"` and
-//! supplying `db_url` under `[storage.model_provider.config]`. Optional pgvector
-//! support is enabled via `[memory.postgres].vector_enabled`.
-//!
-//! Designed for multi-instance deployments where several agents need to share
-//! a single durable memory store with concurrent writes — the SQLite backend
-//! cannot serve that use case.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use anyhow::{Context, Result};
@@ -24,15 +15,46 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
-/// PostgreSQL-backed persistent memory.
-///
-/// Reliable CRUD and keyword recall via SQL. Hybrid keyword + vector recall
-/// is available when pgvector is installed and `vector_enabled = true`;
-/// otherwise the backend falls back to keyword-only recall and logs a
-/// warning at construction.
+struct DropOnThread<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> DropOnThread<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+    fn get(&self) -> &T {
+        self.0.as_ref().expect("DropOnThread value already taken")
+    }
+}
+
+impl<T: Send + 'static> Drop for DropOnThread<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.0.take() else { return };
+        // Wrap in ManuallyDrop so the value is NOT dropped on the current
+        // thread if spawn fails — ManuallyDrop's own Drop is a no-op.
+        let slot = std::mem::ManuallyDrop::new(value);
+        if std::thread::Builder::new()
+            .name("postgres-client-drop".to_string())
+            .spawn(move || drop(std::mem::ManuallyDrop::into_inner(slot)))
+            .is_err()
+        {
+            // The OS refused to spawn a thread. Intentionally leak the value
+            // rather than drop it here: postgres::Client::drop calls
+            // Runtime::block_on, which panics on a Tokio runtime thread.
+            // A controlled leak is preferable to an unrecoverable panic.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "postgres-client-drop thread spawn failed; leaking client to avoid nested-runtime panic"
+            );
+            // `slot` is ManuallyDrop — T is intentionally not dropped.
+        }
+    }
+}
+
 pub struct PostgresMemory {
     alias: String,
-    client: Arc<Mutex<Client>>,
+    client: DropOnThread<Arc<Mutex<Client>>>,
     qualified_table: String,
     qualified_agents: String,
 }
@@ -81,14 +103,14 @@ impl PostgresMemory {
             }
             Ok(Self {
                 alias: alias.to_string(),
-                client: client_ref,
+                client: DropOnThread::new(client_ref),
                 qualified_table,
                 qualified_agents,
             })
         } else {
             Ok(Self {
                 alias: alias.to_string(),
-                client: Arc::new(Mutex::new(client)),
+                client: DropOnThread::new(Arc::new(Mutex::new(client))),
                 qualified_table,
                 qualified_agents,
             })
@@ -168,15 +190,6 @@ impl PostgresMemory {
         Ok(())
     }
 
-    /// One-shot, idempotent normalization of `memories.session_id`.
-    ///
-    /// Mirrors the SQLite path: the orchestrator sanitizes session keys at
-    /// the source so the runtime HashMap, on-disk JSONL filename, and the
-    /// `session_id` filter for recall all agree. Rows written before that
-    /// fix retained the raw, un-sanitized form (e.g. `slack_C123_1.2_user one`)
-    /// and would be invisible to the new sanitized recall filter. Rewrite
-    /// them once at startup; later runs find nothing to update because
-    /// `sanitize_session_key` is idempotent.
     fn migrate_session_ids_to_sanitized(client: &mut Client, qualified_table: &str) -> Result<()> {
         let select = format!(
             "SELECT DISTINCT session_id FROM {qualified_table} WHERE session_id IS NOT NULL"
@@ -280,17 +293,15 @@ impl PostgresMemory {
                 .unwrap_or_else(|_| "default".into()),
             importance: row.try_get("importance").ok(),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: row.try_get("agent_alias").ok(),
             agent_id: row.try_get("agent_id").ok(),
         })
     }
 }
 
-/// Run a blocking closure on a plain OS thread to avoid nested Tokio runtime
-/// panics. The sync `postgres` crate internally calls `Runtime::block_on()`,
-/// which conflicts with `tokio::task::spawn_blocking` threads that are still
-/// associated with the Tokio runtime's blocking pool. Plain OS threads have no
-/// runtime context, so the nested `block_on` succeeds.
 async fn run_on_os_thread<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -317,7 +328,7 @@ where
     })?
 }
 
-fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+pub(super) fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
     }
@@ -340,8 +351,24 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(super) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
+}
+
+fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> String {
+    match (since, until) {
+        (true, true) => format!(
+            " AND m.created_at >= ${first_placeholder}::TIMESTAMPTZ AND m.created_at <= ${}::TIMESTAMPTZ",
+            first_placeholder + 1
+        ),
+        (true, false) => {
+            format!(" AND m.created_at >= ${first_placeholder}::TIMESTAMPTZ")
+        }
+        (false, true) => {
+            format!(" AND m.created_at <= ${first_placeholder}::TIMESTAMPTZ")
+        }
+        (false, false) => String::new(),
+    }
 }
 
 #[async_trait]
@@ -357,12 +384,6 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        // Trait-level `store` has no agent context. Route through
-        // `store_with_agent` so the row is attributed to the default
-        // agent (the NOT NULL FK on `agent_id` rejects unattributed
-        // inserts; un-attributed callers like the heartbeat memory
-        // path land under the synthesized `default` agent rather than
-        // surfacing a constraint violation).
         self.store_with_agent(key, content, category, session_id, None, None, None)
             .await
     }
@@ -375,7 +396,7 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
@@ -388,14 +409,7 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND created_at >= $4::TIMESTAMPTZ AND created_at <= $5::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND created_at >= $4::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND created_at <= $4::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 4);
 
             let stmt = format!(
                 "
@@ -435,7 +449,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -459,7 +473,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -488,7 +502,7 @@ impl Memory for PostgresMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let category = category.map(Self::category_to_str);
@@ -518,7 +532,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
@@ -532,7 +546,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
         let agent_id = agent_id.to_string();
@@ -547,7 +561,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn purge_session_for_agent(&self, session_id: &str, agent_id: &str) -> Result<usize> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let session_id = session_id.to_string();
         let agent_id = agent_id.to_string();
@@ -562,8 +576,105 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> Result<usize> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+            );
+            let deleted = client.execute(&stmt, &[&alias])?;
+            usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+        })
+        .await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> Result<Vec<MemoryEntry>> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
+                ORDER BY m.created_at ASC
+                "
+            );
+            let rows = client.query(&stmt, &[&alias])?;
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> Result<usize> {
+        let client = self.client.get().clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let qualified_table = self.qualified_table.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            let mut tx = client.transaction()?;
+            let to_rows: i64 = tx
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+                    ),
+                    &[&to],
+                )?
+                .get(0);
+            if to_rows > 0 {
+                anyhow::bail!(
+                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                );
+            }
+            tx.execute(
+                &format!("DELETE FROM {qualified_agents} WHERE alias = $1"),
+                &[&to],
+            )?;
+            let updated = tx.execute(
+                &format!("UPDATE {qualified_agents} SET alias = $2 WHERE alias = $1"),
+                &[&from, &to],
+            )?;
+            tx.commit()?;
+            usize::try_from(updated).context("PostgreSQL returned an oversized update count")
+        })
+        .await
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> Result<usize> {
+        let client = self.client.get().clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            // Mirror `rename_agent`: it moves the `agents` row (alias -> id), so
+            // residue is the presence of that alias row (0 or 1), NOT the memory-
+            // row count (which would miss an agents-row-only lag).
+            let stmt = format!("SELECT COUNT(*) FROM {qualified_agents} WHERE alias = $1");
+            let row = client.query_one(&stmt, &[&alias])?;
+            let count: i64 = row.get(0);
+            usize::try_from(count).context("PostgreSQL returned an oversized agent count")
+        })
+        .await
+    }
+
     async fn count(&self) -> Result<usize> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
 
         run_on_os_thread(move || -> Result<usize> {
@@ -578,7 +689,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn health_check(&self) -> bool {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
             .await
             .unwrap_or(false)
@@ -594,7 +705,7 @@ impl Memory for PostgresMemory {
         _importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -606,11 +717,6 @@ impl Memory for PostgresMemory {
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
-            // `agent_id = COALESCE($8, default-agent-uuid)` so callers
-            // without an agent context still satisfy the NOT NULL FK
-            // by attributing to the synthesized default agent. The
-            // subquery is indexed (UNIQUE alias) so the lookup is
-            // metadata-cached after the first call.
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
@@ -652,7 +758,7 @@ impl Memory for PostgresMemory {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let q = normalize_recent_recall_query(query).trim().to_string();
@@ -666,20 +772,7 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            // The agent_id filter lives in the WHERE clause so the
-            // backend never returns a foreign-agent row to the caller;
-            // post-fetch attribution lookups in earlier impls were the
-            // privacy escape Audacity flagged. The NOT NULL FK on
-            // `memories.agent_id` means there are no legacy
-            // unattributed rows to special-case.
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND m.created_at >= $5::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND m.created_at <= $5::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 5);
 
             let stmt = format!(
                 "
@@ -722,7 +815,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = alias.to_string();
         run_on_os_thread(move || -> Result<String> {
@@ -762,6 +855,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recall_time_filter_qualifies_alias_and_preserves_placeholder_order() {
+        let cases = [
+            (false, false, 4, ""),
+            (true, false, 4, " AND m.created_at >= $4::TIMESTAMPTZ"),
+            (false, true, 4, " AND m.created_at <= $4::TIMESTAMPTZ"),
+            (
+                true,
+                true,
+                4,
+                " AND m.created_at >= $4::TIMESTAMPTZ AND m.created_at <= $5::TIMESTAMPTZ",
+            ),
+            (false, false, 5, ""),
+            (true, false, 5, " AND m.created_at >= $5::TIMESTAMPTZ"),
+            (false, true, 5, " AND m.created_at <= $5::TIMESTAMPTZ"),
+            (
+                true,
+                true,
+                5,
+                " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ",
+            ),
+        ];
+
+        for (since, until, first_placeholder, expected) in cases {
+            assert_eq!(
+                recall_time_filter(since, until, first_placeholder),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn valid_identifiers_pass_validation() {
         assert!(validate_identifier("public", "schema").is_ok());
         assert!(validate_identifier("_memories_01", "table").is_ok());
@@ -792,6 +916,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn drop_on_thread_drops_value_on_plain_os_thread() {
+        let (tx, rx) = oneshot::channel::<bool>();
+
+        struct DropGuard(Option<oneshot::Sender<bool>>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                // true  → dropped on a plain OS thread (no active Tokio runtime) ✓
+                // false → dropped on a Tokio runtime thread ✗
+                let on_plain_thread = tokio::runtime::Handle::try_current().is_err();
+                let _ = self.0.take().unwrap().send(on_plain_thread);
+            }
+        }
+
+        // Drop DropOnThread from inside the Tokio runtime — this is the
+        // scenario that caused the nested-runtime panic in production.
+        drop(DropOnThread::new(DropGuard(Some(tx))));
+
+        let on_plain_thread = rx.await.expect("DropGuard did not fire");
+        assert!(
+            on_plain_thread,
+            "DropOnThread must run Drop on a plain OS thread, not a Tokio runtime thread"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn new_does_not_panic_inside_tokio_runtime() {
         let outcome = std::panic::catch_unwind(|| {
             PostgresMemory::new(
@@ -811,15 +960,6 @@ mod tests {
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
     }
-
-    // ── session_id migration ──────────────────────────────────────
-    //
-    // End-to-end migration coverage requires a live PostgreSQL instance, and
-    // the crate's existing Postgres test suite does not run one in CI. The
-    // unit tests below exercise the rewrite plan against the same
-    // `sanitize_session_key` helper used by the migration SQL, which is
-    // sufficient to verify the contract that `migrate_session_ids_to_sanitized`
-    // relies on: which values change, which stay, and idempotence on re-run.
 
     #[test]
     fn rewrites_only_values_that_change_under_sanitization() {

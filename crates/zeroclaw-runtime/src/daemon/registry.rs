@@ -8,24 +8,27 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
+use super::{GatewayReadinessReporter, SocketReadinessReporter};
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
-/// Starts the gateway HTTP server for one daemon run/reload iteration.
-///
-/// The optional broadcast sender carries daemon events, the optional reload
-/// sender lets the gateway trigger in-process reloads, and the optional TUI
-/// registry powers the gateway's TUI identity endpoints.
+#[derive(Clone)]
+pub struct GatewayReloadControls {
+    pub shutdown_tx: watch::Sender<bool>,
+    pub reload_tx: watch::Sender<bool>,
+}
+
 pub type GatewayStarter = Box<
     dyn Fn(
             String,
             u16,
             Config,
             Option<broadcast::Sender<Value>>,
-            Option<watch::Sender<bool>>,
+            Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
+            Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
         + Sync,
@@ -33,6 +36,18 @@ pub type GatewayStarter = Box<
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
 pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+
+/// Starts the local IPC transport and optionally reports its secured bind.
+pub type SocketStarter = Box<
+    dyn Fn(
+            Arc<RpcContext>,
+            CancellationToken,
+            Arc<AtomicUsize>,
+            Option<SocketReadinessReporter>,
+        ) -> StarterFuture
+        + Send
+        + Sync,
+>;
 
 /// Starts an RPC transport using the shared daemon RPC context.
 pub type RpcStarter = Box<
@@ -42,18 +57,17 @@ pub type RpcStarter = Box<
 /// Starts the MQTT SOP listener for one configured MQTT channel alias.
 pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 
-/// Typed startup registry injected by the binary crate.
-///
-/// This registry is the source of truth for startup hook values for the current
-/// daemon run/reload iteration. It deliberately does not copy config-derived
-/// facts; `Config` remains the source of truth for which subsystems are enabled.
 #[derive(Default)]
 pub struct DaemonRegistry {
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
-    socket_start: Option<RpcStarter>,
+    socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
+    /// Shared SOP engine built by the daemon reload loop. Passed through to
+    /// RpcContext so RPC/TUI agent sessions share the same engine.
+    sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 }
 
 impl DaemonRegistry {
@@ -83,7 +97,7 @@ impl DaemonRegistry {
         self.channels_start.is_some()
     }
 
-    pub fn register_socket(&mut self, starter: RpcStarter) -> &mut Self {
+    pub fn register_socket(&mut self, starter: SocketStarter) -> &mut Self {
         self.socket_start = Some(starter);
         self
     }
@@ -119,7 +133,7 @@ impl DaemonRegistry {
         self.channels_start.take()
     }
 
-    pub(crate) fn take_socket_start(&mut self) -> Option<RpcStarter> {
+    pub(crate) fn take_socket_start(&mut self) -> Option<SocketStarter> {
         self.socket_start.take()
     }
 
@@ -130,6 +144,26 @@ impl DaemonRegistry {
     pub(crate) fn take_mqtt_start(&mut self) -> Option<MqttStarter> {
         self.mqtt_start.take()
     }
+
+    /// Set the shared SOP engine for this daemon iteration.
+    pub fn set_sop_engine(
+        &mut self,
+        sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+        sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    ) -> &mut Self {
+        self.sop_engine = sop_engine;
+        self.sop_audit = sop_audit;
+        self
+    }
+
+    pub(crate) fn take_sop_engine(
+        &mut self,
+    ) -> (
+        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+        Option<Arc<crate::sop::SopAuditLogger>>,
+    ) {
+        (self.sop_engine.take(), self.sop_audit.take())
+    }
 }
 
 #[cfg(test)]
@@ -137,11 +171,15 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
         Box::new(|_, _| Box::pin(async { Ok(()) }))
+    }
+
+    fn socket_starter() -> SocketStarter {
+        Box::new(|_, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn rpc_starter() -> RpcStarter {
@@ -169,7 +207,7 @@ mod tests {
         registry
             .register_gateway(gateway_starter())
             .register_channels(channels_starter())
-            .register_socket(rpc_starter())
+            .register_socket(socket_starter())
             .register_wss(rpc_starter())
             .register_mqtt(mqtt_starter());
 
@@ -186,7 +224,7 @@ mod tests {
         registry
             .register_gateway(gateway_starter())
             .register_channels(channels_starter())
-            .register_socket(rpc_starter())
+            .register_socket(socket_starter())
             .register_wss(rpc_starter())
             .register_mqtt(mqtt_starter());
 

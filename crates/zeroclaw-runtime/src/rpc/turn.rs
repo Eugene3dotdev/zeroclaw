@@ -1,6 +1,7 @@
 //! Shared turn execution. Single source of truth for spawn-drain-cancel.
 
 use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -22,6 +23,10 @@ pub enum TurnOutcome {
 pub enum TurnError {
     Panicked(String),
     AgentError(String),
+    TerminalCompletion {
+        diagnostic: String,
+        user_message: String,
+    },
 }
 
 impl std::fmt::Display for TurnError {
@@ -29,11 +34,25 @@ impl std::fmt::Display for TurnError {
         match self {
             Self::Panicked(msg) => write!(f, "Turn task panicked: {msg}"),
             Self::AgentError(msg) => write!(f, "Agent turn failed: {msg}"),
+            Self::TerminalCompletion { diagnostic, .. } => {
+                write!(f, "Agent turn failed: {diagnostic}")
+            }
         }
     }
 }
 
 impl std::error::Error for TurnError {}
+
+impl TurnError {
+    /// Localized text is carried only for a client-delivery boundary. Display
+    /// remains the stable diagnostic form used by logs and durable audit rows.
+    pub fn user_message(&self) -> Option<&str> {
+        match self {
+            Self::TerminalCompletion { user_message, .. } => Some(user_message),
+            Self::Panicked(_) | Self::AgentError(_) => None,
+        }
+    }
+}
 
 /// Attribution fields attached to the tracing span for the duration of a turn.
 /// All fields appear on every `record!()` emitted inside the turn.
@@ -51,6 +70,7 @@ pub async fn execute_turn<F, Fut>(
     prompt: String,
     cancel: CancellationToken,
     attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -75,9 +95,18 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            guard
-                .turn_streamed_with_steering_state(&prompt, event_tx, Some(cancel_clone), None)
-                .instrument(span)
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    cost_context,
+                    guard
+                        .turn_streamed_with_steering_state(
+                            &prompt,
+                            event_tx,
+                            Some(cancel_clone),
+                            None,
+                        )
+                        .instrument(span),
+                )
                 .await
         })
         .await
@@ -85,11 +114,6 @@ where
 
     let mut accumulated_text = String::new();
 
-    // Drive the turn by draining its event channel, but never let a turn task
-    // wedged inside a non-cancellable tool call (shell, HTTP, a stalled provider
-    // stream) hold the dispatch path hostage. The drain exits on channel close,
-    // explicit cancel, OR an idle-stall bound; the latter two return Cancelled
-    // and the in-flight task is aborted on drop.
     let drain =
         drain_until_done_or_cancelled(&mut event_rx, &cancel, &mut accumulated_text, &on_event)
             .await;
@@ -103,17 +127,9 @@ where
             outcome_from_task_result(joined, accumulated_text)
         }
         DrainOutcome::ExplicitCancel => {
-            // The turn task races the same cancel token and unwinds
-            // cooperatively: it synthesizes results for any in-flight tool
-            // call, pushes the `[interrupted]` assistant message, and commits
-            // both into the agent history before returning. Persistence reads
-            // that committed history, so aborting the task mid-commit drops
-            // the cancelled turn's tool exchange and corrupts the next turn.
-            // Give the task a bounded grace window to land its own unwind;
-            // only abort if it is genuinely wedged in a non-cooperative call.
             match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
                 Ok(joined) => outcome_from_task_result(
-                    joined.map_err(|e| TurnError::Panicked(format!("{e}")))?,
+                    joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
                 Err(_) => {
@@ -160,7 +176,17 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
-        Err(StreamedTurnError { error, .. }) => Err(TurnError::AgentError(format!("{error}"))),
+        Err(StreamedTurnError { error, .. }) => {
+            if let Some(user_message) =
+                crate::agent::terminal_completion_error_message(&error, None)
+            {
+                return Err(TurnError::TerminalCompletion {
+                    diagnostic: error.to_string(),
+                    user_message,
+                });
+            }
+            Err(TurnError::AgentError(error.to_string()))
+        }
     }
 }
 
@@ -174,13 +200,6 @@ enum DrainOutcome {
     ExplicitCancel,
 }
 
-/// Drain `event_rx` until the turn finishes or the cancel token fires. Chunk
-/// deltas accumulate in `accumulated` so partial text survives a cancel. The
-/// only terminals are the turn task dropping its sender (`recv` -> `None`,
-/// [`DrainOutcome::Completed`]) and an explicit cancel
-/// ([`DrainOutcome::ExplicitCancel`]). A wedged turn is bounded by the explicit
-/// layers — ownership-gated `session/cancel` and the reaper — never by guessing
-/// from channel quiet.
 async fn drain_until_done_or_cancelled<F, Fut>(
     event_rx: &mut mpsc::Receiver<TurnEvent>,
     cancel: &CancellationToken,
@@ -242,6 +261,7 @@ mod tests {
                     id: "c1".to_string(),
                     name: "shell".to_string(),
                     output: "ok".to_string(),
+                    artifact: None,
                 })
                 .await;
             let _ = tx
@@ -322,11 +342,6 @@ mod tests {
 
     #[test]
     fn cancel_outcome_carries_committed_messages_not_just_partial_text() {
-        // A cooperative cancel returns StreamedTurnError whose new_messages
-        // hold the synthesized tool results + `[interrupted]` message the task
-        // already committed. The mapping must surface them, not drop them onto
-        // the floor and fall back to bare accumulated text — that drop is what
-        // truncated the cancelled turn's tool exchange from persisted history.
         let msgs = vec![ConversationMessage::Chat(
             zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         )];
@@ -373,6 +388,168 @@ mod tests {
             matches!(outcome, Err(TurnError::AgentError(_))),
             "a genuine agent failure must surface as an error, not a silent \
              cancel"
+        );
+    }
+
+    #[test]
+    fn terminal_completion_keeps_diagnostic_and_delivery_text_separate() {
+        let err = StreamedTurnError {
+            error: anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ),
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), String::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("semantic-empty terminal completion must fail"),
+        };
+        assert_eq!(
+            outcome.to_string(),
+            "Agent turn failed: provider completed without final text or tool calls"
+        );
+        assert_eq!(
+            outcome.user_message(),
+            Some("The model provider returned an invalid semantic completion.")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::cost::CostTracker;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use std::collections::HashMap;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+        use zeroclaw_providers::ChatRequest;
+
+        // Minimal provider that returns a final answer carrying non-zero token
+        // usage on the non-streaming `chat` path (the default the engine takes
+        // when the provider does not advertise streaming).
+        struct UsageProvider;
+
+        #[async_trait]
+        impl ModelProvider for UsageProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        impl Attributable for UsageProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "mock-provider"
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("rpc-agent");
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(UsageProvider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "hello".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("s1".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "mock-provider".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            Some(cost_context),
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn should complete normally"
+        );
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(
+            summary.request_count, 1,
+            "execute_turn must scope the cost context so the turn's usage is \
+             persisted (#5221)"
+        );
+        assert_eq!(summary.total_tokens, 1_200);
+        let agent_summary = tracker
+            .get_summary_for_agent("rpc-agent")
+            .expect("agent-scoped summary");
+        assert_eq!(
+            agent_summary.request_count, 1,
+            "the agent alias must flow through to the persisted cost record"
         );
     }
 }

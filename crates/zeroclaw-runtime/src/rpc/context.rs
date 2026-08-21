@@ -1,9 +1,5 @@
 //! Shared context threaded from `daemon::run()` through the Unix socket
 //! listener into each per-connection [`super::dispatch::RpcDispatcher`].
-//!
-//! Every subsystem handle the RPC layer might need lives here. Fields
-//! beyond `config` and `sessions` are `Option` so the context works in
-//! tests and minimal (kernel-only) daemon configurations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,17 +17,45 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
 
-/// Registry for in-flight tool approval requests.
-///
-/// The RpcApprovalChannel inserts a (request_id, oneshot::Sender) pair
-/// before sending the approval_request notification.
-/// handle_session_approve resolves it when the client sends session/approve.
 #[derive(Default)]
 pub struct ApprovalPendingMap {
     inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
 }
 
+pub struct PendingApproval {
+    map: Arc<ApprovalPendingMap>,
+    request_id: String,
+    active: bool,
+}
+
+impl PendingApproval {
+    pub fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        if self.active {
+            self.map.remove(&self.request_id);
+        }
+    }
+}
+
 impl ApprovalPendingMap {
+    pub fn register(
+        self: &Arc<Self>,
+        request_id: String,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+    ) -> PendingApproval {
+        self.insert(request_id.clone(), tx);
+        PendingApproval {
+            map: Arc::clone(self),
+            request_id,
+            active: true,
+        }
+    }
+
     pub fn insert(&self, request_id: String, tx: oneshot::Sender<ChannelApprovalResponse>) {
         self.inner
             .lock()
@@ -39,7 +63,7 @@ impl ApprovalPendingMap {
             .insert(request_id, tx);
     }
 
-    pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) {
+    pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) -> bool {
         let tx = self
             .inner
             .lock()
@@ -47,9 +71,33 @@ impl ApprovalPendingMap {
             .remove(request_id);
         if let Some(tx) = tx {
             let _ = tx.send(response);
+            return true;
         }
+        false
+    }
+
+    pub fn remove(&self, request_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, request_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(request_id)
     }
 }
+
+/// Owned guard for [`RpcContext::config_write_lock`]. Owned (not
+/// borrowed) so a handler can release it explicitly at its commit point
+/// — letting post-commit side effects run unlocked — and pass it by
+/// value into delegated handlers without lifetime coupling.
+pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
 
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
@@ -57,6 +105,22 @@ pub struct RpcContext {
     /// without a full daemon reload. Mirrors the gateway's
     /// `Arc<RwLock<Config>>` pattern.
     pub config: Arc<RwLock<Config>>,
+
+    /// Serializes the read-mutate-flush critical section of every RPC
+    /// handler that mutates `config` (config/set, config/delete, map-key
+    /// create/delete/rename, alias rename, quickstart/apply). A tokio
+    /// mutex, not `parking_lot`, because the guard must survive the
+    /// `.await` on config-save I/O.
+    ///
+    /// Invariant: every mutation of `config` must happen while holding
+    /// this mutex, acquired before the first `config` read-for-modify or
+    /// write and held through the flush that persists it. Never acquire
+    /// it while holding a `config` guard — lock order is this mutex
+    /// first, `config` second, always. A writer that bypasses this lock
+    /// and re-dirties a just-saved path while a flush is mid-save loses
+    /// disk persistence for that write (memory keeps it, but the dirty
+    /// flag is cleared by the concurrent flush).
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
 
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
@@ -79,6 +143,10 @@ pub struct RpcContext {
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
 
+    /// Write `true` to ask the current gateway listener to shut down before
+    /// daemon reload rebinds the same address.
+    pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
 
@@ -91,24 +159,161 @@ pub struct RpcContext {
     /// when the store could not be opened (read-only FS, bad perms) —
     /// callers must treat persistence as best-effort.
     pub acp_session_store: Option<Arc<AcpSessionStore>>,
+
+    /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
+    /// `None` when standalone — sessions build their own.
+    pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+
+    /// Lifecycle hook runner. `None` when hooks are disabled in config.
+    pub hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl RpcContext {
-    /// Minimal context for tests — only config and sessions, everything
-    /// else `None`.
-    #[cfg(test)]
-    pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+    pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let tui_dir = config
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| config.data_dir.clone());
+        let data_dir = config.data_dir.clone();
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
+            acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_event_tx(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        event_tx: tokio::sync::broadcast::Sender<Value>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: Some(event_tx),
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_sop_engine(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: Some(sop_engine),
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_memory(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: Some(memory),
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_cost_tracker(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        cost_tracker: Arc<CostTracker>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: Some(cost_tracker),
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
         })
     }
 
@@ -121,15 +326,46 @@ impl RpcContext {
     ) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend,
             memory: None,
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn minimal_with_reload_controls(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+        reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx,
+            gateway_shutdown_tx,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
         })
     }
 }
@@ -145,14 +381,15 @@ mod tests {
         let map = ApprovalPendingMap::default();
         let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
         map.insert("req-1".to_string(), tx);
-        map.resolve("req-1", ChannelApprovalResponse::Approve);
+        assert!(map.resolve("req-1", ChannelApprovalResponse::Approve));
+        assert!(!map.contains("req-1"));
         assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
     }
 
     #[test]
     fn pending_map_resolve_unknown_key_is_noop() {
         let map = ApprovalPendingMap::default();
-        map.resolve("nonexistent", ChannelApprovalResponse::Deny);
+        assert!(!map.resolve("nonexistent", ChannelApprovalResponse::Deny));
     }
 
     #[test]
@@ -161,6 +398,39 @@ mod tests {
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
         map.insert("req-2".to_string(), tx);
         // _rx is dropped — resolve sends to a closed channel; must not panic
-        map.resolve("req-2", ChannelApprovalResponse::Approve);
+        assert!(map.resolve("req-2", ChannelApprovalResponse::Approve));
+        assert!(!map.contains("req-2"));
+    }
+
+    #[test]
+    fn pending_map_remove_drops_stale_request() {
+        let map = ApprovalPendingMap::default();
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-3".to_string(), tx);
+        assert!(map.contains("req-3"));
+        assert!(map.remove("req-3"));
+        assert!(!map.contains("req-3"));
+        assert!(!map.remove("req-3"));
+    }
+
+    #[test]
+    fn pending_guard_drop_removes_registered_request() {
+        let map = Arc::new(ApprovalPendingMap::default());
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let guard = map.register("req-4".to_string(), tx);
+        assert!(map.contains("req-4"));
+        drop(guard);
+        assert!(!map.contains("req-4"));
+    }
+
+    #[test]
+    fn pending_guard_can_be_disarmed_after_resolution() {
+        let map = Arc::new(ApprovalPendingMap::default());
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let mut guard = map.register("req-5".to_string(), tx);
+        assert!(map.resolve("req-5", ChannelApprovalResponse::Approve));
+        guard.disarm();
+        drop(guard);
+        assert!(!map.contains("req-5"));
     }
 }

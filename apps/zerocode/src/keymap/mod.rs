@@ -4,17 +4,49 @@
 //! Consumers call `ChatTabAction::from_chord(&key)` directly — no
 //! `Keymap` struct, no plumbed argument.
 //!
-//! On darwin, `Chord::matches` translates the `CTRL` modifier to
-//! `SUPER` so Linux's `Ctrl+K` and macOS's `⌘K` resolve identically.
+//! On darwin, `Chord::matches` translates most `CTRL` modifiers to
+//! `SUPER`; terminal-owned control chords remain literal.
 
 pub mod actions;
 mod chord;
+mod guard;
 pub mod overrides;
 
 pub use actions::*;
 pub use chord::Chord;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn chord_bypasses_text_input(chord: &Chord) -> bool {
+    if !matches!(chord.code, KeyCode::Char(_)) {
+        return true;
+    }
+
+    let mut modifiers = chord.modifiers;
+    modifiers.remove(KeyModifiers::SHIFT);
+    !modifiers.is_empty()
+}
+
+pub(crate) fn action_bypasses_text_input<A: RebindableActions>(
+    action: A,
+    event: &KeyEvent,
+) -> bool {
+    action
+        .resolved()
+        .iter()
+        .any(|chord| chord_bypasses_text_input(chord) && chord.matches(event))
+}
+
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    action_bypasses_text_input(GlobalAction::Help, event)
+}
+
+pub fn input_bar_claims_pane_navigation(event: &KeyEvent) -> bool {
+    matches!(
+        InputBarAction::from_chord(event),
+        Some(InputBarAction::CursorWordLeft | InputBarAction::CursorWordRight)
+    )
+}
 
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
@@ -60,7 +92,7 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
 }
 
 /// Rendered, OS-aware key labels for an action's currently-resolved
-/// chords (e.g. `["Tab"]`, `["⌘K"]`). Help surfaces use this so the keys
+/// chords (e.g. `["Tab"]`, `["⌘x"]`). Help surfaces use this so the keys
 /// they advertise track the live keybinding registry instead of literals.
 pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
     action.resolved().iter().map(Chord::display).collect()
@@ -78,11 +110,107 @@ mod tests {
     }
 
     #[test]
+    fn global_help_resolves_from_question_mark_and_control_g() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_g), Some(GlobalAction::Help));
+    }
+
+    #[test]
+    fn help_bypass_distinguishes_text_from_command_chords() {
+        let cases = [
+            (
+                Chord::char('?'),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                false,
+            ),
+            (
+                Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                false,
+            ),
+            (
+                Chord::key(KeyCode::F(1)),
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                true,
+            ),
+            (
+                Chord::ctrl('g'),
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                true,
+            ),
+        ];
+
+        for (chord, event, expected) in cases {
+            assert!(chord.matches(&event));
+            assert_eq!(chord_bypasses_text_input(&chord), expected, "{chord:?}");
+        }
+    }
+
+    #[test]
+    fn action_bypass_distinguishes_text_from_command_chords() {
+        assert!(!action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        ));
+        assert!(action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+        ));
+        assert!(action_bypasses_text_input(
+            ChatTabAction::PageUp,
+            &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        ));
+        assert!(!action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SHIFT),
+        ));
+    }
+
+    #[test]
+    fn browse_enter_resolves_from_control_k() {
+        let ev = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(
+            ChatTabAction::from_chord(&ev),
+            Some(ChatTabAction::BrowseEnter)
+        );
+    }
+
+    #[test]
     fn input_bar_enter_is_submit() {
         let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
             InputBarAction::from_chord(&ev),
             Some(InputBarAction::Submit)
+        );
+    }
+
+    #[test]
+    fn input_bar_word_navigation_claims_global_pane_chords() {
+        for event in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            assert!(matches!(
+                GlobalAction::from_chord(&event),
+                Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
+            ));
+            assert!(input_bar_claims_pane_navigation(&event));
+        }
+    }
+
+    #[test]
+    fn config_cursor_actions_use_config_editor_registry_keys() {
+        assert_eq!(
+            ConfigEditorAction::CursorWordLeft.action_key(),
+            "config_editor.cursor_word_left"
+        );
+        assert_eq!(
+            ConfigEditorAction::CursorWordRight.action_key(),
+            "config_editor.cursor_word_right"
         );
     }
 
@@ -111,9 +239,6 @@ mod tests {
         assert_eq!(action, back);
     }
 
-    /// Every action enum's binding table must have no duplicate chord
-    /// keys (one chord → one action per enum). Runs as a unit test so
-    /// the rejection is loud and reproducible in CI.
     #[test]
     fn no_intra_enum_chord_conflicts() {
         fn check<A: Copy + std::fmt::Debug>(label: &str, table: Vec<(Chord, A)>) {
@@ -126,19 +251,28 @@ mod tests {
                 }
             }
         }
-        check("global", GlobalAction::bindings());
-        check("chat", ChatTabAction::bindings());
-        check("logs", LogsTabAction::bindings());
-        check("dashboard", DashboardTabAction::bindings());
-        check("config", ConfigTabAction::bindings());
-        check("quickstart", QuickstartTabAction::bindings());
-        check("input_bar", InputBarAction::bindings());
-        check("modal", ModalAction::bindings());
-        check("file_explorer", FileExplorerAction::bindings());
-        check("file_explorer_search", FileExplorerSearchAction::bindings());
-        check("search_box", SearchBoxAction::bindings());
-        check("config_editor", ConfigEditorAction::bindings());
-        check("quickstart_modal", QuickstartModalAction::bindings());
+        check(GlobalAction::TAG, GlobalAction::bindings());
+        check(ChatTabAction::TAG, ChatTabAction::bindings());
+        check(LogsTabAction::TAG, LogsTabAction::bindings());
+        check(DashboardTabAction::TAG, DashboardTabAction::bindings());
+        check(ConfigTabAction::TAG, ConfigTabAction::bindings());
+        check(DoctorTabAction::TAG, DoctorTabAction::bindings());
+        check(QuickstartTabAction::TAG, QuickstartTabAction::bindings());
+        check(SopTabAction::TAG, SopTabAction::bindings());
+        check(InputBarAction::TAG, InputBarAction::bindings());
+        check(ModalAction::TAG, ModalAction::bindings());
+        check(CaptureAction::TAG, CaptureAction::bindings());
+        check(FileExplorerAction::TAG, FileExplorerAction::bindings());
+        check(
+            FileExplorerSearchAction::TAG,
+            FileExplorerSearchAction::bindings(),
+        );
+        check(SearchBoxAction::TAG, SearchBoxAction::bindings());
+        check(ConfigEditorAction::TAG, ConfigEditorAction::bindings());
+        check(
+            QuickstartModalAction::TAG,
+            QuickstartModalAction::bindings(),
+        );
     }
 
     #[test]
@@ -180,6 +314,13 @@ mod tests {
                     .map(|(c, _)| c)
                     .collect(),
             ),
+            (
+                "sop",
+                SopTabAction::bindings()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect(),
+            ),
         ];
         for (gc, ga) in &global {
             for (label, chords) in panes {
@@ -193,9 +334,6 @@ mod tests {
         }
     }
 
-    /// Every rebindable enum's TAG and serialized variant names must be
-    /// snake_case — the action-key wire form (`"<tag>.<variant>"`) is
-    /// only valid snake_case, and kebab-case is banned project-wide.
     #[test]
     fn tags_and_variant_names_are_snake_case() {
         fn ok(s: &str) -> bool {
@@ -219,6 +357,7 @@ mod tests {
         check::<DashboardTabAction>();
         check::<ConfigTabAction>();
         check::<QuickstartTabAction>();
+        check::<SopTabAction>();
         check::<InputBarAction>();
         check::<FileExplorerAction>();
     }

@@ -1,18 +1,4 @@
 //! Peer-group runtime resolution.
-//!
-//! Given a `Config` and an `agent_alias`, produces the effective set
-//! of peers that agent should accept inbound messages from on its
-//! configured channels. The schema-side primitive is the
-//! `[peer_groups.<name>]` block in `zeroclaw-config::multi_agent`;
-//! this module is the read-side resolver that walks the configured
-//! groups, applies the mutual-membership rule, unions external peers,
-//! subtracts the per-group ignore lists, and returns the result keyed
-//! by channel.
-//!
-//! Cross-reference invariants (peer-group members are configured
-//! agents, the group's channel is on each member's `channels` list)
-//! are upheld at config load. By the time the runtime calls
-//! [`resolve_peer_set`], every input is internally consistent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use zeroclaw_config::schema::Config;
@@ -45,11 +31,6 @@ impl ResolvedPeers {
         false
     }
 
-    /// NOT a security gate. Unknown senders return `true` by design;
-    /// peer groups are an additive routing hint for cross-agent traffic,
-    /// not a global inbound allowlist. Callers must have already
-    /// authenticated the sender (channel auth, signed webhook, etc.)
-    /// before reaching this check.
     #[must_use]
     pub fn allows_inbound(&self, channel_type: &str, origin: &str) -> bool {
         let normalized = origin.trim_start_matches('@').to_ascii_lowercase();
@@ -67,16 +48,6 @@ impl ResolvedPeers {
     }
 }
 
-/// Defense-in-depth self-loop guard for the agent loop entry point.
-///
-/// Returns `true` when `sender` is recognizable as the bot's own
-/// outbound identity on this channel and the agent loop should refuse
-/// to spawn a turn. Mirrors `Channel::drop_self_messages`'s
-/// normalization (strip leading `@`, case-insensitive) so the two
-/// layers agree on what "self" means; the agent-loop call is a
-/// fallback for channel impls that route around the SDK guard or that
-/// expose self-identity later in their lifecycle than the
-/// orchestrator's check fires.
 #[must_use]
 pub fn should_drop_self_loop(sender: &str, self_handle: Option<&str>) -> bool {
     let Some(handle) = self_handle else {
@@ -87,21 +58,6 @@ pub fn should_drop_self_loop(sender: &str, self_handle: Option<&str>) -> bool {
     !handle_norm.is_empty() && handle_norm == sender_norm
 }
 
-/// Build the effective peer set for `agent_alias`.
-///
-/// Walks every `[peer_groups.<name>]` entry the agent appears in:
-///
-/// 1. Other agents in the same group (mutual membership) become peers
-///    on the group's channel.
-/// 2. The group's `external_peers` are added on the group's channel.
-/// 3. The group's `ignore` list is subtracted from both sets.
-/// 4. The bound agent's own alias is removed defensively (a misconfig
-///    that lists the agent in its own group's external_peers is the
-///    classic self-loop footgun the channel SDK already drops at the
-///    other end).
-///
-/// Returns an empty [`ResolvedPeers`] when the agent isn't on any
-/// peer group — the agent runs solo with no cross-agent dispatch.
 #[must_use]
 pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
     let mut resolved = ResolvedPeers::default();
@@ -112,13 +68,8 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
             continue;
         }
 
-        let channel = group.channel.clone();
+        let channel = group.channel.to_string();
         let agent_set = resolved.agent_peers.entry(channel.clone()).or_default();
-        // Aliases are stored case-folded so the lookup side
-        // (`is_known_peer` / `allows_inbound`) can normalize without
-        // missing `@Beta` against a config of `[agents.beta]` or
-        // similar. Aliases are config map keys — the schema does not
-        // enforce a case rule, so we match insensitively.
         let self_norm = agent_alias.trim_start_matches('@').to_ascii_lowercase();
         for member in &group.agents {
             let normalized = member.as_str().trim_start_matches('@').to_ascii_lowercase();
@@ -129,9 +80,10 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
 
         let ext_set = resolved.external_peers.entry(channel.clone()).or_default();
         for ext in &group.external_peers {
-            // PeerUsername is already case-folded and `@`-stripped at
-            // deserialization (multi_agent.rs).
-            ext_set.insert(ext.as_str().to_ascii_lowercase());
+            // Match the lookup side (`is_known_peer` / `allows_inbound`):
+            // channel-native usernames may be configured with or without a
+            // leading `@`, and callers may pass either form.
+            ext_set.insert(ext.as_str().trim_start_matches('@').to_ascii_lowercase());
         }
 
         for ignored in &group.ignore {
@@ -169,5 +121,29 @@ mod tests {
         // A handle of "@" (empty after stripping the @) must not match
         // every inbound; the guard only fires on a real handle.
         assert!(!should_drop_self_loop("@anyone", Some("@")));
+    }
+
+    #[test]
+    fn resolve_peer_set_normalizes_external_peer_handles_for_lookup() {
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::schema::Config;
+
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("aa")],
+                external_peers: vec![PeerUsername::new("@Operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let resolved = resolve_peer_set(&config, "aa");
+
+        assert!(resolved.is_known_peer("telegram", "operator"));
+        assert!(resolved.is_known_peer("telegram", "@operator"));
+        assert!(resolved.allows_inbound("telegram", "operator"));
+        assert!(resolved.allows_inbound("telegram", "@operator"));
     }
 }

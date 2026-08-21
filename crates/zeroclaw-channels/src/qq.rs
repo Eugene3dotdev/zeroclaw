@@ -31,11 +31,6 @@ enum QQMediaFileType {
     Image = 1,
     /// Video (mp4, mov, etc.)
     Video = 2,
-    /// Voice — only natively supported formats (.wav, .mp3, .silk).
-    /// Non-native audio formats degrade to `File` instead.
-    /// Note: The TS openclaw-qqbot uses silk-wasm + ffmpeg for full format
-    /// transcoding; Rust version avoids heavyweight dependencies and only
-    /// passes through natively supported formats.
     Voice = 3,
     /// File (pdf, zip, or any non-native audio format)
     File = 4,
@@ -46,6 +41,17 @@ enum QQMediaFileType {
 struct QQMediaAttachment {
     kind: QQMediaFileType,
     target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QQVoiceDedupPart {
+    source_id: String,
+    transcript: String,
+}
+
+struct QQComposedMessage {
+    content: String,
+    voice_dedup_parts: Vec<QQVoiceDedupPart>,
 }
 
 /// Response from QQ media upload API.
@@ -103,7 +109,6 @@ fn voice_wav_filename(url: &str) -> String {
 }
 
 /// Map a `[TYPE:target]` marker kind string to `QQMediaFileType`.
-///
 /// For AUDIO/VOICE types, the target's extension determines whether it's
 /// sent as `Voice` (native formats only) or degrades to `File`.
 fn marker_kind_to_qq_file_type(marker: &str, target: &str) -> Option<QQMediaFileType> {
@@ -145,7 +150,6 @@ fn find_matching_close(s: &str) -> Option<usize> {
 }
 
 /// Parse `[TYPE:target]` attachment markers from message content.
-///
 /// Returns the cleaned text (markers removed) and a list of parsed attachments.
 /// Uses the same bracket-matching logic as `telegram.rs::parse_attachment_markers`.
 fn parse_qq_attachment_markers(content: &str) -> (String, Vec<QQMediaAttachment>) {
@@ -274,6 +278,8 @@ fn now_secs() -> u64 {
 
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
+
+const VOICE_REDELIVERY_DEDUP_WINDOW_SECS: u64 = 5 * 60;
 
 /// Maximum number of retry attempts when fetching the access token.
 const AUTH_RETRY_MAX_ATTEMPTS: u32 = 4;
@@ -456,13 +462,6 @@ impl QQChannel {
         Ok((token, expiry))
     }
 
-    /// Fetch an access token with retry and exponential backoff.
-    ///
-    /// Transient failures (network errors, 5xx responses) during reconnection
-    /// can cause the entire recovery loop to fail. This method retries up to
-    /// `AUTH_RETRY_MAX_ATTEMPTS` times with exponential backoff + jitter so
-    /// that a single transient error doesn't permanently break the reconnect
-    /// flow.
     async fn fetch_access_token_with_retry(&self) -> anyhow::Result<(String, u64)> {
         let mut backoff_ms = AUTH_RETRY_INITIAL_BACKOFF_MS;
         let mut last_err = None;
@@ -565,6 +564,30 @@ impl QQChannel {
         Ok(url)
     }
 
+    async fn record_dedup_key(&self, key: String) -> bool {
+        let mut dedup = self.dedup.write().await;
+
+        if dedup.contains(&key) {
+            return true;
+        }
+
+        Self::evict_dedup_if_full(&mut dedup);
+
+        dedup.insert(key);
+        false
+    }
+
+    fn evict_dedup_if_full(dedup: &mut HashSet<String>) {
+        if dedup.len() < DEDUP_CAPACITY {
+            return;
+        }
+
+        let to_remove: Vec<String> = dedup.iter().take(DEDUP_CAPACITY / 2).cloned().collect();
+        for key in to_remove {
+            dedup.remove(&key);
+        }
+    }
+
     /// Check and insert message ID for deduplication.
     async fn is_duplicate(&self, msg_id: &str) -> bool {
         if msg_id.is_empty() {
@@ -577,16 +600,140 @@ impl QQChannel {
             return true;
         }
 
-        // Evict oldest half when at capacity
-        if dedup.len() >= DEDUP_CAPACITY {
-            let to_remove: Vec<String> = dedup.iter().take(DEDUP_CAPACITY / 2).cloned().collect();
-            for key in to_remove {
-                dedup.remove(&key);
-            }
-        }
+        Self::evict_dedup_if_full(&mut dedup);
 
         dedup.insert(msg_id.to_string());
         false
+    }
+
+    async fn record_gateway_sequence(&self, sequence: i64) {
+        if sequence >= 0 {
+            *self.last_sequence.write().await = Some(sequence);
+        }
+    }
+
+    fn normalize_voice_transcript(transcript: &str) -> Option<String> {
+        let normalized = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn voice_redelivery_dedup_hash(
+        event_type: &str,
+        reply_target: &str,
+        sender: &str,
+        parts: &[QQVoiceDedupPart],
+    ) -> Option<String> {
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(event_type.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(reply_target.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(sender.as_bytes());
+        for part in parts {
+            hasher.update(b"\0");
+            hasher.update(part.source_id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(part.transcript.as_bytes());
+        }
+
+        Some(format!("{:x}", hasher.finalize()))
+    }
+
+    fn voice_redelivery_dedup_key(bucket: u64, hash: &str) -> String {
+        format!("qq_voice:{bucket}:{hash}")
+    }
+
+    async fn is_duplicate_voice_redelivery(
+        &self,
+        event_type: &str,
+        reply_target: &str,
+        sender: &str,
+        parts: &[QQVoiceDedupPart],
+    ) -> bool {
+        let Some(hash) = Self::voice_redelivery_dedup_hash(event_type, reply_target, sender, parts)
+        else {
+            return false;
+        };
+
+        let bucket = now_secs() / VOICE_REDELIVERY_DEDUP_WINDOW_SECS;
+        let key = Self::voice_redelivery_dedup_key(bucket, &hash);
+
+        self.record_dedup_key(key).await
+    }
+
+    fn is_voice_attachment(content_type: &str, filename: &str) -> bool {
+        let marker_type = infer_attachment_marker(content_type, filename);
+        content_type == "voice" || content_type.starts_with("audio/") || marker_type == "VOICE"
+    }
+
+    fn normalized_voice_source_id(url: &str) -> String {
+        let fixed = fix_qq_url(url);
+        let end = fixed
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '?' || ch == '#').then_some(idx))
+            .unwrap_or(fixed.len());
+        fixed[..end].to_string()
+    }
+
+    fn voice_attachment_source_id(att: &serde_json::Value) -> Option<String> {
+        let content_type = att
+            .get("content_type")
+            .and_then(|ct| ct.as_str())
+            .unwrap_or("");
+        let filename = att
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .unwrap_or("attachment");
+
+        if !Self::is_voice_attachment(content_type, filename) {
+            return None;
+        }
+
+        let source_url = att
+            .get("voice_wav_url")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| {
+                att.get("url")
+                    .and_then(|u| u.as_str())
+                    .filter(|u| !u.trim().is_empty())
+            })?;
+
+        Some(format!(
+            "{}:{}:{}",
+            content_type.trim().to_ascii_lowercase(),
+            filename.trim(),
+            Self::normalized_voice_source_id(source_url)
+        ))
+    }
+
+    fn platform_voice_dedup_parts(payload: &serde_json::Value) -> Vec<QQVoiceDedupPart> {
+        let Some(attachments) = payload.get("attachments").and_then(|a| a.as_array()) else {
+            return Vec::new();
+        };
+
+        attachments
+            .iter()
+            .filter_map(|att| {
+                let source_id = Self::voice_attachment_source_id(att)?;
+                let transcript = att
+                    .get("asr_refer_text")
+                    .and_then(|t| t.as_str())
+                    .and_then(Self::normalize_voice_transcript)?;
+                Some(QQVoiceDedupPart {
+                    source_id,
+                    transcript,
+                })
+            })
+            .collect()
     }
 
     /// Build upload cache key from file content hash.
@@ -660,11 +807,6 @@ impl QQChannel {
         }
     }
 
-    /// Upload media to QQ API and return file_info for sending.
-    ///
-    /// Supports two modes:
-    /// - URL upload: pass `url = Some(...)`, `file_data = None`
-    /// - Base64 upload: pass `file_data = Some(...)`, `url = None`
     async fn upload_media(
         &self,
         recipient: &str,
@@ -715,21 +857,66 @@ impl QQChannel {
         Ok((upload_resp.file_info, upload_resp.ttl))
     }
 
-    /// Send a media message (msg_type=7) with an already-uploaded file_info.
-    async fn send_media_message(&self, recipient: &str, file_info: &str) -> anyhow::Result<()> {
-        let token = self.get_token().await?;
-        let (scope, id) = Self::resolve_recipient(recipient);
+    /// Build the request body for a markdown text message (msg_type=2).
+    ///
+    /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
+    /// `send_text_markdown` so the body shape (including the optional
+    /// `msg_id` for passive group replies) can be asserted directly in
+    /// tests.
+    fn build_text_markdown_body(content: &str, in_reply_to: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
+            "markdown": {
+                "content": content,
+            },
+            "msg_type": 2,
+            "msg_seq": next_msg_seq(),
+        });
 
-        let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
-        ensure_https(&url)?;
+        // Include msg_id for passive group replies to avoid active-message permission requirements
+        if let Some(msg_id) = in_reply_to {
+            body["msg_id"] = json!(msg_id);
+        }
 
-        let body = json!({
+        body
+    }
+
+    /// Build the request body for a media message (msg_type=7).
+    ///
+    /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
+    /// `send_media_message` so the body shape (including the optional
+    /// `msg_id` for passive group replies) can be asserted directly in
+    /// tests.
+    fn build_media_message_body(file_info: &str, in_reply_to: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
             "msg_type": 7,
             "media": {
                 "file_info": file_info,
             },
             "msg_seq": next_msg_seq(),
         });
+
+        // Include msg_id for passive group replies to avoid active-message permission requirements
+        if let Some(msg_id) = in_reply_to {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        body
+    }
+
+    /// Send a media message (msg_type=7) with an already-uploaded file_info.
+    async fn send_media_message(
+        &self,
+        recipient: &str,
+        file_info: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let token = self.get_token().await?;
+        let (scope, id) = Self::resolve_recipient(recipient);
+
+        let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
+        ensure_https(&url)?;
+
+        let body = Self::build_media_message_body(file_info, in_reply_to);
 
         let resp = self
             .http_client()
@@ -753,6 +940,7 @@ impl QQChannel {
         &self,
         recipient: &str,
         attachment: &QQMediaAttachment,
+        in_reply_to: Option<&str>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -773,7 +961,8 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -807,7 +996,7 @@ impl QQChannel {
                         .with_attrs(::serde_json::json!({"target": target})),
                     "using cached upload for"
                 );
-                self.send_media_message(recipient, &cached_file_info)
+                self.send_media_message(recipient, &cached_file_info, in_reply_to)
                     .await?;
                 return Ok(());
             }
@@ -829,17 +1018,14 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         }
 
         Ok(())
     }
 
-    /// Compose message content from an incoming QQ event payload.
-    ///
-    /// Handles all attachment types (not just images), downloads to workspace
-    /// if configured, and generates appropriate `[TYPE:path]` markers.
-    async fn compose_message_content(&self, payload: &serde_json::Value) -> Option<String> {
+    async fn compose_qq_message(&self, payload: &serde_json::Value) -> Option<QQComposedMessage> {
         let text = payload
             .get("content")
             .and_then(|c| c.as_str())
@@ -848,6 +1034,7 @@ impl QQChannel {
 
         let mut markers: Vec<String> = Vec::new();
         let mut voice_transcripts: Vec<String> = Vec::new();
+        let mut voice_dedup_parts: Vec<QQVoiceDedupPart> = Vec::new();
 
         if let Some(attachments) = payload.get("attachments").and_then(|a| a.as_array()) {
             for att in attachments {
@@ -870,9 +1057,7 @@ impl QQChannel {
                 // For voice attachments, prefer voice_wav_url (WAV format) over
                 // the default url (AMR/SILK). QQ provides this for direct use
                 // without transcoding. (aligned with openclaw-qqbot behavior)
-                let is_voice = content_type == "voice"
-                    || content_type.starts_with("audio/")
-                    || marker_type == "VOICE";
+                let is_voice = Self::is_voice_attachment(content_type, filename);
                 let (download_url, save_filename) = if is_voice {
                     if let Some(wav_url) = att
                         .get("voice_wav_url")
@@ -923,20 +1108,31 @@ impl QQChannel {
                     // openclaw-qqbot format: "[语音消息] transcribed text")
                     // Also keep the file path marker for future multimodal support
                     markers.push(format!("[{marker_type}:{location}]"));
-                    if let Some(asr_text) = att
+                    let voice_transcript = if let Some(asr_text) = att
                         .get("asr_refer_text")
                         .and_then(|t| t.as_str())
-                        .map(|t| t.trim())
-                        .filter(|t| !t.is_empty())
+                        .and_then(Self::normalize_voice_transcript)
                     {
-                        voice_transcripts.push(asr_text.to_string());
+                        Some(asr_text)
                     } else if let Some(audio_data) = local_audio_data.as_deref()
                         && let Some(transcript) = self
                             .try_transcribe_audio_data(audio_data, &save_filename)
                             .await
                     {
-                        voice_transcripts.push(transcript);
-                    }
+                        Self::normalize_voice_transcript(&transcript)
+                    } else {
+                        None
+                    };
+
+                    if let Some(transcript) = voice_transcript {
+                        voice_transcripts.push(transcript.clone());
+                        if let Some(source_id) = Self::voice_attachment_source_id(att) {
+                            voice_dedup_parts.push(QQVoiceDedupPart {
+                                source_id,
+                                transcript,
+                            });
+                        }
+                    };
                 } else {
                     markers.push(format!("[{marker_type}:{location}]"));
                 }
@@ -975,7 +1171,10 @@ impl QQChannel {
             return None;
         }
 
-        Some(parts.join("\n"))
+        Some(QQComposedMessage {
+            content: parts.join("\n"),
+            voice_dedup_parts,
+        })
     }
 
     /// Download an attachment to the local workspace directory.
@@ -1012,7 +1211,7 @@ impl QQChannel {
             anyhow::bail!("Download failed ({}): {url}", resp.status());
         }
 
-        let bytes = resp.bytes().await?.to_vec();
+        let bytes = crate::util::read_response_body_limited(resp, QQ_MAX_UPLOAD_BYTES).await?;
         tokio::fs::write(&dest, &bytes).await?;
 
         Ok((dest, bytes))
@@ -1058,20 +1257,19 @@ impl QQChannel {
     }
 
     /// Send a markdown text message (msg_type=2).
-    async fn send_text_markdown(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
-            "markdown": {
-                "content": content,
-            },
-            "msg_type": 2,
-            "msg_seq": next_msg_seq(),
-        });
+        let body = Self::build_text_markdown_body(content, in_reply_to);
 
         let resp = self
             .http_client()
@@ -1112,19 +1310,34 @@ impl Channel for QQChannel {
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
             return self
-                .send_text_markdown(&message.recipient, &message.content)
+                .send_text_markdown(
+                    &message.recipient,
+                    &message.content,
+                    message.in_reply_to.as_deref(),
+                )
                 .await;
         }
 
         // Send cleaned text first (if non-empty)
         if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text)
-                .await?;
+            self.send_text_markdown(
+                &message.recipient,
+                &cleaned_text,
+                message.in_reply_to.as_deref(),
+            )
+            .await?;
         }
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
+            if let Err(e) = self
+                .send_attachment(
+                    &message.recipient,
+                    attachment,
+                    message.in_reply_to.as_deref(),
+                )
+                .await
+            {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
@@ -1137,8 +1350,12 @@ impl Channel for QQChannel {
                     },
                     attachment.target
                 );
-                self.send_text_markdown(&message.recipient, &fallback)
-                    .await?;
+                self.send_text_markdown(
+                    &message.recipient,
+                    &fallback,
+                    message.in_reply_to.as_deref(),
+                )
+                .await?;
             }
         }
 
@@ -1241,20 +1458,9 @@ impl Channel for QQChannel {
 
         let mut sequence: i64 = stored_seq.unwrap_or(-1);
 
-        // Track consecutive missed heartbeat ACKs.  The previous logic
-        // killed the connection on the *first* missed ACK which is overly
-        // aggressive -- transient network hiccups or brief server-side GC
-        // pauses can cause a single ACK to be delayed.  We now allow up to
-        // `MAX_MISSED_ACKS` consecutive misses before declaring the
-        // connection dead.
         const MAX_MISSED_ACKS: u32 = 3;
         let mut missed_ack_count: u32 = 0;
 
-        // Spawn heartbeat timer.
-        //
-        // We add a small grace period (10% of the server-provided interval,
-        // capped at 5s) so that a slightly-delayed ACK does not immediately
-        // count as missed.
         let hb_interval = heartbeat_interval;
         let grace_ms: u64 = (hb_interval / 10).min(5_000);
         let effective_interval = hb_interval.saturating_add(grace_ms);
@@ -1339,6 +1545,7 @@ impl Channel for QQChannel {
                     // Track sequence number
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
                         sequence = s;
+                        self.record_gateway_sequence(s).await;
                     }
 
                     let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -1408,10 +1615,6 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let Some(content) = self.compose_message_content(d).await else {
-                                continue;
-                            };
-
                             let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
                             // For QQ, user_openid is the identifier
                             let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
@@ -1422,12 +1625,45 @@ impl Channel for QQChannel {
                             }
 
                             let chat_id = format!("user:{user_openid}");
+                            let platform_voice_dedup_parts = Self::platform_voice_dedup_parts(d);
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    user_openid,
+                                    &platform_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
+
+                            let Some(composed) = self.compose_qq_message(d).await else {
+                                continue;
+                            };
+                            let fallback_voice_dedup_parts: Vec<QQVoiceDedupPart> = composed
+                                .voice_dedup_parts
+                                .iter()
+                                .filter(|part| !platform_voice_dedup_parts.contains(part))
+                                .cloned()
+                                .collect();
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    user_openid,
+                                    &fallback_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
-                                content,
+                                content: composed.content,
                                 channel: "qq".to_string(),
                 channel_alias: Some(self.alias.clone()),
                                 timestamp: std::time::SystemTime::now()
@@ -1438,7 +1674,8 @@ impl Channel for QQChannel {
                                 interruption_scope_id: None,
                     attachments: vec![],
                                 subject: None,
-                            };
+
+                                ..Default::default()};
 
                             if tx.send(channel_msg).await.is_err() {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
@@ -1452,10 +1689,6 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let Some(content) = self.compose_message_content(d).await else {
-                                continue;
-                            };
-
                             let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
 
                             if !self.is_user_allowed(author_id) {
@@ -1465,12 +1698,45 @@ impl Channel for QQChannel {
 
                             let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
                             let chat_id = format!("group:{group_openid}");
+                            let platform_voice_dedup_parts = Self::platform_voice_dedup_parts(d);
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    author_id,
+                                    &platform_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
+
+                            let Some(composed) = self.compose_qq_message(d).await else {
+                                continue;
+                            };
+                            let fallback_voice_dedup_parts: Vec<QQVoiceDedupPart> = composed
+                                .voice_dedup_parts
+                                .iter()
+                                .filter(|part| !platform_voice_dedup_parts.contains(part))
+                                .cloned()
+                                .collect();
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    author_id,
+                                    &fallback_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
-                                content,
+                                content: composed.content,
                                 channel: "qq".to_string(),
                 channel_alias: Some(self.alias.clone()),
                                 timestamp: std::time::SystemTime::now()
@@ -1481,7 +1747,8 @@ impl Channel for QQChannel {
                                 interruption_scope_id: None,
                     attachments: vec![],
                                 subject: None,
-                            };
+
+                                ..Default::default()};
 
                             if tx.send(channel_msg).await.is_err() {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
@@ -1563,6 +1830,15 @@ impl Channel for QQChannel {
     async fn health_check(&self) -> bool {
         self.fetch_access_token_with_retry().await.is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API on the QQ Bot Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1638,6 +1914,118 @@ mod tests {
         );
         assert!(!ch.is_duplicate("").await);
         assert!(!ch.is_duplicate("").await);
+    }
+
+    #[tokio::test]
+    async fn gateway_sequence_is_persisted_as_dispatch_frames_arrive() {
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        ch.record_gateway_sequence(42).await;
+
+        assert_eq!(*ch.last_sequence.read().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn voice_redelivery_with_new_msg_id_is_deduped_by_transcript() {
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        let payload = json!({
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "voice.amr",
+                "url": "https://cdn.example.com/voice.amr?sig=first",
+                "voice_wav_url": "https://cdn.example.com/voice.wav?sig=first",
+                "asr_refer_text": "哈喽哈喽，你在干嘛？"
+            }]
+        });
+        let redelivered = json!({
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "voice.amr",
+                "url": "https://cdn.example.com/voice.amr?sig=second",
+                "voice_wav_url": "https://cdn.example.com/voice.wav?sig=second",
+                "asr_refer_text": " 哈喽哈喽，你在干嘛？ "
+            }]
+        });
+        let ordinary_text = json!({
+            "content": "<VOICE_TRANSCRIPTION>哈喽哈喽，你在干嘛？</VOICE_TRANSCRIPTION>"
+        });
+
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &QQChannel::platform_voice_dedup_parts(&payload),
+            )
+            .await
+        );
+        assert!(
+            ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &QQChannel::platform_voice_dedup_parts(&redelivered),
+            )
+            .await
+        );
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &QQChannel::platform_voice_dedup_parts(&ordinary_text),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_redelivery_dedup_keeps_distinct_audio_sources() {
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        let first = vec![QQVoiceDedupPart {
+            source_id: "voice:voice.amr:https://cdn.example.com/first.wav".into(),
+            transcript: "yes".into(),
+        }];
+        let second = vec![QQVoiceDedupPart {
+            source_id: "voice:voice.amr:https://cdn.example.com/second.wav".into(),
+            transcript: "yes".into(),
+        }];
+
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &first,
+            )
+            .await
+        );
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &second,
+            )
+            .await
+        );
     }
 
     #[test]
@@ -1835,6 +2223,73 @@ allowed_users = ["user1"]
         assert_eq!(body["media"]["file_info"], file_info);
     }
 
+    // --- Regression coverage: triggering msg_id propagation ---
+    //
+    // The tests above (`test_send_media_body_msg_type_7`,
+    // `test_send_body_uses_markdown_msg_type`) construct lookalike JSON
+    // bodies inline and would still pass if `build_media_message_body`
+    // or `build_text_markdown_body` dropped or corrupted the `msg_id`
+    // field. The tests below exercise the actual helpers that
+    // `send_media_message` and `send_text_markdown` use to build the
+    // outgoing request body, so removing the msg_id propagation would
+    // break them.
+
+    #[test]
+    fn regression_text_markdown_body_includes_msg_id_for_reply() {
+        let body = QQChannel::build_text_markdown_body("hello", Some("trigger_msg_42"));
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert_eq!(
+            body["msg_id"], "trigger_msg_42",
+            "passive group replies must echo the triggering msg_id \
+             (tracker #7872 / PR #9180) so QQ treats the message as a \
+             passive reply rather than an active send"
+        );
+    }
+
+    #[test]
+    fn regression_text_markdown_body_omits_msg_id_when_no_reply() {
+        let body = QQChannel::build_text_markdown_body("hello", None);
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert!(
+            body.get("msg_id").is_none(),
+            "proactive (non-reply) sends must not carry an msg_id \
+             field — a stray msg_id would cause QQ to try to attach \
+             the message to a stale thread"
+        );
+    }
+
+    #[test]
+    fn regression_media_message_body_includes_msg_id_for_reply() {
+        let body = QQChannel::build_media_message_body("cached_file_info", Some("trigger_msg_99"));
+
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], "cached_file_info");
+        assert_eq!(
+            body["msg_id"], "trigger_msg_99",
+            "passive group media replies must echo the triggering \
+             msg_id (tracker #7872 / PR #9180) — same contract as the \
+             text path, since send_attachment threads in_reply_to \
+             through to send_media_message"
+        );
+    }
+
+    #[test]
+    fn regression_media_message_body_omits_msg_id_when_no_reply() {
+        let body = QQChannel::build_media_message_body("cached_file_info", None);
+
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], "cached_file_info");
+        assert!(
+            body.get("msg_id").is_none(),
+            "proactive (non-reply) media sends must not carry an msg_id \
+             field — same contract as the text path"
+        );
+    }
+
     // --- compose_message_content tests (now async) ---
 
     fn local_whisper_transcription_config(
@@ -1863,6 +2318,12 @@ allowed_users = ["user1"]
         }
     }
 
+    async fn composed_content(ch: &QQChannel, payload: &serde_json::Value) -> Option<String> {
+        ch.compose_qq_message(payload)
+            .await
+            .map(|message| message.content)
+    }
+
     #[tokio::test]
     async fn test_compose_message_content_text_only() {
         let ch = QQChannel::new(
@@ -1873,7 +2334,7 @@ allowed_users = ["user1"]
         );
         let payload = json!({ "content": "  hello world  " });
         assert_eq!(
-            ch.compose_message_content(&payload).await,
+            composed_content(&ch, &payload).await,
             Some("hello world".to_string())
         );
     }
@@ -1894,7 +2355,7 @@ allowed_users = ["user1"]
             }]
         });
         assert_eq!(
-            ch.compose_message_content(&payload).await,
+            composed_content(&ch, &payload).await,
             Some("[IMAGE:https://cdn.example.com/a.jpg]".to_string())
         );
     }
@@ -1915,7 +2376,7 @@ allowed_users = ["user1"]
             ]
         });
         assert_eq!(
-            ch.compose_message_content(&payload).await,
+            composed_content(&ch, &payload).await,
             Some(
                 "Here is an image\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:https://cdn.example.com/b.jpeg]"
                     .to_string()
@@ -1940,7 +2401,7 @@ allowed_users = ["user1"]
                 { "content_type": "application/pdf", "url": "https://cdn.example.com/d.pdf" }
             ]
         });
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("[IMAGE:"));
         assert!(result.contains("[VOICE:"));
         assert!(result.contains("[VIDEO:"));
@@ -1992,13 +2453,58 @@ allowed_users = ["user1"]
             }]
         });
 
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(
             result.contains("<VOICE_TRANSCRIPTION>configured transcript</VOICE_TRANSCRIPTION>")
         );
         assert!(result.contains("[VOICE:"));
         assert!(result.contains("qq_files/download_"));
         assert!(result.contains(".wav]"));
+    }
+
+    #[tokio::test]
+    async fn oversized_attachment_keeps_remote_marker_without_writing_file() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            QQ_MAX_UPLOAD_BYTES + 1
+        )
+        .into_bytes();
+        let (server_url, server) = crate::util::spawn_raw_http_response(response, true).await;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let remote_url = format!("{server_url}/oversized.png");
+        let payload = json!({
+            "attachments": [{
+                "content_type": "image/png",
+                "filename": "oversized.png",
+                "url": remote_url
+            }]
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            composed_content(&ch, &payload),
+        )
+        .await
+        .expect("declared oversize must be rejected before reading the body")
+        .unwrap();
+        server.abort();
+
+        assert!(
+            result.contains(&format!("[IMAGE:{remote_url}]")),
+            "unexpected composed content: {result:?}"
+        );
+        let mut files = tokio::fs::read_dir(workspace.path().join("qq_files"))
+            .await
+            .unwrap();
+        assert!(files.next_entry().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2045,7 +2551,7 @@ allowed_users = ["user1"]
             }]
         });
 
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("<VOICE_TRANSCRIPTION>platform transcript</VOICE_TRANSCRIPTION>"));
         assert!(!result.contains("fallback"));
     }
@@ -2065,7 +2571,7 @@ allowed_users = ["user1"]
                 "url": "//cdn.example.com/a.png"
             }]
         });
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("https://cdn.example.com/a.png"));
         // Ensure the raw `//` prefix was replaced with `https:`
         assert!(!result.starts_with("[IMAGE://"));
@@ -2088,7 +2594,7 @@ allowed_users = ["user1"]
                 "url": "https://cdn.example.com/report.pdf"
             }]
         });
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("[DOCUMENT:https://cdn.example.com/report.pdf]"));
     }
 
@@ -2107,7 +2613,7 @@ allowed_users = ["user1"]
                 "url": "   "
             }]
         });
-        assert_eq!(ch.compose_message_content(&payload).await, None);
+        assert_eq!(composed_content(&ch, &payload).await, None);
     }
 
     // --- Markdown send body test ---

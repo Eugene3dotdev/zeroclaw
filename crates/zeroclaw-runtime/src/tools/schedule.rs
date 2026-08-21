@@ -5,28 +5,45 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 /// Tool that lets the agent manage recurring and one-shot scheduled tasks.
 pub struct ScheduleTool {
     security: Arc<SecurityPolicy>,
     config: Config,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for shell command validation.
     agent_alias: String,
 }
 
 impl ScheduleTool {
+    pub fn new_with_runtime(
+        security: Arc<SecurityPolicy>,
+        config: Config,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         security: Arc<SecurityPolicy>,
         config: Config,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            security,
-            config,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(security, config, agent_alias, runtime)
     }
 }
 
@@ -198,7 +215,7 @@ impl Tool for ScheduleTool {
             }
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{other}'. Use create/add/once/list/get/cancel/remove/pause/resume."
                 )),
@@ -212,7 +229,7 @@ impl ScheduleTool {
         if !self.config.scheduler.enabled {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "cron is disabled by config (scheduler.enabled=false); cannot perform '{action}'"
                 )),
@@ -222,7 +239,7 @@ impl ScheduleTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
@@ -232,7 +249,7 @@ impl ScheduleTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
             });
         }
@@ -245,7 +262,7 @@ impl ScheduleTool {
         if jobs.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: "No scheduled jobs.".to_string(),
+                output: "No scheduled jobs.".to_string().into(),
                 error: None,
             });
         }
@@ -278,7 +295,7 @@ impl ScheduleTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Scheduled jobs ({}):\n{}", lines.len(), lines.join("\n")),
+            output: format!("Scheduled jobs ({}):\n{}", lines.len(), lines.join("\n")).into(),
             error: None,
         })
     }
@@ -298,13 +315,13 @@ impl ScheduleTool {
                 });
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&detail)?,
+                    output: serde_json::to_string_pretty(&detail)?.into(),
                     error: None,
                 })
             }
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Job '{id}' not found")),
             }),
         }
@@ -341,7 +358,7 @@ impl ScheduleTool {
                 if expression.is_none() || delay.is_some() || run_at.is_some() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'add' requires 'expression' and forbids delay/run_at".into()),
                     });
                 }
@@ -350,14 +367,14 @@ impl ScheduleTool {
                 if expression.is_some() || (delay.is_none() && run_at.is_none()) {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'once' requires exactly one of 'delay' or 'run_at'".into()),
                     });
                 }
                 if delay.is_some() && run_at.is_some() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'once' supports either delay or run_at, not both".into()),
                     });
                 }
@@ -370,7 +387,7 @@ impl ScheduleTool {
                 if count != 1 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(
                             "Exactly one of 'expression', 'delay', or 'run_at' must be provided"
                                 .into(),
@@ -381,7 +398,7 @@ impl ScheduleTool {
         }
 
         // Enforce rate-limiting AFTER command/args validation so that invalid
-        // requests do not consume the action budget.  (Fixes #3699)
+        // requests do not consume the action budget.
         if let Some(blocked) = self.enforce_mutation_allowed(action) {
             return Ok(blocked);
         }
@@ -389,8 +406,10 @@ impl ScheduleTool {
         // All job creation routes through validated cron helpers, which enforce
         // the full security policy (allowlist + risk gate) before persistence.
         if let Some(value) = expression {
-            let job = match cron::add_shell_job_with_approval(
+            let job = match cron::add_shell_job_with_runtime(
                 &self.config,
+                self.runtime.as_ref(),
+                &self.security,
                 &self.agent_alias,
                 None,
                 cron::Schedule::Cron {
@@ -405,7 +424,7 @@ impl ScheduleTool {
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error.to_string()),
                     });
                 }
@@ -418,24 +437,28 @@ impl ScheduleTool {
                     job.expression,
                     job.next_run.to_rfc3339(),
                     job.command
-                ),
+                )
+                .into(),
                 error: None,
             });
         }
 
         if let Some(value) = delay {
-            let job = match cron::add_once_validated(
+            let job = match cron::add_once_validated_with_runtime(
                 &self.config,
+                self.runtime.as_ref(),
+                &self.security,
                 &self.agent_alias,
                 value,
                 command,
+                None,
                 approved,
             ) {
                 Ok(job) => job,
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error.to_string()),
                     });
                 }
@@ -447,7 +470,8 @@ impl ScheduleTool {
                     job.id,
                     job.next_run.to_rfc3339(),
                     job.command
-                ),
+                )
+                .into(),
                 error: None,
             });
         }
@@ -477,18 +501,21 @@ impl ScheduleTool {
             })?
             .with_timezone(&Utc);
 
-        let job = match cron::add_once_at_validated(
+        let job = match cron::add_once_at_validated_with_runtime(
             &self.config,
+            self.runtime.as_ref(),
+            &self.security,
             &self.agent_alias,
             run_at_parsed,
             command,
+            None,
             approved,
         ) {
             Ok(job) => job,
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error.to_string()),
                 });
             }
@@ -500,7 +527,8 @@ impl ScheduleTool {
                 job.id,
                 job.next_run.to_rfc3339(),
                 job.command
-            ),
+            )
+            .into(),
             error: None,
         })
     }
@@ -509,12 +537,12 @@ impl ScheduleTool {
         match cron::remove_job(&self.config, id) {
             Ok(()) => ToolResult {
                 success: true,
-                output: format!("Cancelled job {id}"),
+                output: format!("Cancelled job {id}").into(),
                 error: None,
             },
             Err(error) => ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             },
         }
@@ -531,15 +559,15 @@ impl ScheduleTool {
             Ok(_) => ToolResult {
                 success: true,
                 output: if pause {
-                    format!("Paused job {id}")
+                    format!("Paused job {id}").into()
                 } else {
-                    format!("Resumed job {id}")
+                    format!("Resumed job {id}").into()
                 },
                 error: None,
             },
             Err(error) => ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             },
         }
@@ -697,8 +725,8 @@ mod tests {
         config.agents.entry(TEST_AGENT.to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
@@ -911,6 +939,46 @@ mod tests {
                 .unwrap_or_default()
                 .contains("not allowed")
         );
+    }
+
+    #[tokio::test]
+    async fn create_uses_injected_runtime_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["*".into()];
+        seed_test_agent_provider_and_agent(&mut config);
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::for_agent(&config, TEST_AGENT).unwrap());
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
+        let tool = ScheduleTool::new_with_runtime(security, config, TEST_AGENT, runtime);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "ac blocked.txt value",
+                "approved": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            result.error
+        );
+        assert!(cron::list_jobs(&tool.config).unwrap().is_empty());
     }
 
     #[tokio::test]

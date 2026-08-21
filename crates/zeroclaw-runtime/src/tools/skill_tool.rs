@@ -1,23 +1,99 @@
 //! Shell-based tool derived from a skill's `[[tools]]` section.
-//!
-//! Each `SkillTool` with `kind = "shell"` or `kind = "script"` is converted
-//! into a `SkillShellTool` that implements the `Tool` trait. The tool name is
-//! prefixed with the skill name (e.g. `my_skill__run_lint`) to avoid collisions
-//! with built-in tools. The `__` separator matches the MCP server prefix
-//! convention and keeps names valid under OpenAI-compatible function-name
-//! rules (`^[a-zA-Z0-9_-]+$`), which reject `.`.
 
+use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
+/// Default execution time for a skill shell command when the manifest does not
+/// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
+/// its SKILL.toml `[[tools]]` entry.
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+#[cfg(not(target_os = "windows"))]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "LANG",
+    "USERNAME",
+];
+
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Dependency-free, build-stable 64-bit FNV-1a hash, rendered as 16 hex chars.
+/// Used only to disambiguate names that had to be altered. A bounded 64-bit
+/// hash reduces accidental collisions among sanitized names; it is not a
+/// uniqueness proof and cannot make the mapping injective.
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+pub(crate) fn composed_tool_name(skill_name: &str, tool_name: &str) -> String {
+    sanitize_tool_name(&format!("{skill_name}__{tool_name}"))
+}
+
+fn sanitize_tool_name(raw: &str) -> String {
+    let already_valid =
+        !raw.is_empty() && raw.len() <= MAX_TOOL_NAME_LEN && raw.chars().all(is_name_char);
+    if already_valid {
+        return raw.to_string();
+    }
+
+    let mapped: String = raw
+        .chars()
+        .map(|c| if is_name_char(c) { c } else { '_' })
+        .collect();
+
+    // Reserve room for `_<16 hex>` so the disambiguating hash always survives.
+    let suffix = format!("_{}", short_hash(raw));
+    let budget = MAX_TOOL_NAME_LEN - suffix.len();
+    let head: String = mapped.chars().take(budget).collect();
+    format!("{head}{suffix}")
+}
+
+/// Name of the environment variable that carries the in-flight session key
+/// into skill shell tools.
+const SESSION_ID_ENV_VAR: &str = "ZEROCLAW_SESSION_ID";
+
+/// The session key for the current turn, or `None` when the turn is unscoped
+/// (one-shot / webhook). Empty keys are treated as absent.
+fn get_session_id() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|key| !key.is_empty())
+}
 
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
@@ -26,11 +102,14 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
+    /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
+    timeout_secs: u64,
 }
 
 impl SkillShellTool {
     /// Create a new skill shell tool.
-    ///
     /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
     pub fn new(
@@ -38,12 +117,23 @@ impl SkillShellTool {
         tool: &crate::skills::SkillTool,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        Self::new_with_runtime(skill_name, tool, security, Arc::new(NativeRuntime::new()))
+    }
+
+    pub fn new_with_runtime(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            runtime,
+            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
 
@@ -101,50 +191,65 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Rate limiting is applied by the RateLimitedTool wrapper at
-        // registration time (see zeroclaw-runtime::tools::mod). The
-        // PathGuardedTool wrapper cannot inspect the substituted command
-        // built by substitute_args, so the forbidden_path_argument check
-        // below remains tool-local.
-
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution(&command, true) {
+        match self.security.validate_command_execution_for_shell(
+            &command,
+            true,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(reason),
                 });
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(&command) {
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+        {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Path blocked by security policy: {path}")),
             });
         }
 
-        // Build and execute the command
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
+        let mut cmd = match self
+            .runtime
+            .build_shell_command(&command, &self.security.workspace_dir)
+        {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &e,
+                    )),
+                });
+            }
+        };
         cmd.env_clear();
 
         // Only pass safe environment variables
-        for var in &[
-            "PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "SHELL", "TMPDIR",
-        ] {
+        for var in SAFE_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
         }
 
+        // Injected after env_clear so it survives; absent when the turn is unscoped.
+        if let Some(session_id) = get_session_id() {
+            cmd.env(SESSION_ID_ENV_VAR, session_id);
+        }
+
         let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -170,7 +275,7 @@ impl Tool for SkillShellTool {
 
                 Ok(ToolResult {
                     success: output.status.success(),
-                    output: stdout,
+                    output: stdout.into(),
                     error: if stderr.is_empty() {
                         None
                     } else {
@@ -180,14 +285,15 @@ impl Tool for SkillShellTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to execute command: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {}s and was killed",
+                    self.timeout_secs
                 )),
             }),
         }
@@ -196,37 +302,19 @@ impl Tool for SkillShellTool {
 
 // ─── Builtin / MCP delegation tool ───────────────────────────────────────────
 
-/// A skill tool that delegates execution to another tool resolved from the
-/// resolution registry — either a built-in (`kind = "builtin"`) or an MCP tool
-/// (`kind = "mcp"`). This is the skill-scoped tool elevation mechanism: a
-/// policy blocking `shell` by name (or deferred MCP tools hidden from the
-/// model) does not block `my_skill__use_shell`, because the wrapper is
-/// registered under the prefixed name `{skill}__{tool}` and delegates to the
-/// resolved target.
-///
-/// `locked_args` are arguments fixed by the manifest. They are applied **on top
-/// of** the caller-supplied args (the caller cannot override them) and are
-/// stripped from the advertised parameter schema, so the model can neither see
-/// nor change them. This is what scopes a delegated tool — e.g.
-/// `target = "composio"` + `locked_args = { action_name = "TEXT_TO_PDF" }`
-/// exposes exactly one action, and `target = "images__generate"` exposes a
-/// single MCP capability.
 pub struct SkillBuiltinTool {
     tool_name: String,
     tool_description: String,
     target_tool: Arc<dyn zeroclaw_api::tool::Tool>,
     locked_args: serde_json::Map<String, serde_json::Value>,
-    /// Target schema with the locked keys removed (precomputed at construction).
-    advertised_schema: serde_json::Value,
+    /// Target schema with the locked keys removed (precomputed at
+    /// construction). `Arc`-shared so per-iteration spec assembly hands out
+    /// reference counts instead of deep-cloning the (possibly MCP-derived,
+    /// tens-of-KB) tree — see the invariant on `Tool::spec`.
+    advertised_schema: Arc<serde_json::Value>,
 }
 
 impl SkillBuiltinTool {
-    /// Create a new skill elevation tool delegating to `target_tool`.
-    ///
-    /// `target_tool` is the resolved built-in or MCP tool (looked up from the
-    /// resolution registry at registration time). `locked_args` are fixed by
-    /// the manifest: applied over caller args (non-overridable) and hidden from
-    /// the advertised schema.
     pub fn new(
         skill_name: &str,
         tool: &crate::skills::SkillTool,
@@ -237,9 +325,9 @@ impl SkillBuiltinTool {
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        let advertised_schema = narrow_schema(target_tool.parameters_schema(), &locked);
+        let advertised_schema = Arc::new(narrow_schema(target_tool.parameters_schema(), &locked));
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             target_tool,
             locked_args: locked,
@@ -302,7 +390,20 @@ impl Tool for SkillBuiltinTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.advertised_schema.clone()
+        (*self.advertised_schema).clone()
+    }
+
+    // Hand out the stored schema by `Arc::clone` instead of the trait
+    // default's per-call deep clone — specs are rebuilt every agent-loop
+    // iteration and elevated skill tools can front MCP-derived schemas.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.tool_description.clone(),
+            parameters: Arc::clone(&self.advertised_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
+        }
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -328,8 +429,10 @@ impl Tool for SkillBuiltinTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use zeroclaw_config::schema::DockerRuntimeConfig;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -337,6 +440,28 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[tokio::test]
+    async fn get_session_id_returns_scoped_session_key() {
+        let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {
+            get_session_id()
+        })
+        .await;
+        assert_eq!(got, Some("gw_abc-123".to_string()));
+    }
+
+    #[test]
+    fn get_session_id_none_outside_a_scoped_turn() {
+        assert_eq!(get_session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn get_session_id_none_for_empty_session_key() {
+        let got =
+            crate::agent::loop_::scope_session_key(Some(String::new()), async { get_session_id() })
+                .await;
+        assert_eq!(got, None);
     }
 
     fn sample_skill_tool() -> SkillTool {
@@ -355,6 +480,7 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -362,6 +488,79 @@ mod tests {
     fn skill_shell_tool_name_is_prefixed() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
         assert_eq!(tool.name(), "my_skill__run_lint");
+    }
+
+    fn name_is_provider_valid(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn skill_tool_name_sanitized_for_provider_regex() {
+        // Plugin-namespaced skill names (colons), dotted names, spaces, and
+        // non-ASCII must all yield a provider-valid function name
+        for (skill, tool_name) in [
+            ("pr-review-toolkit:code-reviewer", "run.lint"),
+            ("my skill", "do thing"),
+            ("skill.with.dots", "tool"),
+            ("ünïcode", "naïve"),
+        ] {
+            let mut st = sample_skill_tool();
+            st.name = tool_name.to_string();
+            let tool = SkillShellTool::new(skill, &st, test_security());
+            assert!(
+                name_is_provider_valid(tool.name()),
+                "illegal tool name `{}` from skill `{}`",
+                tool.name(),
+                skill
+            );
+        }
+    }
+
+    fn shell_tool_name(skill: &str, tool_name: &str) -> String {
+        let mut st = sample_skill_tool();
+        st.name = tool_name.to_string();
+        SkillShellTool::new(skill, &st, test_security())
+            .name()
+            .to_string()
+    }
+
+    #[test]
+    fn skill_tool_already_valid_name_is_unchanged() {
+        // The common case must not be perturbed (no spurious hash suffix).
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.name(), "my_skill__run_lint");
+    }
+
+    #[test]
+    fn skill_tool_name_truncated_to_64_and_stays_distinct() {
+        // A raw composed name over 64 chars must be sanitized to <= 64 while
+        // two distinct tools under the same long skill name stay distinct, i.e.
+        // truncation must not collapse them Anthropic's contract is
+        // `^[a-zA-Z0-9_-]{1,64}$`, so 64 is the bound, not 128.
+        let long = "a".repeat(200);
+        let a = shell_tool_name(&long, "alpha");
+        let b = shell_tool_name(&long, "beta");
+        assert!(
+            a.len() <= 64 && b.len() <= 64,
+            "sanitized names exceed the 64-char provider bound: {} / {}",
+            a.len(),
+            b.len()
+        );
+        assert!(name_is_provider_valid(&a) && name_is_provider_valid(&b));
+        assert_ne!(a, b, "distinct tools under a long skill name collided");
+    }
+
+    #[test]
+    fn skill_tool_name_sanitization_disambiguates_common_collisions() {
+        // Inputs differing only by illegal characters must not collide.
+        let a = shell_tool_name("a.b", "run");
+        let b = shell_tool_name("a:b", "run");
+        assert!(name_is_provider_valid(&a) && name_is_provider_valid(&b));
+        assert_ne!(a, b, "illegal-char variants collapsed to the same name");
     }
 
     #[test]
@@ -415,6 +614,7 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -433,11 +633,91 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_reports_invalid_docker_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let missing_root = workspace.path().join("missing-root");
+        let missing_root_text = missing_root.to_string_lossy().into_owned();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(DockerRuntime::new(DockerRuntimeConfig {
+            allowed_workspace_roots: vec![missing_root_text.clone()],
+            ..DockerRuntimeConfig::default()
+        }));
+        let tool =
+            SkillShellTool::new_with_runtime("test", &sample_skill_tool(), security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({"file": "src/main.rs", "format": "text"}))
+            .await
+            .expect("invalid Docker root should return a tool result");
+
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("Failed to canonicalize Docker workspace root"));
+        assert!(error.contains(missing_root_text.as_str()));
+    }
+
+    #[test]
+    fn skill_shell_tool_uses_default_timeout_when_unset() {
+        // `timeout_secs = None` in the manifest falls back to the 60s default.
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.timeout_secs, SKILL_SHELL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn skill_shell_tool_honors_manifest_timeout() {
+        // A manifest `timeout_secs` overrides the default — the fix for
+        // long-running skills that were killed at the 60s default.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(3600);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 3600);
+    }
+
+    #[test]
+    fn skill_shell_tool_clamps_zero_timeout_to_one() {
+        // A zero timeout would fire instantly and kill every command; clamp it.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(0);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 1);
+    }
+
+    #[test]
+    fn skill_tool_serde_parses_timeout_secs() {
+        // The manifest field deserializes; absent it defaults to None.
+        let with = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+            timeout_secs = 3600
+        "#;
+        let st: SkillTool = toml::from_str(with).unwrap();
+        assert_eq!(st.timeout_secs, Some(3600));
+
+        let without = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+        "#;
+        let st: SkillTool = toml::from_str(without).unwrap();
+        assert_eq!(st.timeout_secs, None);
     }
 
     #[test]
@@ -494,7 +774,7 @@ mod tests {
             let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("none");
             Ok(ToolResult {
                 success: true,
-                output: format!("mock_result:{input}"),
+                output: format!("mock_result:{input}").into(),
                 error: None,
             })
         }
@@ -509,6 +789,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("shell".to_string()),
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -661,6 +942,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("composio".to_string()),
             locked_args: locked.clone(),
+            timeout_secs: None,
         };
         let tool = SkillBuiltinTool::new("my_skill", &st, target, locked);
         // Caller passes only "input"; locked args provide action_name + app.
@@ -707,7 +989,7 @@ mod tests {
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: args.to_string(),
+                output: args.to_string().into(),
                 error: None,
             })
         }
@@ -726,6 +1008,7 @@ mod tests {
             args: HashMap::new(),
             target: Some(target.to_string()),
             locked_args: locked,
+            timeout_secs: None,
         }
     }
 
@@ -782,6 +1065,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skill_elevated_spec_shares_schema_across_calls() {
+        let target: Arc<dyn Tool> = Arc::new(EchoArgsTool {
+            name: "composio".into(),
+        });
+        let mut locked = HashMap::new();
+        locked.insert("action".to_string(), "execute".to_string());
+        let st = elevation_skill_tool("builtin", "composio", locked.clone());
+        let tool = SkillBuiltinTool::new("sk", &st, target, locked);
+
+        assert!(
+            Arc::ptr_eq(&tool.spec().parameters, &tool.spec().parameters),
+            "spec() must hand out the stored Arc, not deep-clone the \
+             advertised schema every agent-loop iteration"
+        );
+        assert_eq!(
+            *tool.spec().parameters,
+            tool.parameters_schema(),
+            "shared spec schema and legacy owned accessor must agree"
+        );
+    }
+
     #[tokio::test]
     async fn skill_elevated_mcp_delegates_with_locked_scope() {
         // A `kind = "mcp"` skill tool resolves to an MCP wrapper (mocked here as
@@ -824,7 +1129,7 @@ mod tests {
 
     #[test]
     fn elevation_wrapper_survives_policy_filter_that_blocks_raw_target() {
-        // The trust-boundary contract (#6915): a SecurityPolicy blocking the
+        // The trust-boundary contract a SecurityPolicy blocking the
         // raw tool by name must keep it out of the model-visible registry,
         // while the skill's scoped wrapper — registered under the prefixed
         // name — remains the only callable path to that capability.
@@ -854,6 +1159,7 @@ mod tests {
         let skill = Skill {
             name: "ops".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "1".to_string(),
             author: None,
             tags: vec![],
@@ -865,8 +1171,11 @@ mod tests {
                 args: HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
+            slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         crate::tools::register_skill_tools_with_context(

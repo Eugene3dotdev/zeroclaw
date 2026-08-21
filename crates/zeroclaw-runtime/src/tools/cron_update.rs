@@ -6,34 +6,51 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronUpdateTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for command updates.
     agent_alias: String,
 }
 
 impl CronUpdateTool {
+    pub fn new_with_runtime(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            config,
-            security,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
@@ -43,7 +60,7 @@ impl CronUpdateTool {
         if self.security.is_rate_limited() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
             });
         }
@@ -51,7 +68,7 @@ impl CronUpdateTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
             });
         }
@@ -67,7 +84,7 @@ impl Tool for CronUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)"
+        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.). Accepts job name or ID — no need to call cron_list first."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -76,7 +93,7 @@ impl Tool for CronUpdateTool {
             "properties": {
                 "job_id": {
                     "type": "string",
-                    "description": "ID of the cron job to update, as returned by cron_add or cron_list"
+                    "description": "ID or name of the cron job to update. Accepts either the UUID returned by cron_add/cron_list or the human-readable job name (case-insensitive). No need to call cron_list first."
                 },
                 "patch": {
                     "type": "object",
@@ -115,6 +132,11 @@ impl Tool for CronUpdateTool {
                         "delete_after_run": {
                             "type": "boolean",
                             "description": "If true, delete the job automatically after its first successful run"
+                        },
+                        "uses_memory": {
+                            "type": "boolean",
+                            "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs.",
+                            "default": true
                         },
                         // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
                         // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
@@ -197,28 +219,41 @@ impl Tool for CronUpdateTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
 
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
+        let raw_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
                 });
             }
         };
+
+        let job_id_owned =
+            match cron::resolve_job_id_or_name(&self.config, raw_id, &self.agent_alias) {
+                Ok(id) => id,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            };
+        let job_id = job_id_owned.as_str();
 
         let patch_val = match args.get("patch") {
             Some(v) => v.clone(),
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'patch' parameter".to_string()),
                 });
             }
@@ -229,7 +264,7 @@ impl Tool for CronUpdateTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error),
                 });
             }
@@ -243,21 +278,22 @@ impl Tool for CronUpdateTool {
             return Ok(blocked);
         }
 
-        match cron::update_shell_job_with_approval(
+        match cron::update_shell_job_with_runtime(
             &self.config,
-            &self.agent_alias,
+            self.runtime.as_ref(),
+            &self.security,
             job_id,
             patch,
             approved,
         ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&cron_job_output(&job)?)?,
+                output: serde_json::to_string_pretty(&cron_job_output(&job)?)?.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -301,8 +337,8 @@ mod tests {
         config.agents.entry(TEST_AGENT.to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
@@ -395,6 +431,47 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn command_update_uses_injected_runtime_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["*".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
+        let tool =
+            CronUpdateTool::new_with_runtime(cfg.clone(), test_security(&cfg), TEST_AGENT, runtime);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "ac blocked.txt value" },
+                "approved": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]
@@ -638,6 +715,9 @@ mod tests {
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(channel_strs.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
         assert!(channel_strs.contains(&"dingtalk"));
+        assert!(channel_strs.contains(&"wechat"));
+        assert!(channel_strs.contains(&"signal"));
+        assert!(channel_strs.contains(&"email"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks
         // back to the originating conversation.
@@ -752,6 +832,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into()]),
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -790,6 +871,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -807,5 +889,52 @@ mod tests {
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             Some(vec!["file_read".into(), "web_search".into()])
         );
+    }
+
+    #[tokio::test]
+    async fn accepts_job_name_without_prior_cron_list() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        cron::add_shell_job(
+            &cfg,
+            TEST_AGENT,
+            Some("morning_briefing".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 7 * * 1-5".into(),
+                tz: None,
+            },
+            "echo ok",
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": "morning_briefing",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("\"enabled\": false"));
+    }
+
+    #[tokio::test]
+    async fn errors_on_unknown_name() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": "no_such_job",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("no_such_job"),);
     }
 }

@@ -54,7 +54,7 @@ Structure:
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, …: one file per native provider
 - `compatible.rs`: a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
 - `router.rs`: hint-based per-call model route selection
-- `reliable.rs`: same-provider retry / backoff / API-key rotation wrapper
+- `reliable.rs`: retry / backoff / cooldown and ordered model-provider fallback wrapper
 - `streaming.rs`: SSE parsing, token estimation, tool-call deltas
 
 ### `zeroclaw-channels`
@@ -80,7 +80,7 @@ Pairing is required by default; `[gateway.allow_public_bind = true]` enables bin
 
 Callable tools the agent invokes. Not to be confused with CLI `zeroclaw` subcommands.
 
-Includes: `browser`, `http_request`, `pdf_read`, `web_search`, `shell`, `file_read`, `file_write`, hardware probes (`hardware_board_info`, `hardware_memory_read`), and more. See [Tools → Overview](../tools/overview.md).
+Includes: `browser`, `http_request`, `web_search`, `shell`, `file_read`, `file_write`, hardware probes (`hardware_board_info`, `hardware_memory_read`), and more. See [Tools → Overview](../tools/overview.md).
 
 Each tool is registered via factory and described to the model via Fluent-localised strings.
 
@@ -105,7 +105,7 @@ Model-side tool-call syntax parsing. Handles variations between providers:
 
 ### `zeroclaw-plugins`
 
-Dynamic plugin loader for out-of-process tool implementations. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+Sandboxed WASM plugin host: loads component-model plugins (tool, channel, memory, skill bundles) in-process under WASI with per-call fuel and memory limits. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
 
 ### `zeroclaw-hardware`
 
@@ -133,7 +133,10 @@ Call sites use `spawn!` instead of `tokio::spawn` directly.
 ### `zeroclaw-infra`
 
 Process-level support: debouncers, watchdogs, the SQLite session
-backend. Not a tracing/metrics layer, that's `zeroclaw-log`.
+backend. Not a tracing/metrics layer, that's `zeroclaw-log`. See
+[Runtime state and persistence](./runtime-state-and-persistence.md) for the
+state ownership and durability boundaries across config, sessions, memory,
+logs, costs, cron, and gateway metadata.
 
 ### `zeroclaw-macros`
 
@@ -142,10 +145,6 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 ### `zerocode`
 
 Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
-
-### `aardvark-sys`, `robot-kit`
-
-Specialised hardware support used by the `hardware` submodule. Out-of-scope unless you're bringing up specific peripherals.
 
 ## Feature flags
 

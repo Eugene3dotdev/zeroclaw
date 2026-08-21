@@ -15,11 +15,6 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Monotonic counter to ensure unique message IDs under burst traffic.
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// IRC over TLS channel.
-///
-/// Connects to an IRC server using TLS, joins configured channels,
-/// and forwards PRIVMSG messages to the `ZeroClaw` message bus.
-/// Supports both channel messages and private messages (DMs).
 pub struct IrcChannel {
     server: String,
     port: u16,
@@ -43,6 +38,10 @@ pub struct IrcChannel {
 
 type WriteHalf = tokio::io::WriteHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
+fn is_irc_nick_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
 /// Style instruction prepended to every IRC message before it reaches the LLM.
 /// IRC clients render plain text only — no markdown, no HTML, no XML.
 const IRC_STYLE_PREFIX: &str = "\
@@ -65,7 +64,6 @@ struct IrcMessage {
 
 impl IrcMessage {
     /// Parse a raw IRC line into an `IrcMessage`.
-    ///
     /// IRC format: `[:<prefix>] <command> [<params>] [:<trailing>]`
     fn parse(line: &str) -> Option<Self> {
         let line = line.trim_end_matches(['\r', '\n']);
@@ -150,16 +148,6 @@ fn encode_sasl_plain(nick: &str, password: &str) -> String {
     out
 }
 
-/// Split a message into lines safe for IRC transmission.
-///
-/// IRC is a line-based protocol — `\r\n` terminates each command, so any
-/// newline inside a PRIVMSG payload would truncate the message and turn the
-/// remainder into garbled/invalid IRC commands.
-///
-/// This function:
-/// 1. Splits on `\n` (and strips `\r`) so each logical line becomes its own PRIVMSG.
-/// 2. Splits any line that exceeds `max_bytes` at a safe UTF-8 boundary.
-/// 3. Skips empty lines to avoid sending blank PRIVMSGs.
 fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
     let mut chunks = Vec::new();
 
@@ -279,8 +267,24 @@ impl IrcChannel {
     }
 
     fn is_mentioned(my_nick: &str, text: &str) -> bool {
-        text.to_ascii_lowercase()
-            .contains(&my_nick.to_ascii_lowercase())
+        let nick = my_nick.to_ascii_lowercase();
+        if nick.is_empty() {
+            return false;
+        }
+
+        let text = text.to_ascii_lowercase();
+        text.match_indices(&nick).any(|(start, matched)| {
+            let before = if start == 0 {
+                None
+            } else {
+                text[..start].chars().next_back()
+            };
+            let end = start + matched.len();
+            let after = text[end..].chars().next();
+
+            before.is_none_or(|ch| !is_irc_nick_char(ch))
+                && after.is_none_or(|ch| !is_irc_nick_char(ch))
+        })
     }
 
     /// Create a TLS connection to the IRC server.
@@ -376,14 +380,6 @@ impl Channel for IrcChannel {
         "irc"
     }
 
-    /// IRC echoes the bot's own PRIVMSGs back through the same socket
-    /// for any channel the bot is JOINed to. Returning the configured
-    /// nickname here engages the SDK self-loop guard so those echoes
-    /// drop before reaching the agent loop. The nickname is set at
-    /// construction (`config.nickname`) and used as the preferred nick
-    /// during NICK negotiation; if the server forces a different nick
-    /// (collision fallback in `listen`), the agent-loop fallback
-    /// catches the gap.
     fn self_handle(&self) -> Option<String> {
         Some(self.nickname.clone())
     }
@@ -452,7 +448,7 @@ impl Channel for IrcChannel {
         )
         .await?;
 
-        // Store writer for send()
+        // Store writer for send
         {
             let mut guard = self.writer.lock().await;
             *guard = Some(writer);
@@ -675,6 +671,8 @@ impl Channel for IrcChannel {
                         interruption_scope_id: None,
                         attachments: vec![],
                         subject: None,
+
+                        ..Default::default()
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -702,6 +700,15 @@ impl Channel for IrcChannel {
             }
             Err(_) => false,
         }
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No reliable server-supported typing indicator on IRC.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -1002,6 +1009,17 @@ mod tests {
             "bot",
             "This one doesn't mention."
         ));
+    }
+
+    #[test]
+    fn mention_only_requires_token_boundary() {
+        assert!(!IrcChannel::is_mentioned("bot", "robotics team update"));
+        assert!(!IrcChannel::is_mentioned("bot", "this is bothering me"));
+        assert!(!IrcChannel::is_mentioned("bot", "bot_away status update"));
+
+        assert!(IrcChannel::is_mentioned("bot", "bot: status?"));
+        assert!(IrcChannel::is_mentioned("bot", "@bot status?"));
+        assert!(IrcChannel::is_mentioned("bot", "hey bot, status?"));
     }
 
     #[test]

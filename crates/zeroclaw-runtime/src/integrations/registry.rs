@@ -1,24 +1,4 @@
 //! Integration catalog — schema-driven, single-loop.
-//!
-//! Every entry comes from a schema-side source:
-//! - Channels: `ChannelsConfig::channels()` (each multi-instance V3
-//!   channel field surfaces as one `ChannelInfo` entry; name and desc
-//!   strings live in `channels()` itself, not in this file).
-//! - Toggle integrations: `Config::integration_descriptors()` (per-struct
-//!   `#[integration(...)]` attribute on `BrowserConfig` /
-//!   `GoogleWorkspaceConfig`, plus an inline descriptor for `cron` whose
-//!   `active` reflects whether any job is configured — cron is now a
-//!   `HashMap<String, CronJobDecl>` with no enable toggle struct).
-//! - AI providers: `zeroclaw_providers::list_providers()` (each
-//!   `ProviderInfo` row carries `display_name`, `description`, and a
-//!   `ProviderActivation` strategy).
-//! - Always-on built-in tools: `crate::tools::BUILTIN_TOOL_INTEGRATIONS`.
-//! - Platforms: `super::platform::PLATFORMS` (compile-time `cfg!` facts).
-//!
-//! No string literal naming a channel, vendor, tool, or platform appears
-//! in this file's production path. Adding a new integration of any kind
-//! is one row in the corresponding schema source — the registry picks
-//! it up automatically.
 
 use super::platform::PLATFORMS;
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
@@ -48,13 +28,6 @@ fn parse_category(label: &str) -> IntegrationCategory {
     }
 }
 
-/// Compute an AI-model integration's status from typed-family slot
-/// occupancy. The registry never branches on a provider name — the
-/// canonical slot list (`for_each_model_provider_slot!`) is the single
-/// source of truth, and a slot is "active" iff at least one alias is
-/// configured under it. Regional variants and OAuth modes that used to
-/// drive richer activation predicates are now folded onto the parent
-/// typed slot, so per-row activation enums are unnecessary.
 fn evaluate_model_provider_activation(
     config: &Config,
     info: &zeroclaw_providers::ModelProviderInfo,
@@ -67,15 +40,6 @@ fn evaluate_model_provider_activation(
     )
 }
 
-/// Returns the integration catalog computed against `config`.
-///
-/// Single-loop, schema-driven. Every per-row decision lives on the
-/// schema-side source; this function just concatenates the iterators.
-///
-/// Channel discovery walks `ChannelsConfig::channels()` which always
-/// returns all known channel types; each `ChannelInfo` carries name,
-/// desc, and a configured flag.  Multi-instance V3 channels are
-/// reported active when any alias is configured.
 pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
     let channels = config
         .channels
@@ -88,15 +52,15 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             status: bool_to_status(info.configured),
         });
 
-    let toggles = config
-        .integration_descriptors()
-        .into_iter()
-        .map(|d| IntegrationEntry {
+    let toggles = config.integration_descriptors().into_iter().map(|d| {
+        let category = parse_category(d.category);
+        IntegrationEntry {
             name: d.display_name.to_string(),
             description: d.description.to_string(),
-            category: parse_category(d.category),
+            category,
             status: bool_to_status(d.active),
-        });
+        }
+    });
 
     let providers = zeroclaw_providers::list_model_providers()
         .into_iter()
@@ -178,13 +142,6 @@ mod tests {
 
     #[test]
     fn channel_entries_carry_per_field_metadata_from_schema() {
-        // Schema-driven contract: every channel registered through
-        // `ChannelsConfig::channels()` surfaces as a Chat entry whose
-        // display_name and description come from the channel's
-        // `ChannelConfig::name()` / `desc()` methods — no override
-        // table lives here. V3 channels are HashMap<alias, XConfig>
-        // (one entry per channel type at the registry level), so the
-        // count must equal the number of (handle, _) pairs returned.
         let config = Config::default();
         let entries = all_integrations(&config);
         let channel_count = entries
@@ -228,6 +185,7 @@ mod tests {
             TelegramConfig {
                 enabled: true,
                 bot_token: "123:ABC".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -238,6 +196,7 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         let entries = all_integrations(&config);
@@ -442,16 +401,6 @@ mod tests {
 
     #[test]
     fn populated_typed_slot_activates_corresponding_ai_integration() {
-        // PR-branch typed-family layout: regional variants are folded
-        // onto the parent canonical slot (e.g. minimax-cn → minimax with
-        // a typed `endpoint` enum on the alias entry). Activation is
-        // therefore "any alias under the canonical slot" — a one-call
-        // `contains_model_provider_type` check that drops the V2-era
-        // `FallbackKeyMatches` predicate scaffolding.
-        //
-        // Drives every entry of `list_model_providers()` so adding a
-        // new family later (one row in `for_each_model_provider_slot!`
-        // + one display_name row here) is automatically covered.
         for info in zeroclaw_providers::list_model_providers() {
             let mut config = Config::default();
             assert!(

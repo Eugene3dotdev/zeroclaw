@@ -8,12 +8,11 @@
 // passed through to the API client and ignored by the gateway.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { markdown } from '@codemirror/lang-markdown';
-import { oneDark } from '@codemirror/theme-one-dark';
-import CodeMirror from '@uiw/react-codemirror';
+import MarkdownEditor from '@/components/MarkdownEditor';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
+import { t } from '@/lib/i18n';
 import {
   ApiError,
   PersonalityConflictError,
@@ -38,6 +37,7 @@ interface Props {
 }
 
 export default function PersonalityEditor({ agent }: Props) {
+
   const [index, setIndex] = useState<PersonalityIndex | null>(null);
   const [active, setActive] = useState<string | null>(null);
   const [buffers, setBuffers] = useState<Record<string, BufferState>>({});
@@ -122,7 +122,7 @@ export default function PersonalityEditor({ agent }: Props) {
       const byFilename = await fetchTemplates();
       const template = byFilename.get(active);
       if (template === undefined) {
-        setError(`No template available for ${active}.`);
+        setError(`${t('personality.no_template_prefix')}${active}.`);
         return;
       }
       setBuffers((prev) => {
@@ -271,7 +271,7 @@ export default function PersonalityEditor({ agent }: Props) {
           color: 'var(--pc-text-muted)',
         }}
       >
-        {error ? `Couldn't load personality files: ${error}` : 'Loading…'}
+        {error ? `${t('personality.load_failed_prefix')}${error}` : t('common.loading')}
       </div>
     );
   }
@@ -280,8 +280,7 @@ export default function PersonalityEditor({ agent }: Props) {
     return (
       <div className="flex flex-col gap-4">
         <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-          These markdown files shape your agent's voice and context. Pick a
-          starting point — you can edit each file before saving.
+          {t('personality.picker_intro')}
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <button
@@ -295,12 +294,10 @@ export default function PersonalityEditor({ agent }: Props) {
             }}
           >
             <div className="font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>
-              {seeding ? 'Loading templates…' : 'Use the default templates'}
+              {seeding ? t('personality.loading_templates') : t('personality.use_default_templates')}
             </div>
             <div className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              Pre-fills every file with a sensible starter (identity, tone,
-              boundaries, session ritual). Nothing is saved until you click
-              Save in each tab. Existing files are left untouched.
+              {t('personality.use_default_templates_desc')}
             </div>
           </button>
           <button
@@ -313,11 +310,10 @@ export default function PersonalityEditor({ agent }: Props) {
             }}
           >
             <div className="font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>
-              Start blank
+              {t('personality.start_blank')}
             </div>
             <div className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              Open the editor with empty buffers and write each file
-              from scratch.
+              {t('personality.start_blank_desc')}
             </div>
           </button>
         </div>
@@ -340,9 +336,7 @@ export default function PersonalityEditor({ agent }: Props) {
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-        These markdown files shape your agent's voice and context. The
-        runtime reads them at every request, so changes take effect on the
-        next message — no daemon reload needed.
+        {t('personality.editor_intro')}
       </p>
 
       {/* Tab strip */}
@@ -382,7 +376,7 @@ export default function PersonalityEditor({ agent }: Props) {
                 fontWeight: !preview ? 600 : 400,
               }}
             >
-              Edit
+              {t('common.edit')}
             </button>
             <button
               type="button"
@@ -394,7 +388,7 @@ export default function PersonalityEditor({ agent }: Props) {
                 fontWeight: preview ? 600 : 400,
               }}
             >
-              Preview
+              {t('personality.preview')}
             </button>
           </div>
 
@@ -416,57 +410,43 @@ export default function PersonalityEditor({ agent }: Props) {
                 </ReactMarkdown>
               ) : (
                 <p style={{ color: 'var(--pc-text-muted)' }}>
-                  Nothing to preview yet — switch to Edit and add content, or
-                  click Insert template.
+                  {t('personality.nothing_to_preview')}
                 </p>
               )}
             </div>
           ) : (
-            <div
-              className="rounded-md border overflow-hidden"
-              style={{ borderColor: 'var(--pc-border)' }}
-            >
-              <CodeMirror
-                value={activeBuf?.draft ?? ''}
-                onChange={(value) =>
-                  setBuffers((prev) => ({
-                    ...prev,
-                    [active]: {
-                      loaded: prev[active]?.loaded ?? '',
-                      draft: value,
-                      loadedMtimeMs: prev[active]?.loadedMtimeMs ?? null,
-                      exists: prev[active]?.exists ?? false,
-                      truncated: prev[active]?.truncated ?? false,
-                    },
-                  }))
-                }
-                extensions={[markdown()]}
-                theme={oneDark}
-                height="32rem"
-                basicSetup={{
-                  lineNumbers: true,
-                  highlightActiveLine: true,
-                  foldGutter: true,
-                  bracketMatching: true,
-                }}
-                placeholder={`# ${active}\n\n…`}
-              />
-            </div>
+            <MarkdownEditor
+              value={activeBuf?.draft ?? ''}
+              onChange={(value) =>
+                setBuffers((prev) => ({
+                  ...prev,
+                  [active]: {
+                    loaded: prev[active]?.loaded ?? '',
+                    draft: value,
+                    loadedMtimeMs: prev[active]?.loadedMtimeMs ?? null,
+                    exists: prev[active]?.exists ?? false,
+                    truncated: prev[active]?.truncated ?? false,
+                  },
+                }))
+              }
+              height="32rem"
+              placeholder={`# ${active}\n\n…`}
+            />
           )}
           <div
             className="flex items-center justify-between text-xs"
             style={{ color: 'var(--pc-text-muted)' }}
           >
             <span>
-              {charCount.toLocaleString()} / {maxChars.toLocaleString()} chars
+              {charCount.toLocaleString()} / {maxChars.toLocaleString()} {t('personality.chars')}
               {overLimit && (
                 <span style={{ color: 'var(--color-status-error)' }}>
-                  {' '}— over limit, save will be rejected
+                  {' '}— {t('personality.over_limit')}
                 </span>
               )}
               {activeBuf?.truncated && (
                 <span style={{ color: 'var(--color-status-warn)' }}>
-                  {' '}— file on disk exceeds limit; saving will overwrite with truncated content
+                  {' '}— {t('personality.truncated_warning')}
                 </span>
               )}
             </span>
@@ -480,18 +460,18 @@ export default function PersonalityEditor({ agent }: Props) {
                   if (
                     !hasContent ||
                     window.confirm(
-                      `Replace the current ${active} buffer with the default template? Unsaved edits will be lost.`,
+                      `${t('personality.replace_confirm_prefix')}${active}${t('personality.replace_confirm_suffix')}`,
                     )
                   ) {
                     void insertTemplateIntoActive();
                   }
                 }}
                 className="btn-secondary text-sm px-3 py-1.5"
-                title="Fill this tab with the default starter template"
+                title={t('personality.insert_template_title')}
               >
                 {(activeBuf?.draft ?? '').trim().length > 0
-                  ? 'Replace with template'
-                  : 'Insert template'}
+                  ? t('personality.replace_with_template')
+                  : t('personality.insert_template')}
               </button>
               <button
                 type="button"
@@ -499,7 +479,7 @@ export default function PersonalityEditor({ agent }: Props) {
                 onClick={() => void onSave()}
                 className="btn-electric text-sm px-4 py-1.5"
               >
-                {saving ? 'Saving…' : 'Save'}
+                {saving ? t('personality.saving') : t('common.save')}
               </button>
             </div>
           </div>
@@ -528,25 +508,24 @@ export default function PersonalityEditor({ agent }: Props) {
           }}
         >
           <div style={{ color: 'var(--pc-text-primary)' }}>
-            <strong>{conflict.filename}</strong> changed on disk while you
-            were editing. Pick how to resolve:
+            <strong>{conflict.filename}</strong> {t('personality.conflict_message')}
           </div>
           <div className="flex gap-2 flex-wrap">
             <button
               type="button"
               onClick={resolveTakeTheirs}
               className="btn-secondary text-sm px-3 py-1.5"
-              title="Replace your buffer with the on-disk content"
+              title={t('personality.take_theirs_title')}
             >
-              Take theirs (discard my edits)
+              {t('personality.take_theirs')}
             </button>
             <button
               type="button"
               onClick={resolveKeepMine}
               className="btn-secondary text-sm px-3 py-1.5"
-              title="Keep your edits and overwrite disk on next save"
+              title={t('personality.keep_mine_title')}
             >
-              Keep mine (overwrite on next save)
+              {t('personality.keep_mine')}
             </button>
           </div>
           <details>
@@ -554,7 +533,7 @@ export default function PersonalityEditor({ agent }: Props) {
               className="cursor-pointer text-xs"
               style={{ color: 'var(--pc-text-muted)' }}
             >
-              Show on-disk content
+              {t('personality.show_on_disk')}
             </summary>
             <pre
               className="mt-2 p-2 text-xs rounded font-mono whitespace-pre-wrap break-all"
@@ -565,7 +544,7 @@ export default function PersonalityEditor({ agent }: Props) {
                 overflow: 'auto',
               }}
             >
-              {conflict.currentContent || '(empty)'}
+              {conflict.currentContent || t('personality.empty')}
             </pre>
           </details>
         </div>
@@ -604,14 +583,14 @@ function PersonalityTab({ entry, active, dirty, onSelect }: TabProps) {
             ? 'var(--color-status-success)'
             : 'var(--pc-border)',
         }}
-        title={entry.exists ? 'Saved on disk' : 'Not yet created'}
+        title={entry.exists ? t('personality.tab_saved') : t('personality.tab_not_created')}
       />
       <span>{entry.filename}</span>
       {dirty && (
         <span
           className="h-1.5 w-1.5 rounded-full"
           style={{ background: 'var(--color-status-warn)' }}
-          title="Unsaved changes"
+          title={t('personality.unsaved_changes')}
         />
       )}
     </button>

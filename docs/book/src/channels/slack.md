@@ -54,6 +54,14 @@ Both tokens are secrets, so set them through a surface that encrypts them:
 
 Set `app_token` the same way (it's the `xapp-` token from step 3).
 
+**Environment-variable alternative.** Both tokens can be supplied from the
+daemon's environment instead of the config file: `bot_token` is resolved from
+`ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`; `app_token` from
+`ZEROCLAW_SLACK_APP_TOKEN`, then `SLACK_APP_TOKEN`. A value in the config file
+takes precedence over the environment. This lets you omit `bot_token` from
+`config.toml` entirely (e.g. for secret managers that inject env vars) without
+the config failing to load.
+
 ### 6. Invite the bot and test
 
 In Slack, go to a channel and type `/invite @YourBotName`. Then send a message
@@ -83,6 +91,22 @@ secure.
 `strict_mention_in_thread` tightens this further: when `true`, the bot only
 answers inside a thread if a message there @-mentions it, instead of replying to
 every message in a thread it's part of.
+
+On the first message ZeroClaw handles in an existing thread, it fetches prior
+replies and prepends a bounded `[Thread context]` block so the agent can answer
+with the earlier discussion. `thread_context_max_messages` controls how many of
+the newest prior messages available within the fetch window are included while
+preserving chronological order. The default is `0`, the maximum is `50`, and
+`0` disables this automatic hydration. Set an explicit nonzero value to opt in.
+
+One hydration makes at most three total `conversations.replies` attempts,
+including retries after HTTP 429 responses. ZeroClaw honors Slack's `Retry-After`
+value before retrying while request budget remains. If a longer
+thread still has another page, ZeroClaw uses the bounded partial context, adds an
+omission marker, and records the thread as hydrated so later replies do not
+restart the scan. A Slack API failure does not drop the current message; it
+skips hydration and releases the reservation so the next eligible reply can
+retry.
 
 ## Mentions and formatting
 

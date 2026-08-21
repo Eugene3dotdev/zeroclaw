@@ -2,18 +2,13 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Read file contents with workspace sandboxing.
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
-    /// Whether the workspace is host-persistent. `false` on an ephemeral
-    /// runtime (Docker tmpfs / no volume mount), where reads can return stale
-    /// or empty data that does not reflect the host filesystem. When `false`,
-    /// successful text reads carry a loud ephemeral-workspace warning so the
-    /// agent doesn't trust the contents as host-backed. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -35,11 +30,6 @@ impl FileReadTool {
         }
     }
 
-    /// Resolve a caller-supplied path to an absolute candidate. Reject
-    /// only path-shape attacks (null byte, `..` traversal); the
-    /// allowlist gate is `SecurityPolicy::is_resolved_path_readable`
-    /// after canonicalize, which already unions `allowed_roots` and
-    /// `allowed_roots_read_only`.
     fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
         if path.contains('\0') {
             anyhow::bail!("Path not allowed: contains null byte");
@@ -51,23 +41,7 @@ impl FileReadTool {
             anyhow::bail!("Path not allowed by security policy: {path}");
         }
 
-        let p = std::path::Path::new(path);
-        if p.is_absolute() {
-            return Ok(p.to_path_buf());
-        }
-
-        let workspace_dir = &self.security.workspace_dir;
-        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
-            && let Ok(stripped) = p.strip_prefix(workspace_rootless)
-        {
-            return Ok(if stripped.as_os_str().is_empty() {
-                workspace_dir.clone()
-            } else {
-                workspace_dir.join(stripped)
-            });
-        }
-
-        Ok(workspace_dir.join(p))
+        Ok(self.security.resolve_tool_path(path))
     }
 }
 
@@ -78,7 +52,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion. Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .xlsx/.docx); offset/limit are ignored in that mode."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -111,11 +85,11 @@ impl Tool for FileReadTool {
         // Base64 reads return a verbatim payload the caller decodes, so they
         // must NOT be annotated — a prepended banner would corrupt decoding.
         // Text reads on an ephemeral runtime may return stale/empty data, so
-        // they carry the loud warning instead (issue #4627).
+        // they carry the loud warning instead
         let is_base64 = args.get("encoding").and_then(|v| v.as_str()) == Some("base64");
         let mut result = self.read_path(args).await?;
         if !self.persistent_writes && result.success && !is_base64 {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
         Ok(result)
     }
@@ -137,27 +111,13 @@ impl FileReadTool {
             anyhow::Error::msg("Missing 'path' parameter")
         })?;
 
-        // Cross-cutting rate limiting and path-allowlist checks live in the
-        // RateLimitedTool + PathGuardedTool wrappers at registration time
-        // (see zeroclaw-runtime::tools::mod).  Successful reads consume one
-        // budget slot via the outer RateLimitedTool.
-        //
-        // Read-tool exception: post-`PathGuardedTool` resolve/canonicalize
-        // failures (path-traversal that slipped through allowlist, missing
-        // file) also consume one budget slot, charged here, so that callers
-        // cannot probe path existence for free.  The outer wrapper only
-        // records on `success: true`, so calling `record_action()` on these
-        // failure paths charges exactly one slot per attempt — matching the
-        // pre-wrapper semantics where every attempted read cost one slot.
-
         // Validate and build candidate path using workspace_dir directly.
         let full_path = match self.resolve_candidate(path) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -167,10 +127,9 @@ impl FileReadTool {
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
                 });
             }
@@ -181,7 +140,7 @@ impl FileReadTool {
         if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Path escapes workspace directory: {path}")),
             });
         }
@@ -192,7 +151,7 @@ impl FileReadTool {
                 if meta.len() > MAX_FILE_SIZE_BYTES {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
                             meta.len()
@@ -203,7 +162,7 @@ impl FileReadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
@@ -222,7 +181,7 @@ impl FileReadTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to read file: {e}")),
                     });
                 }
@@ -231,13 +190,13 @@ impl FileReadTool {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return Ok(ToolResult {
                 success: true,
-                output: encoded,
+                output: encoded.into(),
                 error: None,
             });
         } else if encoding != "utf8" {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported encoding '{encoding}' (expected 'utf8' or 'base64')"
                 )),
@@ -252,7 +211,7 @@ impl FileReadTool {
                 if total == 0 {
                     return Ok(ToolResult {
                         success: true,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: None,
                     });
                 }
@@ -279,7 +238,7 @@ impl FileReadTool {
                 if start >= end {
                     return Ok(ToolResult {
                         success: true,
-                        output: format!("[No lines in range, file has {total} lines]"),
+                        output: format!("[No lines in range, file has {total} lines]").into(),
                         error: None,
                     });
                 }
@@ -300,7 +259,7 @@ impl FileReadTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("{numbered}{summary}"),
+                    output: format!("{numbered}{summary}").into(),
                     error: None,
                 })
             }
@@ -320,19 +279,43 @@ impl FileReadTool {
                     anyhow::Error::msg(format!("Failed to read file: {e}"))
                 })?;
 
-                if let Some(text) = try_extract_pdf_text(&bytes) {
+                // PDF text extraction was removed with the `rag-pdf` feature
+                // Bytes still flow to the binary detection below.
+
+                // Reject confident binary instead of returning lossy garbage.
+                // Known image formats: point the agent at the image_info tool.
+                if let Some(kind) = detect_image_format(&bytes) {
                     return Ok(ToolResult {
-                        success: true,
-                        output: text,
-                        error: None,
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Binary image file detected ({kind}): {}. Use the image_info \
+                             tool for images, or encoding=\"base64\" to read the raw bytes.",
+                            resolved_path.display()
+                        )),
                     });
                 }
 
-                // Lossy fallback — replaces invalid bytes with U+FFFD
+                // Other confident binary (NUL byte or a glut of control bytes).
+                if looks_binary(&bytes) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Binary file detected: {}. Use encoding=\"base64\" to read the \
+                             raw bytes.",
+                            resolved_path.display()
+                        )),
+                    });
+                }
+
+                // Not confidently binary — most likely text in a non-UTF-8 encoding
+                // (e.g. Windows-1251, Latin-1). Decode leniently for now; proper
+                // charset detection/transcoding is tracked as a follow-up.
                 let lossy = String::from_utf8_lossy(&bytes).into_owned();
                 Ok(ToolResult {
                     success: true,
-                    output: lossy,
+                    output: lossy.into(),
                     error: None,
                 })
             }
@@ -340,27 +323,52 @@ impl FileReadTool {
     }
 }
 
-#[cfg(feature = "rag-pdf")]
-fn try_extract_pdf_text(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 5 || &bytes[..5] != b"%PDF-" {
-        return None;
+fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if is_bmp_header(bytes) {
+        Some("bmp")
+    } else {
+        None
     }
-    let text = pdf_extract::extract_text_from_mem(bytes).ok()?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(text)
 }
 
-#[cfg(not(feature = "rag-pdf"))]
-fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
-    None
+fn is_bmp_header(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || !bytes.starts_with(b"BM") {
+        return false;
+    }
+    if bytes[6..10] != [0, 0, 0, 0] {
+        return false;
+    }
+    let off_bits = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+    (14..=bytes.len() as u32).contains(&off_bits)
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    // Sample a prefix so very large files stay cheap.
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.is_empty() {
+        return false;
+    }
+    if sample.contains(&0) {
+        return true;
+    }
+    let is_control = |b: u8| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r';
+    let controls = sample.iter().filter(|&&b| is_control(b)).count();
+    controls * 100 / sample.len() > 30
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
     fn test_tool(workspace: std::path::PathBuf) -> FileReadTool {
         let security = Arc::new(SecurityPolicy {
@@ -392,6 +400,24 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileReadTool::new_with_persistence(security, false)
+    }
+
+    fn workspace_prefixed_relative_path_for_test(
+        workspace: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let mut relative = std::path::PathBuf::new();
+        for component in workspace.components() {
+            match component {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    panic!("test workspace path must not contain parent components")
+                }
+                std::path::Component::Normal(part) => relative.push(part),
+            }
+        }
+        relative
     }
 
     #[test]
@@ -547,10 +573,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+    // ── Ephemeral-workspace warning────────────────
 
-    /// On an ephemeral runtime a successful text read may reflect stale/empty
-    /// data; the output carries a loud warning while preserving the contents.
     #[tokio::test]
     async fn file_read_warns_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral");
@@ -578,8 +602,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// base64 reads return a verbatim payload the caller decodes; prepending a
-    /// banner would corrupt decoding, so base64 reads must stay un-annotated.
     #[tokio::test]
     async fn file_read_base64_not_warned_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral_b64");
@@ -608,8 +630,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// A failed read returns no file data — not data loss — so no banner is
-    /// attached to either field.
     #[tokio::test]
     async fn file_read_failure_not_warned_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral_fail");
@@ -631,7 +651,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// On a persistent runtime (the default) no warning is attached.
     #[tokio::test]
     async fn file_read_no_warning_when_persistent() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_persistent");
@@ -710,6 +729,36 @@ mod tests {
         assert!(result.output.contains("1: deep content"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_normalizes_workspace_prefixed_relative_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_workspace_prefixed");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(nested.join("notes.txt"), "prefixed content")
+            .await
+            .unwrap();
+
+        let tool = test_tool(workspace.clone());
+        let workspace_prefixed =
+            workspace_prefixed_relative_path_for_test(&workspace).join("nested/notes.txt");
+        let result = tool
+            .execute(json!({"path": workspace_prefixed.to_string_lossy()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "workspace-prefixed file_read path should resolve, error: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("1: prefixed content"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[cfg(unix)]
@@ -904,44 +953,13 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PDF files should be readable via pdf-extract text extraction.
     #[tokio::test]
-    async fn file_read_extracts_pdf_text() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_pdf");
+    async fn file_read_rejects_binary_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_binary");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, dir.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        let tool = test_tool(dir.clone());
-        let result = tool.execute(json!({"path": "report.pdf"})).await.unwrap();
-
-        assert!(
-            result.success,
-            "PDF read must succeed, error: {:?}",
-            result.error
-        );
-        assert!(
-            result.output.contains("Hello"),
-            "extracted text must contain 'Hello', got: {}",
-            result.output
-        );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    /// Non-UTF-8 binary files should be read with lossy conversion.
-    #[tokio::test]
-    async fn file_read_lossy_reads_binary_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_lossy");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        // Write bytes that are not valid UTF-8 and not a PDF
+        // Non-UTF-8 bytes containing a NUL — the classic binary signal.
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(dir.join("data.bin"), &binary_data)
             .await
@@ -951,19 +969,205 @@ mod tests {
         let result = tool.execute(json!({"path": "data.bin"})).await.unwrap();
 
         assert!(
-            result.success,
-            "lossy read must succeed, error: {:?}",
+            !result.success,
+            "binary read must fail, got output: {:?}",
+            result.output
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Binary file detected"),
+            "error must indicate binary rejection, got: {:?}",
             result.error
         );
         assert!(
-            result.output.contains('\u{FFFD}'),
-            "lossy output must contain replacement character, got: {:?}",
+            !result.output.contains('\u{FFFD}'),
+            "must not return lossy replacement output, got: {:?}",
             result.output
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_pdf_without_rag_pdf() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_pdf");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Minimal PDF-looking bytes: valid header followed by invalid UTF-8 and
+        // a NUL byte so the non-UTF-8 path triggers the binary heuristic now
+        // that pdf-extract is gone.
+        let pdf: Vec<u8> =
+            b"%PDF-1.4\n\x80\x00\xFF\xFE\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        tokio::fs::write(dir.join("doc.pdf"), &pdf).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "doc.pdf"})).await.unwrap();
+
         assert!(
-            result.output.contains("hi"),
-            "lossy output must preserve valid ASCII, got: {:?}",
+            !result.success,
+            "pdf read must fail without rag-pdf, got output: {:?}",
             result.output
+        );
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("Binary file detected"),
+            "error must indicate binary rejection, got: {:?}",
+            result.error
+        );
+
+        // Base64 path still works.
+        let result = tool
+            .execute(json!({"path": "doc.pdf", "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "base64 pdf read must succeed: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_png_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_png");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // PNG magic (0x89 makes it invalid UTF-8) + a few header bytes.
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        tokio::fs::write(dir.join("pic.png"), &png).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "pic.png"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "image read must fail, got output: {:?}",
+            result.output
+        );
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("image") && err.contains("image_info"),
+            "error must point at image_info, got: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_jpeg_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_jpeg");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let jpeg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        tokio::fs::write(dir.join("pic.jpg"), &jpeg).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "pic.jpg"})).await.unwrap();
+
+        assert!(!result.success, "jpeg read must fail");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("image"),
+            "error must indicate image rejection, got: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_rejects_bmp_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_bmp");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // BMP: "BM", bfSize, reserved=0, bfOffBits=54, a 40-byte DIB header,
+        // then pixel bytes. The 0xFF pixel byte makes the file invalid UTF-8 (a
+        // header of only sub-0x80 bytes would be valid UTF-8 and take the fast
+        // path), so it reaches the non-UTF-8 branch where detect_image_format runs.
+        let mut bmp: Vec<u8> = vec![
+            b'B', b'M', // magic
+            0x3A, 0x00, 0x00, 0x00, // bfSize = 58
+            0x00, 0x00, 0x00, 0x00, // reserved
+            0x36, 0x00, 0x00, 0x00, // bfOffBits = 54
+        ];
+        bmp.resize(54, 0); // DIB header
+        bmp.extend_from_slice(&[0xFF, 0x00, 0xFF, 0x00]); // pixel array
+        tokio::fs::write(dir.join("pic.bmp"), &bmp).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "pic.bmp"})).await.unwrap();
+
+        assert!(!result.success, "bmp read must fail");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("image") && err.contains("image_info"),
+            "error must point at image_info, got: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_reads_non_utf8_bm_text_lossy() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_bm_text");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // "BM" followed by cp1251 high bytes (a Cyrillic phrase): >14 bytes, the
+        // reserved field (offset 6..10) holds printable text, no NUL / control.
+        let mut data: Vec<u8> = vec![b'B', b'M'];
+        data.extend_from_slice(&[
+            0xCF, 0xF0, 0xE0, 0xE9, 0xF1, 0x20, 0xEA, 0xEE, 0xEC, 0xEF, 0xE0, 0xED, 0xE8, 0xE8,
+        ]);
+        tokio::fs::write(dir.join("note.txt"), &data).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "note.txt"})).await.unwrap();
+
+        assert!(
+            result.success,
+            "non-UTF-8 text starting with BM must not be rejected as an image, error: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_reads_non_utf8_text_lossy() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_legacy_text");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // "Privet" (Cyrillic) in Windows-1251: all high bytes, but no NUL / control / magic.
+        let cp1251: Vec<u8> = vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
+        tokio::fs::write(dir.join("note.txt"), &cp1251)
+            .await
+            .unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "note.txt"})).await.unwrap();
+
+        assert!(
+            result.success,
+            "non-UTF-8 text must not be rejected as binary, error: {:?}",
+            result.error
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1057,109 +1261,8 @@ mod tests {
         }
     }
 
-    /// End-to-end test: scripted model_provider calls `file_read` on a real PDF
-    /// fixture, the tool extracts text via pdf-extract, and the extracted
-    /// content reaches the model_provider in the tool result message.
     #[tokio::test]
-    async fn e2e_agent_file_read_pdf_extraction() {
-        use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::NativeToolDispatcher;
-        use e2e_helpers::*;
-        use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
-
-        // ── Set up workspace with PDF fixture ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_pdf");
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, workspace.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        // ── Build real FileReadTool ──
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        });
-        let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
-
-        // ── Script model_provider: call file_read → then answer ──
-        let (model_provider, recorded) = RecordingModelProvider::new(vec![
-            // Turn 1 response: model_provider asks to read the PDF
-            ChatResponse {
-                text: Some(String::new()),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "file_read".into(),
-                    arguments: r#"{"path": "report.pdf"}"#.into(),
-                    extra_content: None,
-                }],
-                usage: None,
-                reasoning_content: None,
-            },
-            // Turn 1 continued: model_provider sees tool result and answers
-            ChatResponse {
-                text: Some("The PDF contains a greeting: Hello PDF".into()),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            },
-        ]);
-
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
-            .memory(make_memory())
-            .observer(make_observer())
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(workspace.clone())
-            .build()
-            .unwrap();
-
-        // ── Execute ──
-        let response = agent
-            .turn("Read report.pdf and tell me what it says")
-            .await
-            .unwrap();
-
-        // ── Verify final response ──
-        assert!(
-            response.contains("Hello PDF"),
-            "agent response must contain PDF content, got: {response}",
-        );
-
-        // ── Verify model_provider received extracted PDF text in tool result ──
-        {
-            let all_requests = recorded.lock().unwrap();
-            assert!(
-                all_requests.len() >= 2,
-                "expected at least 2 model_provider requests (initial + after tool), got {}",
-                all_requests.len(),
-            );
-
-            let second_request = &all_requests[1];
-            let tool_result_msg = second_request
-                .iter()
-                .find(|m| m.role == "tool")
-                .expect("second request must contain a tool result message");
-
-            assert!(
-                tool_result_msg.content.contains("Hello"),
-                "tool result must contain extracted PDF text 'Hello', got: {}",
-                tool_result_msg.content,
-            );
-        }
-
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-    }
-
-    /// End-to-end test: agent calls `file_read` on a binary file, gets
-    /// lossy UTF-8 output with replacement characters in the tool result.
-    #[tokio::test]
-    async fn e2e_agent_file_read_lossy_binary() {
+    async fn e2e_agent_file_read_rejects_binary() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use e2e_helpers::*;
@@ -1219,7 +1322,7 @@ mod tests {
             "agent response must mention binary, got: {response}",
         );
 
-        // Verify tool result contains lossy output with replacement chars
+        // Verify the tool result carries the binary-rejection error, not lossy output
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
@@ -1234,83 +1337,16 @@ mod tests {
                 .expect("second request must contain a tool result message");
 
             assert!(
-                tool_result_msg.content.contains("valid"),
-                "tool result must preserve valid ASCII from binary file, got: {}",
+                tool_result_msg.content.contains("Binary file detected"),
+                "tool result must contain the binary-rejection error, got: {}",
                 tool_result_msg.content,
             );
             assert!(
-                tool_result_msg.content.contains('\u{FFFD}'),
-                "tool result must contain replacement character for invalid bytes, got: {}",
+                !tool_result_msg.content.contains('\u{FFFD}'),
+                "tool result must NOT contain lossy replacement characters, got: {}",
                 tool_result_msg.content,
             );
         }
-
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-    }
-
-    /// Live e2e: real OpenAI Codex model_provider + real FileReadTool + PDF fixture.
-    /// Verifies the model receives extracted PDF text and responds meaningfully.
-    ///
-    /// Requires valid OAuth credentials in `~/.zeroclaw/`.
-    /// Run: `cargo test --lib -- tools::file_read::tests::e2e_live_file_read_pdf --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "requires valid OpenAI Codex OAuth credentials"]
-    async fn e2e_live_file_read_pdf() {
-        use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::XmlToolDispatcher;
-        use e2e_helpers::*;
-        use zeroclaw_providers::openai_codex::OpenAiCodexModelProvider;
-        use zeroclaw_providers::{ModelProvider, ModelProviderRuntimeOptions};
-
-        // ── Set up workspace with PDF fixture ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_live_file_read_pdf");
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, workspace.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        // ── Build real FileReadTool ──
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        });
-        let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
-
-        // ── Real model_provider (OpenAI Codex uses XML tool dispatch) ──
-        let model_provider =
-            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
-                .expect("model_provider should initialize");
-
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
-            .memory(make_memory())
-            .observer(make_observer())
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(workspace.clone())
-            .model_name("gpt-5.3-codex".to_string())
-            .build()
-            .unwrap();
-
-        // ── Execute ──
-        let response = agent
-            .turn("Use the file_read tool to read report.pdf, then tell me what text it contains. Be concise.")
-            .await
-            .unwrap();
-
-        eprintln!("=== Live e2e response ===\n{response}\n=========================");
-
-        // ── Verify model saw the actual PDF content ("Hello PDF") ──
-        let lower = response.to_lowercase();
-        assert!(
-            lower.contains("hello"),
-            "model response must reference extracted PDF text 'Hello PDF', got: {response}",
-        );
 
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
@@ -1398,19 +1434,20 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
-    /// Anti-probing regression: a caller cannot probe file existence for free.
-    /// Both `resolve_candidate` failures and `canonicalize` failures must
-    /// consume one action-budget slot, so repeated probes hit the rate limit.
     #[tokio::test]
-    async fn file_read_nonexistent_consumes_rate_limit_budget() {
+    async fn wrapped_file_read_failure_preserves_rate_limit_budget() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Allow only 2 actions total.
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
+        let inner = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
+        let security = inner.security.clone();
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(inner, security.clone()),
+            security.clone(),
+        );
 
-        // Two failing reads each consume one slot via the inner-tool charge.
+        // Failed production-wrapped reads release their reservations.
         let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
         assert!(!r1.success);
         assert!(
@@ -1429,20 +1466,15 @@ mod tests {
                 .contains("Failed to resolve")
         );
 
-        // Third attempt: budget is now exhausted.  The inner tool still
-        // charges, but `record_action()` returns false; the failure error
-        // is unchanged from the caller's perspective (probing failed),
-        // and the budget is observably full (a subsequent allowed read
-        // would have to wait for the window to reset).
         let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
         assert!(!r3.success);
 
-        // Verify the budget is actually full by attempting a real read,
-        // which must now report rate-limit exhaustion when wrapped, or at
-        // minimum fail.  Here we use the inner-only tool, so we just
-        // assert that record_action returns false (budget already at cap).
-        // The inner tool's own retry would consume nothing more.
-        assert!(!tool.security.record_action(), "budget must be exhausted");
+        assert!(security.record_action(), "first slot remains available");
+        assert!(security.record_action(), "second slot remains available");
+        assert!(
+            !security.record_action(),
+            "successful debits exhaust the budget"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

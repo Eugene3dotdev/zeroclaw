@@ -1,58 +1,309 @@
 //! WhatsApp Web channel using wa-rs (native Rust implementation)
-//!
-//! This channel provides direct WhatsApp Web integration with:
-//! - QR code and pair code linking
-//! - End-to-end encryption via Signal Protocol
-//! - Full Baileys parity (groups, media, presence, reactions, editing/deletion)
-//!
-//! # Feature Flag
-//!
-//! This channel requires the `whatsapp-web` feature flag:
-//! ```sh
-//! cargo build --features whatsapp-web
-//! # If installed to PATH:
-//! cargo install --path . --force --locked --features whatsapp-web
-//! ```
-//!
-//! # Configuration
-//!
-//! ```toml
-//! [channels_config.whatsapp]
-//! session_path = "~/.zeroclaw/whatsapp-session.db"  # Required for Web mode
-//! pair_phone = "15551234567"  # Optional: for pair code linking
-//! allowed_numbers = ["+1234567890", "*"]  # Same as Cloud API
-//! ```
-//!
-//! # Runtime Negotiation
-//!
-//! This channel is automatically selected when `session_path` is set in the config.
-//! The Cloud API channel is used when `phone_number_id` is set.
 
 use super::whatsapp_storage::RusqliteStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-#[cfg(not(feature = "whatsapp-web"))]
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelConversationScope,
+    ChannelMessage, SendMessage,
+};
+#[cfg(feature = "whatsapp-web")]
+use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
-/// WhatsApp Web channel using wa-rs with custom rusqlite storage
+/// What a pending approval token is bound to.
 ///
-/// # Status: Functional Implementation
+/// The Cloud transport's map stores only `token -> sender`, which is why a
+/// token is answerable by anyone who can see it. On Web the token is delivered
+/// into a chat that may have other members, so the binding travels with the
+/// token and is re-checked when a reply arrives.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovalBinding {
+    /// The configured alias that ISSUED this request.
+    ///
+    /// The map below is process-wide, so without this the binding is only
+    /// (token, chat) and the reply path resolves the authorized peers using
+    /// whichever instance happened to receive the reply. Two aliases sharing a
+    /// contact or group then leak authority across the boundary an operator
+    /// drew between them: a responder alias A denies can approve alias A's tool
+    /// call by replying through alias B, because B's allowlist is the one
+    /// consulted. Binding the issuer and enforcing it on resolve keeps each
+    /// alias's approvals answerable only under its own policy.
+    alias: String,
+    /// The chat JID the prompt was posted into. A reply carrying a valid token
+    /// from a DIFFERENT chat is not this request's answer.
+    chat: String,
+    /// True when the prompt landed in a group, i.e. when the token was visible
+    /// to members other than the operator.
+    is_group: bool,
+}
+
+#[cfg(feature = "whatsapp-web")]
+struct PendingApproval {
+    registration_id: uuid::Uuid,
+    responder: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    binding: ApprovalBinding,
+}
+
+#[cfg(feature = "whatsapp-web")]
+struct PendingApprovalRegistration {
+    token: String,
+    receiver: tokio::sync::oneshot::Receiver<ChannelApprovalResponse>,
+    binding: ApprovalBinding,
+    guard: PendingApprovalGuard,
+}
+
+/// Removes a parked token when the requesting future goes away.
 ///
-/// This implementation uses the wa-rs Bot with our custom RusqliteStore backend.
+/// Every explicit cleanup path lives INSIDE the async body: send-failure and
+/// the channel's own timeout both remove the token before returning. None of
+/// that code runs if the future is CANCELLED or DROPPED, which the routed
+/// approval timeout and the orchestrator's cancellation branch both do. The
+/// entry then outlives its receiver, and a late reply passes every
+/// authorization gate, removes the entry, and is logged as accepted while the
+/// oneshot is already gone, so no tool call can ever receive that decision. An
+/// approval recorded as granted that nothing acted on is worse than a denial:
+/// the log says the operator approved and the system disagrees.
 ///
-/// # Configuration
+/// `Drop` is the only hook that survives cancellation, so registration is made
+/// cancellation-safe by tying the entry's lifetime to a guard rather than to
+/// any code path. The guard is disarmed once the decision has been taken, so
+/// the normal path still owns its own removal.
+#[cfg(feature = "whatsapp-web")]
+struct PendingApprovalGuard {
+    token: Option<String>,
+    registration_id: uuid::Uuid,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl PendingApprovalGuard {
+    fn new(token: String, registration_id: uuid::Uuid) -> Self {
+        Self {
+            token: Some(token),
+            registration_id,
+        }
+    }
+
+    /// The decision was taken through a normal path; stop guarding.
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        // Drop is not async, and blocking here would stall whatever runtime
+        // thread is unwinding. Spawn the removal instead; the entry is gone
+        // before any realistic reply, and a reply that beats it still finds a
+        // dead receiver and cannot be reported as accepted.
+        let registration_id = self.registration_id;
+        zeroclaw_spawn::spawn!(async move {
+            remove_pending_approval_if_matches(&token, registration_id).await;
+        });
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+type PendingApprovalsMap = tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>;
+
+/// Process-wide pending approvals, keyed by token.
 ///
-/// ```toml
-/// [channels_config.whatsapp]
-/// session_path = "~/.zeroclaw/whatsapp-session.db"
-/// pair_phone = "15551234567"  # Optional
-/// allowed_numbers = ["+1234567890", "*"]
-/// ```
+/// Static rather than per-instance for the same reason as the Cloud transport:
+/// `request_approval` is called on one handle while the reply arrives on the
+/// `listen()` task, and the two do not share a `&self`.
+#[cfg(feature = "whatsapp-web")]
+static PENDING_APPROVALS: std::sync::LazyLock<Arc<PendingApprovalsMap>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+    });
+
+#[cfg(feature = "whatsapp-web")]
+async fn remove_pending_approval_if_matches(token: &str, registration_id: uuid::Uuid) -> bool {
+    let mut pending = PENDING_APPROVALS.lock().await;
+    if pending
+        .get(token)
+        .is_some_and(|entry| entry.registration_id == registration_id)
+    {
+        pending.remove(token);
+        true
+    } else {
+        false
+    }
+}
+
+/// Reserve an unused reply token and tie its map entry to a cancellation guard.
+#[cfg(feature = "whatsapp-web")]
+async fn register_pending_approval(binding: ApprovalBinding) -> PendingApprovalRegistration {
+    loop {
+        let token = crate::util::new_approval_token();
+        let mut pending = PENDING_APPROVALS.lock().await;
+
+        if let std::collections::hash_map::Entry::Vacant(slot) = pending.entry(token.clone()) {
+            let registration_id = uuid::Uuid::new_v4();
+            let (responder, receiver) = tokio::sync::oneshot::channel();
+            slot.insert(PendingApproval {
+                registration_id,
+                responder,
+                binding: binding.clone(),
+            });
+            drop(pending);
+
+            return PendingApprovalRegistration {
+                token: token.clone(),
+                receiver,
+                binding,
+                guard: PendingApprovalGuard::new(token, registration_id),
+            };
+        }
+    }
+}
+
+/// Why a syntactically valid approval reply was refused.
+///
+/// Named rather than a bool so the log says which gate rejected, the way
+/// discord's component path reports `UnauthorizedUser`.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalRefusal {
+    /// No such token, or it was already answered or timed out.
+    UnknownToken,
+    /// The token exists but the reply came from a different chat.
+    ForeignChat,
+    /// The reply came from the right chat, but the responder is not on
+    /// an authorized peer for this alias. This is the gate the other transports omit.
+    UnauthorizedResponder,
+    /// The reply cleared every authorization gate, but the requesting future
+    /// was already cancelled or dropped, so the oneshot receiver is gone and
+    /// no tool call can receive the decision. Reporting this as accepted would
+    /// record an approval that nothing acted on.
+    ReceiverGone,
+    /// A valid token replied to through a DIFFERENT configured alias than the
+    /// one that issued it. Distinct from `ForeignChat` because two aliases can
+    /// legitimately share a chat, so the chat can match while the issuer does
+    /// not, and answering under the wrong alias means the wrong
+    /// alias's authorized peers decide.
+    ForeignAlias,
+    /// The token belongs to a group that the live channel policy no longer
+    /// admits.
+    GroupNoLongerAllowed,
+}
+
+/// Decide whether an approval reply may resolve `token`, and resolve it if so.
+///
+/// Returns `Ok(())` when the decision was delivered, or the refusal reason.
+///
+/// AUTHORIZATION, and the reason this is not a mirror of the Cloud path: a
+/// 6-character token is a correlator, not a credential. It is delivered in
+/// plaintext into a chat, so in a group every member can read it and reply with
+/// it. Treating possession of the token as authority makes the approval
+/// answerable by any group member, which is the shape confirmed on slack,
+/// telegram and matrix. Discord already gates the equivalent decision on the
+/// clicking user, so the gate is required rather than novel; this applies the
+/// same rule to a text reply.
+#[cfg(feature = "whatsapp-web")]
+async fn resolve_approval_reply(
+    token: &str,
+    response: ChannelApprovalResponse,
+    from_alias: &str,
+    from_chat: &str,
+    responder_is_allowlisted: bool,
+) -> std::result::Result<(), ApprovalRefusal> {
+    let mut map = PENDING_APPROVALS.lock().await;
+    let Some(pending) = map.get(token) else {
+        return Err(ApprovalRefusal::UnknownToken);
+    };
+    // The issuing alias is checked FIRST, before the chat and before the
+    // allowlist. `responder_is_allowlisted` is computed by whichever instance
+    // received the reply, so evaluating it against another alias's request is
+    // the bypass itself: alias B's allowlist would decide alias A's approval.
+    // Two aliases can legitimately share a contact or a group, which is what
+    // makes the chat check alone insufficient here.
+    if pending.binding.alias != from_alias {
+        return Err(ApprovalRefusal::ForeignAlias);
+    }
+    if pending.binding.chat != from_chat {
+        return Err(ApprovalRefusal::ForeignChat);
+    }
+    if !responder_is_allowlisted {
+        return Err(ApprovalRefusal::UnauthorizedResponder);
+    }
+    // Only remove once the reply has cleared every gate. A refused reply must
+    // leave the request pending so the real operator can still answer it,
+    // otherwise anyone who can see the token can cancel the approval by
+    // replying to it badly.
+    let pending = map
+        .remove(token)
+        .expect("token was present under this same lock");
+    // Report acceptance ONLY when the decision reached a live receiver.
+    //
+    // `send` fails when the oneshot receiver is already gone, which happens
+    // when the requesting future was cancelled or dropped. Discarding that
+    // error would log the reply as accepted while no tool call can ever act on
+    // it, so the record would say the operator approved and the system would
+    // disagree. A stale token is a refusal, not an approval, and the caller
+    // logs each refusal distinctly.
+    pending
+        .responder
+        .send(response)
+        .map_err(|_| ApprovalRefusal::ReceiverGone)?;
+    Ok(())
+}
+
+/// Re-check live group admission before resolving a pending approval reply.
+#[cfg(feature = "whatsapp-web")]
+async fn resolve_approval_reply_with_group_admission(
+    token: &str,
+    response: ChannelApprovalResponse,
+    from_alias: &str,
+    from_chat: &str,
+    is_group: bool,
+    responder_is_allowlisted: bool,
+    allowed_groups_resolver: &(dyn Fn() -> Vec<String> + Send + Sync),
+) -> std::result::Result<(), ApprovalRefusal> {
+    if is_group && !is_group_chat_allowed(from_chat, &allowed_groups_resolver()) {
+        return Err(ApprovalRefusal::GroupNoLongerAllowed);
+    }
+
+    resolve_approval_reply(
+        token,
+        response,
+        from_alias,
+        from_chat,
+        responder_is_allowlisted,
+    )
+    .await
+}
+
+/// Test-only interception point for the approval prompt's send.
+///
+/// The send is the only moment at which this request's token is registered
+/// and its cleanup has not yet run, so it is the only place a test can stand
+/// between the two. Without it the generation check in `request_approval`'s
+/// send-error branch is unobservable from outside: `request_approval` mints
+/// its own random token, so a separately parked sentinel is never the key
+/// that branch removes, and an unconditional `remove` there behaves exactly
+/// like a generation-checked one.
+///
+/// It returns the send's own `Result` rather than being a bare fail flag,
+/// because a hook that can return `Ok` also reaches the wait without a vendor
+/// client, which is what driving the timeout arm for real would need.
+#[cfg(all(test, feature = "whatsapp-web"))]
+type ApprovalSendHook = Arc<
+    dyn Fn(SendMessage) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
     /// Session database path
@@ -73,6 +324,9 @@ pub struct WhatsAppWebChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// When true, only respond to messages that @-mention the bot in groups
     mention_only: bool,
+    /// When true, allowed unaddressed group messages become context-only
+    /// history entries instead of being dropped.
+    passive_group_context: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
     /// Bot LID number (digits only), resolved from device identity at runtime
@@ -85,6 +339,14 @@ pub struct WhatsAppWebChannel {
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
+    /// Seconds to wait for an operator approval reply before denying.
+    ///
+    /// Read from `[channels.whatsapp.<alias>].approval_timeout_secs` in
+    /// [`WhatsAppWebChannel::new`], so every construction path picks it up
+    /// without threading it through a builder. Default 300; `0` denies
+    /// immediately, which is what an already-elapsed `tokio::time::timeout`
+    /// does and the safer of the two readings of zero.
+    approval_timeout_secs: u64,
     /// Bot handle for shutdown.
     /// whatsapp-rust 0.6: `Bot::run()` now returns `BotHandle` (a Future + abort)
     /// rather than a tokio JoinHandle directly (oxidezap/whatsapp-rust BotHandle wrapper).
@@ -112,30 +374,74 @@ pub struct WhatsAppWebChannel {
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     group_mention_patterns: Arc<Vec<regex::Regex>>,
+    /// Resolved channel workspace root used to bound outbound local media
+    /// marker reads. The source of truth remains
+    /// `Config::channel_workspace_dir("whatsapp.<alias>")`; this is the
+    /// runtime trust boundary for file delivery.
+    workspace_dir: Option<PathBuf>,
+    /// Resolves allowed group chats from canonical config at message-time.
+    /// Empty = all groups permitted. Direct messages bypass.
+    allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Optional pairing-persist handle to the canonical shared `Config`.
+    /// `None` in tests; `Some` in the long-running daemon, wired via
+    /// `.with_persistence(config)`. Same contract as WeChat's handle: on
+    /// connect, the linked account is persisted into `peer_groups` through
+    /// `crate::identity_persist` (no channel-local allowlist cache).
+    persist: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    /// See [`ApprovalSendHook`]. `None` outside the tests that need to act
+    /// between a token's registration and the cleanup that follows it.
+    #[cfg(test)]
+    approval_send_hook: Option<ApprovalSendHook>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+struct SenderAllowlistResolution {
+    mapped_phone: Option<String>,
+    candidates: Vec<String>,
+    allowed_phone: Option<String>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Clone)]
+struct WhatsAppInboundContext {
+    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    alias: Arc<String>,
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    mode: zeroclaw_config::schema::WhatsAppWebMode,
+    dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
+    group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
+    self_chat_mode: bool,
+    mention_only: bool,
+    passive_group_context: bool,
+    bot_phone: Arc<Mutex<Option<String>>>,
+    bot_lid: Arc<Mutex<Option<String>>>,
+    dm_mention_patterns: Arc<Vec<regex::Regex>>,
+    group_mention_patterns: Arc<Vec<regex::Regex>>,
+    transcription_config: Option<zeroclaw_config::schema::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl WhatsAppWebChannel {
-    /// Create a new WhatsApp Web channel from a `WhatsAppConfig`.
-    ///
-    /// `config` is the schema block under `[channels.whatsapp.<alias>]`;
-    /// `alias` is that alias key; `peer_resolver` resolves inbound
-    /// external peers from canonical state at message-time (no cache —
-    /// see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
         config: &zeroclaw_config::schema::WhatsAppConfig,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         let session_path = config.session_path.clone().unwrap_or_default();
         let pair_phone = config.pair_phone.clone();
         let pair_code = config.pair_code.clone();
         let ws_url = config.ws_url.clone();
         let mention_only = config.mention_only;
+        let passive_group_context = config.passive_group_context;
         let mode = config.mode.clone();
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
         let self_chat_mode = config.self_chat_mode;
+        let approval_timeout_secs = config.approval_timeout_secs;
 
         // Seed bot_phone from pair_phone (digits only)
         let bot_phone = pair_phone
@@ -162,12 +468,15 @@ impl WhatsAppWebChannel {
             alias: alias.into(),
             peer_resolver,
             mention_only,
+            passive_group_context,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             bot_lid: Arc::new(Mutex::new(None)),
             mode,
             dm_policy,
             group_policy,
             self_chat_mode,
+            approval_timeout_secs,
+            allowed_groups_resolver,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -178,6 +487,10 @@ impl WhatsAppWebChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
+            workspace_dir: None,
+            persist: None,
+            #[cfg(test)]
+            approval_send_hook: None,
         }
     }
 
@@ -185,6 +498,47 @@ impl WhatsAppWebChannel {
     /// channel handle is bound to.
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    /// Wire the shared Config handle so a completed pairing can persist the
+    /// linked account into `peer_groups` and save — the same contract as
+    /// `WeChatChannel::with_persistence`. The long-running daemon sets this
+    /// from the orchestrator; tests and one-shot callers leave it unset
+    /// (pairing works at runtime, doesn't persist).
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_persistence(
+        mut self,
+        config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    ) -> Self {
+        self.persist = Some(config);
+        self
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Substitute the approval prompt's send. See [`ApprovalSendHook`].
+    #[cfg(all(test, feature = "whatsapp-web"))]
+    fn with_approval_send_hook(mut self, hook: ApprovalSendHook) -> Self {
+        self.approval_send_hook = Some(hook);
+        self
+    }
+
+    /// Deliver an approval prompt.
+    ///
+    /// A pass-through to [`Channel::send`] in production. The indirection
+    /// exists so a test can substitute the send, which is the only window in
+    /// which this request's map entry is live and its cleanup has not run.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_approval_prompt(&self, message: &SendMessage) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.approval_send_hook.clone() {
+            return hook(message.clone()).await;
+        }
+        self.send(message).await
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -214,19 +568,9 @@ impl WhatsAppWebChannel {
         self
     }
 
-    /// Configure text-to-speech for outgoing voice replies.
-    ///
-    /// Builds a [`super::tts::TtsManager`] from the
-    /// `[tts_providers.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
-    /// or when the manager fails to construct (logged at warn).
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            // Bind the TTS manager to the agent that owns THIS channel so the
-            // voice reply uses that agent's `tts_provider`. Without this the
-            // shared manager resolves the lexicographically-smallest enabled
-            // agent, which silently breaks TTS when that agent has no
-            // `tts_provider` set (e.g. a background/delegate agent).
             let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
             match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
@@ -271,14 +615,6 @@ impl WhatsAppWebChannel {
         Self::is_number_allowed_for_list(&peers, phone)
     }
 
-    /// Check whether a phone number is allowed against a provided allowlist.
-    ///
-    /// The per-entry comparison is E.164 normalization, which the in-tree
-    /// `crate::allowlist::Match` modes can't express, so it goes through
-    /// `crate::allowlist::is_user_allowed_by` with a custom matcher. `phone`
-    /// is matched only after `normalize_phone_token`; a token with no canonical
-    /// form never matches. `allowed_numbers` is the caller's freshly-resolved
-    /// peer list, so no allowlist state is cached.
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
         // This channel historically accepted a surrounding-whitespace wildcard
@@ -299,7 +635,6 @@ impl WhatsAppWebChannel {
     }
 
     /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    ///
     /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
@@ -322,12 +657,6 @@ impl WhatsAppWebChannel {
         }
     }
 
-    /// Build the LID-aware diagnostic suffix appended to allowlist-rejection
-    /// logs so the operator sees why a known phone number didn't match.
-    /// Only meaningful inside an actual rejection branch (`normalized.is_none()`
-    /// under `Allowlist` policy); outside that branch the LID resolution
-    /// state is not the operator's concern, since the message is being
-    /// processed normally.
     #[cfg(feature = "whatsapp-web")]
     fn lid_rejection_diagnostic(
         sender: &wacore_binary::jid::Jid,
@@ -377,23 +706,429 @@ impl WhatsAppWebChannel {
         candidates
     }
 
-    /// Compute the reply target for a chat.
-    ///
-    /// As of whatsapp-rust 0.6+ with PR #636, the library handles LID→PN
-    /// resolution internally and requires consistent LID namespace throughout
-    /// the message stanza. We now pass the chat JID unchanged and let the
-    /// library handle addressing.
-    ///
-    /// Previously (pre-0.6), this function converted LID JIDs to phone JIDs
-    /// because LIDs couldn't receive messages directly. Now the library
-    /// expects LID format when the recipient is LID-addressed.
+    #[cfg(feature = "whatsapp-web")]
+    async fn resolve_sender_allowlist(
+        client: &whatsapp_rust::Client,
+        sender: &wacore_binary::jid::Jid,
+        sender_alt: Option<&wacore_binary::jid::Jid>,
+        allowed_numbers: &[String],
+    ) -> SenderAllowlistResolution {
+        let mapped_phone = if sender.is_lid() {
+            client
+                .get_lid_pn_entry(sender)
+                .await
+                .ok()
+                .flatten()
+                .map(|entry| entry.phone_number)
+        } else {
+            None
+        };
+        let candidates = Self::sender_phone_candidates(sender, sender_alt, mapped_phone.as_deref());
+        let allowed_phone = candidates
+            .iter()
+            .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
+            .cloned();
+
+        SenderAllowlistResolution {
+            mapped_phone,
+            candidates,
+            allowed_phone,
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn handle_inbound_message_event(
+        event: &wacore::types::events::Event,
+        client: &whatsapp_rust::Client,
+        context: &WhatsAppInboundContext,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+        use wacore_binary::jid::JidExt as _;
+
+        let wacore::types::events::Event::Message(msg, info) = event else {
+            return;
+        };
+
+        let sender_jid = info.source.sender.clone();
+        let sender_alt = info.source.sender_alt.clone();
+        let sender = sender_jid.user().to_string();
+        let chat = info.source.chat.to_string();
+
+        let allowed_peers = (context.peer_resolver)();
+        let sender_resolution = Self::resolve_sender_allowlist(
+            client,
+            &sender_jid,
+            sender_alt.as_ref(),
+            &allowed_peers,
+        )
+        .await;
+        let mapped_phone = sender_resolution.mapped_phone;
+        let sender_candidates = sender_resolution.candidates;
+        let normalized = sender_resolution.allowed_phone;
+
+        let is_group = info.source.is_group;
+        let reply_target = Self::compute_reply_target(&chat);
+
+        // ── Approval-reply interception ──
+        //
+        // Must live here rather than in the gateway: the generic resolver at
+        // zeroclaw-gateway lib.rs sits inside the Cloud WEBHOOK handler, and
+        // Web never reaches that endpoint because it runs its own listen().
+        // So the token is intercepted on this inbound path, the way discord
+        // and signal do it.
+        //
+        // Ahead of the agent dispatch, because an approval reply is a control
+        // message and must not also be handled as conversation.
+        if let Some((token, response)) = msg
+            .text_content()
+            .and_then(crate::util::parse_approval_reply)
+        {
+            // `normalized` is Some only when a sender candidate matched
+            // an authorized peer, so it IS the authorization signal, already
+            // computed above for the message path.
+            match resolve_approval_reply_with_group_admission(
+                &token,
+                response,
+                &context.alias,
+                &reply_target,
+                is_group,
+                normalized.is_some(),
+                context.allowed_groups_resolver.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"chat": reply_target})),
+                        "approval reply accepted"
+                    );
+                    return;
+                }
+                Err(ApprovalRefusal::UnknownToken) => {
+                    // Not ours, already answered, or timed out. Fall through:
+                    // a bare 6-char word plus "yes" is plausible conversation.
+                }
+                Err(refusal) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "denial": format!("{:?}", refusal),
+                                "chat": reply_target,
+                                "is_group": is_group,
+                            })),
+                        "rejecting unauthorized approval reply"
+                    );
+                    return;
+                }
+            }
+        }
+
+        let allowed_groups = (context.allowed_groups_resolver)();
+        if is_group && !is_group_chat_allowed(&chat, &allowed_groups) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "chat": chat })),
+                "dropping group message: chat not in allowed_groups"
+            );
+            return;
+        }
+
+        if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
+            let sender_user = sender_jid.user();
+            let chat_user = chat.split_once('@').map(|(u, _)| u).unwrap_or(&chat);
+            let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
+
+            if is_self_chat {
+                if !context.self_chat_mode {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "ignoring self-chat message (self_chat_mode=false)"
+                    );
+                    return;
+                }
+            } else if info.source.is_from_me
+                && !fromme_outside_self_chat_is_operator_trigger(
+                    is_group,
+                    &context.dm_mention_patterns,
+                    &context.group_mention_patterns,
+                    msg.text_content().unwrap_or(""),
+                )
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"chat": chat, "sender": sender})),
+                    "ignoring fromMe message outside self-chat thread (chat=, sender=)"
+                );
+                return;
+            } else if is_group {
+                match &context.group_policy {
+                    zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "ignoring group message (group_policy=ignore)"
+                        );
+                        return;
+                    }
+                    zeroclaw_config::schema::WhatsAppChatPolicy::All => {}
+                    zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
+                        if normalized.is_none() {
+                            let lid_diag = Self::lid_rejection_diagnostic(
+                                &sender_jid,
+                                mapped_phone.as_deref(),
+                            );
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                    sender_candidates.len(),
+                                    lid_diag
+                                )
+                            );
+                            return;
+                        }
+                    }
+                }
+            } else {
+                match &context.dm_policy {
+                    zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "ignoring DM (dm_policy=ignore)"
+                        );
+                        return;
+                    }
+                    zeroclaw_config::schema::WhatsAppChatPolicy::All => {}
+                    zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
+                        if normalized.is_none() {
+                            let lid_diag = Self::lid_rejection_diagnostic(
+                                &sender_jid,
+                                mapped_phone.as_deref(),
+                            );
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                    sender_candidates.len(),
+                                    lid_diag
+                                )
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        let normalized = normalized.unwrap_or_else(|| sender.clone());
+        let conversation_scope = Self::group_context_scope(context.passive_group_context, is_group);
+        let mut passive_context = false;
+        let text_content = msg.text_content().unwrap_or("").trim().to_string();
+        let mut content = Self::media_fallback_content(text_content, msg);
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
+                sender.len(),
+                chat.len(),
+                content.len()
+            )
+        );
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("WhatsApp Web message content: {}", content)
+        );
+
+        if context.mention_only && is_group {
+            let bot_phone = context.bot_phone.lock();
+            let bot_lid = context.bot_lid.lock();
+            if bot_phone.is_some() || bot_lid.is_some() {
+                let bp = bot_phone.as_deref().unwrap_or("");
+                let bl = bot_lid.as_deref();
+                let addressed = Self::is_message_addressed_to_bot(msg, &content, bp, bl);
+                if Self::should_record_passive_group_context(
+                    context.passive_group_context,
+                    is_group,
+                    addressed,
+                ) {
+                    passive_context = true;
+                } else if !addressed {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "ignoring group message not addressed to bot"
+                    );
+                    return;
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "mention_only active but bot identity unknown, skipping group msg"
+                );
+                return;
+            }
+        }
+
+        let passive_from_mention_gating_possible = Self::should_record_passive_group_context(
+            context.passive_group_context,
+            is_group,
+            false,
+        );
+        if !passive_context && passive_from_mention_gating_possible {
+            match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                &context.dm_mention_patterns,
+                &context.group_mention_patterns,
+                &content,
+                is_group,
+            ) {
+                Some(c) => content = c,
+                None => passive_context = true,
+            }
+        }
+
+        if passive_context {
+            if content.is_empty() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("ignoring empty passive group context from {}", normalized)
+                );
+                return;
+            }
+            Self::send_inbound_channel_message(
+                &context.tx,
+                context.alias.as_ref(),
+                &normalized,
+                reply_target,
+                content,
+                Vec::new(),
+                true,
+                conversation_scope,
+            )
+            .await;
+            return;
+        }
+
+        let voice_text = if let Some(ref audio) = msg.audio_message {
+            let is_ptt = audio.ptt == Some(true);
+            let non_ptt_enabled = context
+                .transcription_config
+                .as_ref()
+                .is_some_and(|c| c.transcribe_non_ptt_audio);
+            if is_ptt || non_ptt_enabled {
+                Self::try_transcribe_voice_note(
+                    client,
+                    audio,
+                    context.transcription_config.as_ref(),
+                    context.transcription_manager.as_deref(),
+                )
+                .await
+            } else {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("ignoring non-PTT audio message from {}", normalized)
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref vt) = voice_text {
+            if let Ok(mut vs) = context.voice_chats.lock() {
+                vs.insert(reply_target.clone());
+            }
+            content = format!("[Voice] {vt}");
+        } else if let Ok(mut vs) = context.voice_chats.lock() {
+            vs.remove(&reply_target);
+        }
+        content = Self::media_fallback_content(content, msg);
+
+        if content.is_empty() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("ignoring empty or non-text message from {}", normalized)
+            );
+            return;
+        }
+
+        if !passive_from_mention_gating_possible {
+            content = match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                &context.dm_mention_patterns,
+                &context.group_mention_patterns,
+                &content,
+                is_group,
+            ) {
+                Some(c) => c,
+                None => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"normalized": normalized})),
+                        "message from did not match mention patterns, dropping"
+                    );
+                    return;
+                }
+            };
+        }
+
+        let mut attachments = Vec::new();
+        Self::collect_media_attachments(client, msg, "", false, &mut attachments).await;
+        if let Some(quoted) = Self::extract_quoted_message(msg) {
+            Self::collect_media_attachments(client, quoted, "quoted-", true, &mut attachments)
+                .await;
+        }
+
+        Self::send_inbound_channel_message(
+            &context.tx,
+            context.alias.as_ref(),
+            &normalized,
+            reply_target,
+            content,
+            attachments,
+            false,
+            conversation_scope,
+        )
+        .await;
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn compute_reply_target(chat_jid: &str) -> String {
         // Pass through unchanged - library handles LID resolution internally
         chat_jid.to_string()
     }
 
-    /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and PR #636,
+    /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and
     /// LID JIDs are handled internally by the library, so we pass through unchanged.
     #[cfg(feature = "whatsapp-web")]
     fn resolve_outbound_recipient(recipient: &str) -> String {
@@ -448,11 +1183,6 @@ impl WhatsAppWebChannel {
             .build())
     }
 
-    /// Convert a recipient to a wa-rs JID.
-    ///
-    /// Supports:
-    /// - Full JIDs (e.g. "12345@s.whatsapp.net")
-    /// - E.164-like numbers (e.g. "+1234567890")
     #[cfg(feature = "whatsapp-web")]
     fn recipient_to_jid(&self, recipient: &str) -> Result<wacore_binary::jid::Jid> {
         let trimmed = recipient.trim();
@@ -517,6 +1247,27 @@ impl WhatsAppWebChannel {
         retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Expand `~` in a configured `session_path`. Single source of truth
+    /// for the on-disk location — the run loop and the readiness probe
+    /// must agree on the file they are looking at.
+    fn expand_session_path(session_path: &str) -> String {
+        shellexpand::tilde(session_path).to_string()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether the session
+    /// database at the configured `session_path` holds a device linked to a
+    /// WhatsApp account (`device.pn` written by a completed QR pairing).
+    /// Stricter than the run loop's resume check on purpose — a channel
+    /// waiting for its QR scan persists an unregistered device row, which
+    /// must not read as an authenticated login. Read-only; never creates
+    /// the database or its sidecar files.
+    pub fn has_persisted_session(session_path: &str) -> bool {
+        if session_path.is_empty() {
+            return false;
+        }
+        super::whatsapp_storage::persisted_device_exists(Self::expand_session_path(session_path))
+    }
+
     /// Return the session file paths to remove (primary + WAL + SHM sidecars).
     fn session_file_paths(expanded_session_path: &str) -> [String; 3] {
         [
@@ -526,8 +1277,35 @@ impl WhatsAppWebChannel {
         ]
     }
 
-    /// Attempt to download and transcribe a WhatsApp voice note.
+    /// Channel-owned relink hook: delete the persisted session so the next
+    /// channel start finds no device and begins a fresh QR pairing.
     ///
+    /// Removes the same triple the logged-out purge path removes —
+    /// [`Self::session_file_paths`] is the single source of truth for both.
+    /// Returns the paths actually removed; already absent files are not an
+    /// error, so relinking an unpaired channel is a safe no-op that returns
+    /// an empty list. Never creates the database.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// live connection until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_session(session_path: &str) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        if session_path.is_empty() {
+            return Ok(removed);
+        }
+        let expanded = Self::expand_session_path(session_path);
+        for path in Self::session_file_paths(&expanded) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Attempt to download and transcribe a WhatsApp voice note.
     /// Returns `None` if transcription is disabled, download fails, or
     /// transcription fails (all logged as warnings).
     #[cfg(feature = "whatsapp-web")]
@@ -617,6 +1395,304 @@ impl WhatsAppWebChannel {
                 );
                 None
             }
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_context_info(
+        msg: &waproto::whatsapp::Message,
+    ) -> Option<&waproto::whatsapp::ContextInfo> {
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref ext) = base.extended_text_message
+            && let Some(ref ctx) = ext.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref img) = base.image_message
+            && let Some(ref ctx) = img.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref vid) = base.video_message
+            && let Some(ref ctx) = vid.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref doc) = base.document_message
+            && let Some(ref ctx) = doc.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref aud) = base.audio_message
+            && let Some(ref ctx) = aud.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref stk) = base.sticker_message
+            && let Some(ref ctx) = stk.context_info
+        {
+            return Some(ctx);
+        }
+
+        None
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message(
+        msg: &waproto::whatsapp::Message,
+    ) -> Option<&waproto::whatsapp::Message> {
+        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_deref())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension(mime: &str, fallback: &str) -> String {
+        let subtype = mime
+            .split(';')
+            .next()
+            .and_then(|clean| clean.split_once('/').map(|(_, subtype)| subtype))
+            .and_then(|subtype| subtype.split('+').next())
+            .filter(|subtype| {
+                !subtype.is_empty()
+                    && subtype
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+            })
+            .unwrap_or(fallback);
+
+        match subtype {
+            "jpeg" => "jpg".to_string(),
+            "svg+xml" => "svg".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn push_downloaded_attachment(
+        client: &whatsapp_rust::Client,
+        downloadable: &dyn whatsapp_rust::download::Downloadable,
+        file_name: String,
+        mime_type: Option<String>,
+        attachments: &mut Vec<MediaAttachment>,
+    ) {
+        let data = match client.download(downloadable).await {
+            Ok(data) => data,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "file": file_name,
+                            "error": format!("{}", e),
+                        })),
+                    "failed to download WhatsApp media attachment"
+                );
+                return;
+            }
+        };
+
+        attachments.push(MediaAttachment {
+            file_name,
+            data,
+            mime_type,
+        });
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn collect_media_attachments(
+        client: &whatsapp_rust::Client,
+        msg: &waproto::whatsapp::Message,
+        file_prefix: &str,
+        include_audio: bool,
+        attachments: &mut Vec<MediaAttachment>,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+        use whatsapp_rust::download::Downloadable;
+
+        let base = msg.get_base_message();
+
+        if let Some(ref image) = base.image_message {
+            let mime = image
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-image.{}",
+                Self::mime_extension(&mime, "jpg")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                image.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref video) = base.video_message {
+            let mime = video
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-video.{}",
+                Self::mime_extension(&mime, "mp4")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                video.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if include_audio && let Some(ref audio) = base.audio_message {
+            let mime = audio
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "audio/ogg".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-audio.{}",
+                Self::mime_extension(&mime, "ogg")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                audio.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref sticker) = base.sticker_message {
+            let mime = sticker
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/webp".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-sticker.{}",
+                Self::mime_extension(&mime, "webp")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                sticker.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content(content: String, msg: &waproto::whatsapp::Message) -> String {
+        if !content.is_empty() {
+            return content;
+        }
+
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if base.sticker_message.is_some() {
+            return "[Sticker]".to_string();
+        }
+        if base.image_message.is_some() {
+            return "[Image]".to_string();
+        }
+        if base.video_message.is_some() {
+            return "[Video]".to_string();
+        }
+        if base.document_message.is_some() {
+            return "[Document]".to_string();
+        }
+        if let Some(ref loc) = base.location_message {
+            // Live locations are silently ignored — they stream
+            // periodic updates and have no meaningful static content.
+            if loc.is_live == Some(true) {
+                return String::new();
+            }
+            let lat = match loc.degrees_latitude {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            let lng = match loc.degrees_longitude {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            return crate::util::format_location_content(lat, lng, loc.name.as_deref());
+        }
+
+        String::new()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn group_context_scope(
+        passive_group_context: bool,
+        is_group: bool,
+    ) -> ChannelConversationScope {
+        if passive_group_context && is_group {
+            ChannelConversationScope::ReplyTarget
+        } else {
+            ChannelConversationScope::Sender
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_record_passive_group_context(
+        passive_group_context: bool,
+        is_group: bool,
+        addressed_to_bot: bool,
+    ) -> bool {
+        passive_group_context && is_group && !addressed_to_bot
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_inbound_channel_message(
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        alias: &str,
+        sender: &str,
+        reply_target: String,
+        content: String,
+        attachments: Vec<MediaAttachment>,
+        passive_context: bool,
+        conversation_scope: ChannelConversationScope,
+    ) {
+        if let Err(e) = tx
+            .send(ChannelMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some(alias.to_string()),
+                sender: sender.to_string(),
+                // Reply to the originating chat JID (DM or group), passed
+                // through unchanged (library handles LID addressing internally).
+                reply_target,
+                content,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments,
+                subject: None,
+                internal_sop_event: None,
+                passive_context,
+                explicitly_addressed: false,
+                conversation_scope,
+                references: Vec::new(),
+            })
+            .await
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to send message to channel"
+            );
         }
     }
 
@@ -716,6 +1792,132 @@ impl WhatsAppWebChannel {
         Ok(())
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_media_marker(
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
+        marker: &WhatsAppMediaMarker,
+        path: &Path,
+    ) -> Result<()> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read WhatsApp marker target {}", path.display()))?;
+        if bytes.is_empty() {
+            anyhow::bail!("WhatsApp marker target {} is empty", path.display());
+        }
+
+        let media_type = marker.kind.media_type();
+        let mime = marker.kind.mime_for_path(path);
+
+        use whatsapp_rust::upload::UploadOptions;
+        let upload = client
+            .upload(bytes, media_type, UploadOptions::default())
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
+
+        let media_key = upload.media_key_vec();
+        let file_enc_sha256 = upload.file_enc_sha256_vec();
+        let file_sha256 = upload.file_sha256_vec();
+        let outgoing = match marker.kind {
+            WhatsAppMediaKind::Image => waproto::whatsapp::Message {
+                image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mime),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WhatsAppMediaKind::Video => waproto::whatsapp::Message {
+                video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mime),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WhatsAppMediaKind::Audio | WhatsAppMediaKind::Voice => {
+                #[allow(clippy::cast_possible_truncation)]
+                let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+                waproto::whatsapp::Message {
+                    audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(media_key),
+                        file_enc_sha256: Some(file_enc_sha256),
+                        file_sha256: Some(file_sha256),
+                        file_length: Some(upload.file_length),
+                        mimetype: Some(mime),
+                        ptt: Some(matches!(marker.kind, WhatsAppMediaKind::Voice)),
+                        seconds: Some(estimated_seconds),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+            }
+            WhatsAppMediaKind::Document => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("attachment")
+                    .to_string();
+                waproto::whatsapp::Message {
+                    document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(media_key),
+                        file_enc_sha256: Some(file_enc_sha256),
+                        file_sha256: Some(file_sha256),
+                        file_length: Some(upload.file_length),
+                        mimetype: Some(mime),
+                        file_name: Some(file_name.clone()),
+                        title: Some(file_name),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+            }
+        };
+
+        Box::pin(client.send_message(to.clone(), outgoing))
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp media send failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Send a native location pin. No file read or media upload is involved —
+    /// the coordinates and labels travel inline in a `LocationMessage`.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_location(
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
+        loc: &WhatsAppLocation,
+    ) -> Result<()> {
+        let outgoing = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(loc.lat),
+                degrees_longitude: Some(loc.lng),
+                name: loc.name.clone(),
+                address: loc.address.clone(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        Box::pin(client.send_message(to.clone(), outgoing))
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp location send failed: {e}")))?;
+        Ok(())
+    }
+
     // ── Mention detection helpers (used when mention_only is enabled) ──
 
     /// Extract digits from a JID string (e.g. "919211916069@s.whatsapp.net" -> "919211916069").
@@ -749,26 +1951,11 @@ impl WhatsAppWebChannel {
     }
 
     /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
-    ///
-    /// Uses `get_base_message()` to see through ephemeral/view-once/edited/document wrappers,
-    /// matching the same unwrapping that `text_content()` performs.
-    ///
-    /// NOTE: Only checks `extended_text_message.context_info`. Media messages (image, video,
-    /// document) carry mentions in their own `context_info`, but `text_content()` already
-    /// ignores captions so those messages are filtered out upstream as empty text.
     #[cfg(feature = "whatsapp-web")]
     fn extract_mentioned_jids(msg: &waproto::whatsapp::Message) -> Vec<String> {
-        use wacore::proto_helpers::MessageExt;
-        let base = msg.get_base_message();
-
-        if let Some(ref ext) = base.extended_text_message
-            && let Some(ref ctx) = ext.context_info
-            && !ctx.mentioned_jid.is_empty()
-        {
-            return ctx.mentioned_jid.clone();
-        }
-
-        Vec::new()
+        Self::extract_context_info(msg)
+            .map(|ctx| ctx.mentioned_jid.clone())
+            .unwrap_or_default()
     }
 
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
@@ -818,16 +2005,10 @@ impl WhatsAppWebChannel {
         has_text_mention(text, bot_phone) || bot_lid.is_some_and(|lid| has_text_mention(text, lid))
     }
 
-    /// Extract the author JID of the message quoted by an extended-text reply.
+    /// Extract the author JID of the message quoted by a reply.
     #[cfg(feature = "whatsapp-web")]
     fn extract_reply_participant(msg: &waproto::whatsapp::Message) -> Option<&str> {
-        use wacore::proto_helpers::MessageExt;
-        let base = msg.get_base_message();
-
-        base.extended_text_message
-            .as_ref()
-            .and_then(|ext| ext.context_info.as_ref())
-            .and_then(|ctx| ctx.participant.as_deref())
+        Self::extract_context_info(msg).and_then(|ctx| ctx.participant.as_deref())
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -853,19 +2034,6 @@ impl WhatsAppWebChannel {
     }
 }
 
-/// Decide whether a `fromMe` message outside the operator's self-chat is an
-/// intentional operator-typed bot trigger.
-///
-/// The default response to a `fromMe` mirror is to drop, because WhatsApp Web
-/// echoes every message the operator types from any linked device and replying
-/// would impersonate them. The exception is when the operator has configured
-/// `dm_mention_patterns` / `group_mention_patterns` and the text matches —
-/// that is the explicit opt-in that distinguishes a deliberate trigger
-/// (e.g. typing `TinyBot foo` in a friend's DM) from a normal mirrored
-/// message.
-///
-/// Returns `true` when the message should fall through to the regular policy
-/// branches; `false` when it should be dropped as a mirror.
 #[cfg(feature = "whatsapp-web")]
 fn fromme_outside_self_chat_is_operator_trigger(
     is_group: bool,
@@ -882,6 +2050,287 @@ fn fromme_outside_self_chat_is_operator_trigger(
         return false;
     }
     super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn is_group_chat_allowed(chat_jid: &str, allowed_groups: &[String]) -> bool {
+    if allowed_groups.is_empty() {
+        return true;
+    }
+    let chat_user = chat_jid
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(chat_jid);
+    allowed_groups.iter().any(|entry| {
+        let entry = entry.trim();
+        !entry.is_empty() && (entry == chat_jid || entry == chat_user)
+    })
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatsAppMediaKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMediaKind {
+    fn from_marker(kind: &str) -> Option<Self> {
+        match kind {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+
+    fn media_type(self) -> wacore::download::MediaType {
+        match self {
+            Self::Image => wacore::download::MediaType::Image,
+            Self::Document => wacore::download::MediaType::Document,
+            Self::Video => wacore::download::MediaType::Video,
+            Self::Audio | Self::Voice => wacore::download::MediaType::Audio,
+        }
+    }
+
+    fn mime_for_path(self, path: &Path) -> String {
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase);
+        if matches!(self, Self::Voice) && matches!(ext.as_deref(), Some("ogg" | "oga" | "opus")) {
+            return "audio/ogg; codecs=opus".to_string();
+        }
+        match ext.as_deref() {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some("mp4") => "video/mp4",
+            Some("mov") => "video/quicktime",
+            Some("mkv") => "video/x-matroska",
+            Some("avi") => "video/x-msvideo",
+            Some("webm") => "video/webm",
+            Some("mp3") => "audio/mpeg",
+            Some("m4a") => "audio/mp4",
+            Some("wav") => "audio/wav",
+            Some("flac") => "audio/flac",
+            Some("ogg" | "oga") => "audio/ogg",
+            Some("opus") => "audio/opus",
+            Some("pdf") => "application/pdf",
+            Some("doc") => "application/msword",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xls") => "application/vnd.ms-excel",
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Some("csv") => "text/csv",
+            Some("txt") => "text/plain",
+            _ => "application/octet-stream",
+        }
+        .to_string()
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WhatsAppMediaMarker {
+    kind: WhatsAppMediaKind,
+    /// Path-like target resolved against the workspace before upload.
+    target: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+use crate::util::WhatsAppLocation;
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq)]
+enum WhatsAppMarker {
+    Media(WhatsAppMediaMarker),
+    Location(String),
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMarker {
+    fn from_shared_marker(kind: String, target: String) -> Option<Self> {
+        if kind.eq_ignore_ascii_case("LOCATION") {
+            return Some(Self::Location(target));
+        }
+        let kind = WhatsAppMediaKind::from_marker(&kind)?;
+        Some(Self::Media(WhatsAppMediaMarker { kind, target }))
+    }
+
+    /// Short label for structured logs.
+    fn kind_label(&self) -> String {
+        match self {
+            Self::Media(m) => format!("{:?}", m.kind),
+            Self::Location(_) => "Location".to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatsAppMarkerFailure {
+    Refused,
+    Failed,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug)]
+enum WhatsAppMarkerError {
+    Refused(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl std::fmt::Display for WhatsAppMarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(err) | Self::Failed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMarkerError {
+    fn kind(&self) -> WhatsAppMarkerFailure {
+        match self {
+            Self::Refused(_) => WhatsAppMarkerFailure::Refused,
+            Self::Failed(_) => WhatsAppMarkerFailure::Failed,
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn validate_whatsapp_marker_target(
+    target: &str,
+    workspace_dir: Option<&Path>,
+) -> std::result::Result<PathBuf, WhatsAppMarkerError> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Err(WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web media markers currently accept local workspace files only",
+        )));
+    }
+    let disallowed_scheme = if target.starts_with("data:") {
+        Some("data")
+    } else if target.starts_with("file:") {
+        Some("file")
+    } else if target.contains("://") {
+        Some(target.split("://").next().unwrap_or("?"))
+    } else {
+        None
+    };
+    if let Some(scheme) = disallowed_scheme {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"scheme": scheme})),
+            "whatsapp-web: marker target uses disallowed scheme"
+        );
+        return Err(WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web marker target uses a disallowed scheme",
+        )));
+    }
+
+    let workspace = workspace_dir.ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"reason": "no_workspace_dir"})),
+            "whatsapp-web: local marker target has no workspace_dir"
+        );
+        WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web channel was started without a workspace_dir",
+        ))
+    })?;
+    let workspace_canon = std::fs::canonicalize(workspace)
+        .with_context(|| format!("canonicalize workspace {}", workspace.display()))
+        .map_err(WhatsAppMarkerError::Refused)?;
+    let target_path = Path::new(target);
+    let absolute = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        workspace_canon.join(target_path)
+    };
+    let target_canon = match std::fs::canonicalize(&absolute) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"reason": "not_found"})),
+                "whatsapp-web: marker target not found on disk"
+            );
+            return Err(WhatsAppMarkerError::Failed(anyhow::Error::msg(
+                "WhatsApp Web marker target not found on disk",
+            )));
+        }
+        Err(err) => {
+            return Err(WhatsAppMarkerError::Refused(
+                anyhow::Error::from(err).context("canonicalize WhatsApp marker target"),
+            ));
+        }
+    };
+
+    if !target_canon.starts_with(&workspace_canon) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"reason": "outside_workspace"})),
+            "whatsapp-web: marker target escapes workspace_dir"
+        );
+        return Err(WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web marker target resolves outside workspace_dir",
+        )));
+    }
+    Ok(target_canon)
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn validate_whatsapp_location_target(
+    target: &str,
+) -> std::result::Result<WhatsAppLocation, WhatsAppMarkerError> {
+    WhatsAppLocation::parse(target).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"reason": "invalid_location"})),
+            "whatsapp-web: location marker target is malformed or outside WGS84 range"
+        );
+        WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web location marker must be `lat,lng[,name[,address]]` with in-range WGS84 coordinates",
+        ))
+    })
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
+    if failure_count == 0 {
+        return None;
+    }
+    let count = failure_count.to_string();
+    let key = if failure_count == 1 {
+        "channel-whatsapp-web-delivery-failure-note-one"
+    } else {
+        "channel-whatsapp-web-delivery-failure-note-many"
+    };
+    Some(i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -925,6 +2374,34 @@ impl Channel for WhatsAppWebChannel {
 
         let deliverable_recipient = Self::resolve_outbound_recipient(&message.recipient);
         let to = self.recipient_to_jid(&deliverable_recipient)?;
+        let raw_content = if message.content.contains("<function_calls")
+            || message.content.contains("</function_calls")
+            || message.content.contains("<tool_call")
+            || message.content.contains("</tool_call")
+            || message.content.contains("<tool_calls")
+            || message.content.contains("</tool_calls")
+        {
+            crate::util::strip_tool_call_tags(&message.content)
+        } else {
+            message.content.clone()
+        };
+        let (mut text_content, raw_markers) = if raw_content.contains('[')
+            && raw_content.contains(':')
+            && raw_content.contains(']')
+        {
+            let (cleaned, raw_markers) = super::util::parse_attachment_markers(&raw_content);
+            if raw_markers.is_empty() {
+                (raw_content, raw_markers)
+            } else {
+                (cleaned, raw_markers)
+            }
+        } else {
+            (raw_content, Vec::new())
+        };
+        let markers = raw_markers
+            .into_iter()
+            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
+            .collect::<Vec<_>>();
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -937,7 +2414,7 @@ impl Channel for WhatsAppWebChannel {
             .unwrap_or(false);
 
         if is_voice_chat && self.tts_manager.is_some() {
-            let content = &message.content;
+            let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
             let is_substantive = content.len() > 40
@@ -1019,16 +2496,110 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
+        let mut delivered_markers = 0usize;
+        let mut failed_marker_count = 0usize;
+        for marker in &markers {
+            // Location markers carry inline data (lat,lng,...) and skip the
+            // workspace file validator, but the coordinates must still parse
+            // and land in WGS84 range; media markers must resolve to a real
+            // file inside the workspace before upload.
+            let result = match marker {
+                WhatsAppMarker::Location(target) => {
+                    match validate_whatsapp_location_target(target) {
+                        Ok(loc) => Self::send_location(&client, &to, &loc).await,
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "kind": "Location",
+                                    "reason": "invalid coordinates",
+                                    "error": err.to_string(),
+                                })),
+                                "whatsapp-web: dropping unresolved outbound attachment marker"
+                            );
+                            failed_marker_count += 1;
+                            continue;
+                        }
+                    }
+                }
+                WhatsAppMarker::Media(media) => {
+                    let target = match validate_whatsapp_marker_target(
+                        &media.target,
+                        self.workspace_dir.as_deref(),
+                    ) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let reason = match err.kind() {
+                                WhatsAppMarkerFailure::Refused => "trust boundary",
+                                WhatsAppMarkerFailure::Failed => "not found",
+                            };
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "kind": format!("{:?}", media.kind),
+                                    "reason": reason,
+                                    "error": err.to_string(),
+                                })),
+                                "whatsapp-web: dropping unresolved outbound attachment marker"
+                            );
+                            failed_marker_count += 1;
+                            continue;
+                        }
+                    };
+                    Self::send_media_marker(&client, &to, media, &target).await
+                }
+            };
+            match result {
+                Ok(()) => delivered_markers += 1,
+                Err(err) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "kind": marker.kind_label(),
+                                "error": err.to_string(),
+                            })),
+                        "whatsapp-web: marker delivery failed"
+                    );
+                    failed_marker_count += 1;
+                }
+            }
+        }
+
+        if let Some(note) = whatsapp_delivery_failure_note(failed_marker_count) {
+            if text_content.is_empty() {
+                text_content = note;
+            } else {
+                text_content.push_str("\n\n");
+                text_content.push_str(&note);
+            }
+        }
+
+        if !markers.is_empty() && text_content.is_empty() && delivered_markers > 0 {
+            return Ok(());
+        }
+
         // Send text message
         let outgoing = waproto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
+            conversation: Some(text_content),
             ..Default::default()
         };
 
         // Box::pin the large future (~34KB) so it doesn't inflate the
         // enclosing Send future's stack slot — clippy::large_futures.
         // whatsapp-rust 0.6: send_message returns `SendResult { message_id, to }`
-        // instead of a bare `String` (oxidezap/whatsapp-rust#597).
+        // instead of a bare `String` (oxidezap/whatsapp-rust
         let send_result = Box::pin(client.send_message(to, outgoing)).await?;
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1050,7 +2621,6 @@ impl Channel for WhatsAppWebChannel {
         // borrowing `self` for its 'static lifetime.
         let alias = std::sync::Arc::new(self.alias.clone());
 
-        use wacore::proto_helpers::MessageExt;
         use wacore::store::DevicePropsOverride;
         use wacore::types::events::Event;
         use wacore_binary::jid::JidExt as _;
@@ -1064,7 +2634,7 @@ impl Channel for WhatsAppWebChannel {
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         loop {
-            let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
+            let expanded_session_path = Self::expand_session_path(&self.session_path);
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -1132,30 +2702,33 @@ impl Channel for WhatsAppWebChannel {
             let session_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Build the bot
-            let tx_clone = tx.clone();
-            let peer_resolver = Arc::clone(&self.peer_resolver);
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
-            let transcription_config = self.transcription.clone();
-            let transcription_mgr = self.transcription_manager.clone();
-            let voice_chats = self.voice_chats.clone();
-            let wa_mode = self.mode.clone();
-            let wa_dm_policy = self.dm_policy.clone();
-            let wa_group_policy = self.group_policy.clone();
-            let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
-            let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
-            let wa_group_mention_patterns = self.group_mention_patterns.clone();
+            let persist_clone = self.persist.clone();
+            let inbound_context = WhatsAppInboundContext {
+                tx: tx.clone(),
+                alias: Arc::clone(&alias),
+                peer_resolver: Arc::clone(&self.peer_resolver),
+                allowed_groups_resolver: Arc::clone(&self.allowed_groups_resolver),
+                mode: self.mode.clone(),
+                dm_policy: self.dm_policy.clone(),
+                group_policy: self.group_policy.clone(),
+                self_chat_mode: self.self_chat_mode,
+                mention_only: self.mention_only,
+                passive_group_context: self.passive_group_context,
+                bot_phone: self.bot_phone.clone(),
+                bot_lid: self.bot_lid.clone(),
+                dm_mention_patterns: self.dm_mention_patterns.clone(),
+                group_mention_patterns: self.group_mention_patterns.clone(),
+                transcription_config: self.transcription.clone(),
+                transcription_manager: self.transcription_manager.clone(),
+                voice_chats: self.voice_chats.clone(),
+            };
 
-            // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
-            // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
-            // required before `.build()` resolves; we use the bundled
-            // `TokioRuntime`. `with_device_props` switched from three
-            // positional Options to a `DevicePropsOverride` builder
-            // (oxidezap/whatsapp-rust#586).
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
@@ -1168,263 +2741,42 @@ impl Channel for WhatsAppWebChannel {
                 )
                 .on_event({
                     let alias = Arc::clone(&alias);
+                    let inbound_context = inbound_context.clone();
                     move |event, client| {
-                    let tx_inner = tx_clone.clone();
-                    let peer_resolver = Arc::clone(&peer_resolver);
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
                     let alias = Arc::clone(&alias);
-                    let transcription_config = transcription_config.clone();
-                    let transcription_mgr = transcription_mgr.clone();
-                    let voice_chats = voice_chats.clone();
-                    let wa_mode = wa_mode.clone();
-                    let wa_dm_policy = wa_dm_policy.clone();
-                    let wa_group_policy = wa_group_policy.clone();
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
-                    let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
-                    let wa_group_mention_patterns = wa_group_mention_patterns.clone();
+                    let persist_inner = persist_clone.clone();
+                    let inbound_context = inbound_context.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
-                        // per PR #613, so we match against `&*event` to get a
+                        // per so we match against `&*event` to get a
                         // `&Event` reference and bind variant fields by ref.
                         match &*event {
-                            Event::Message(msg, info) => {
-                                let sender_jid = info.source.sender.clone();
-                                let sender_alt = info.source.sender_alt.clone();
-                                let sender = sender_jid.user().to_string();
-                                let chat = info.source.chat.to_string();
-
-                                // whatsapp-rust 0.6: `Client::get_phone_number_from_lid`
-                                // was replaced by the unified `get_lid_pn_entry`
-                                // (oxidezap/whatsapp-rust#487). The new helper
-                                // returns the full LID↔phone entry; we extract
-                                // the phone field on hit, swallow lookup errors
-                                // back to `None` (consistent with the legacy
-                                // semantics — best-effort enrichment).
-                                let mapped_phone = if sender_jid.is_lid() {
-                                    match client.get_lid_pn_entry(&sender_jid).await {
-                                        Ok(Some(entry)) => Some(entry.phone_number),
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                };
-                                let sender_candidates = Self::sender_phone_candidates(
-                                    &sender_jid,
-                                    sender_alt.as_ref(),
-                                    mapped_phone.as_deref(),
-                                );
-
-                                let allowed_peers = peer_resolver();
-                                let normalized = sender_candidates
-                                    .iter()
-                                    .find(|candidate| {
-                                        Self::is_number_allowed_for_list(&allowed_peers, candidate)
-                                    })
-                                    .cloned();
-
-                                let is_group = info.source.is_group;
-                                let reply_target = Self::compute_reply_target(&chat);
-
-                                // ── Personal-mode chat-type policy filtering ──
-                                if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
-                                    // Self-chat: the chat JID user part matches
-                                    // the sender's user part (message to "Notes
-                                    // to Self").
-                                    let sender_user = sender_jid.user();
-                                    let chat_user = chat
-                                        .split_once('@')
-                                        .map(|(u, _)| u)
-                                        .unwrap_or(&chat);
-                                    let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
-
-                                    if is_self_chat {
-                                        if !wa_self_chat_mode {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring self-chat message (self_chat_mode=false)");
-                                            return;
-                                        }
-                                        // self_chat_mode=true: always process, skip further policy checks.
-                                    } else if info.source.is_from_me
-                                        && !fromme_outside_self_chat_is_operator_trigger(
-                                            is_group,
-                                            &wa_dm_mention_patterns,
-                                            &wa_group_mention_patterns,
-                                            msg.text_content().unwrap_or(""),
-                                        )
-                                    {
-                                        // fromMe outside the self-chat thread is a mirror of the
-                                        // operator's own outbound message to a third party (DM or
-                                        // group). Replying would impersonate the operator. Drop —
-                                        // unless the operator has configured a mention pattern
-                                        // and the text matches it (the workflow @ilteoood uses
-                                        // with `TinyBot ...` triggers), in which case the helper
-                                        // returns true and we fall through to the policy branches
-                                        // below to treat the message like an inbound trigger.
-                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chat": chat, "sender": sender})), "ignoring fromMe message outside self-chat thread (chat=, sender=)");
-                                        return;
-                                    } else if is_group {
-                                        match wa_group_policy {
-                                            zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
-                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message (group_policy=ignore)");
-                                                return;
-                                            }
-                                            zeroclaw_config::schema::WhatsAppChatPolicy::All => {
-                                                // allow unconditionally
-                                            }
-                                            zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
-                                                if normalized.is_none() {
-                                                    let lid_diag = Self::lid_rejection_diagnostic(
-                                                        &sender_jid,
-                                                        mapped_phone.as_deref(),
-                                                    );
-                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // DM (non-self)
-                                        match wa_dm_policy {
-                                            zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
-                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring DM (dm_policy=ignore)");
-                                                return;
-                                            }
-                                            zeroclaw_config::schema::WhatsAppChatPolicy::All => {
-                                                // allow unconditionally
-                                            }
-                                            zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
-                                                if normalized.is_none() {
-                                                    let lid_diag = Self::lid_rejection_diagnostic(
-                                                        &sender_jid,
-                                                        mapped_phone.as_deref(),
-                                                    );
-                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let normalized = normalized.unwrap_or_else(|| sender.clone());
-
-                                // Attempt voice note transcription (ptt = push-to-talk = voice note).
-                                // When `transcribe_non_ptt_audio` is enabled in the transcription
-                                // config, also transcribe forwarded / regular audio messages.
-                                let voice_text = if let Some(ref audio) = msg.audio_message {
-                                    let is_ptt = audio.ptt == Some(true);
-                                    let non_ptt_enabled = transcription_config
-                                        .as_ref()
-                                        .is_some_and(|c| c.transcribe_non_ptt_audio);
-                                    if is_ptt || non_ptt_enabled {
-                                        Self::try_transcribe_voice_note(
-                                            &client,
-                                            audio,
-                                            transcription_config.as_ref(),
-                                            transcription_mgr.as_deref(),
-                                        )
-                                        .await
-                                    } else {
-                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring non-PTT audio message from {}", normalized));
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                // Use transcribed voice text, or fall back to text content.
-                                // Track whether this chat used a voice note so we reply in kind.
-                                let content = if let Some(ref vt) = voice_text {
-                                    if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.insert(reply_target.clone());
-                                    }
-                                    format!("[Voice] {vt}")
-                                } else {
-                                    if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&reply_target);
-                                    }
-                                    let text = msg.text_content().unwrap_or("");
-                                    text.trim().to_string()
-                                };
-
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
-
-                                if content.is_empty() {
-                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty or non-text message from {}", normalized));
-                                    return;
-                                }
-
-                                // mention_only: skip group messages without a bot mention
-                                if mention_only && is_group {
-                                    let bot_phone = bot_phone_inner.lock();
-                                    let bot_lid = bot_lid_inner.lock();
-                                    if bot_phone.is_some() || bot_lid.is_some() {
-                                        let bp = bot_phone.as_deref().unwrap_or("");
-                                        let bl = bot_lid.as_deref();
-                                        if !Self::is_message_addressed_to_bot(msg, &content, bp, bl) {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
-                                            return;
-                                        }
-                                    } else {
-                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
-                                        return;
-                                    }
-                                }
-
-                                // ── Mention-pattern gating ──
-                                // Apply dm_mention_patterns for DMs and
-                                // group_mention_patterns for group chats.
-                                // When the applicable pattern set is non-empty,
-                                // messages without a match are dropped and
-                                // matched fragments are stripped.
-                                let content =
-                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
-                                        &wa_dm_mention_patterns,
-                                        &wa_group_mention_patterns,
-                                        &content,
-                                        is_group,
-                                    ) {
-                                        Some(c) => c,
-                                        None => {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"normalized": normalized})), "message from did not match mention patterns, dropping");
-                                            return;
-                                        }
-                                    };
-
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        channel_alias: Some((*alias).clone()),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group),
-                                        // passed through unchanged (library handles
-                                        // LID addressing internally).
-                                        reply_target,
-                                        content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                        interruption_scope_id: None,
-                    attachments: vec![],
-                                        subject: None,
-                                    })
-                                    .await
-                                {
-                                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "failed to send message to channel");
-                                }
+                            Event::Message(_, _) => {
+                                Self::handle_inbound_message_event(
+                                    event.as_ref(),
+                                    &client,
+                                    &inbound_context,
+                                )
+                                .await;
                             }
                             Event::Connected(_) => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
+                                crate::login_events::LoginEvent::Connected.emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web connected successfully",
+                                );
                                 WhatsAppWebChannel::reset_retry(&retry_count);
+                                let device = client
+                                    .persistence_manager()
+                                    .get_device_snapshot()
+                                    .await;
                                 // Resolve bot identity from the device store
                                 if mention_only {
-                                    let device = client
-                                        .persistence_manager()
-                                        .get_device_snapshot()
-                                    .await;
                                     if let Some(ref pn) = device.pn
                                         && let Some(digits) =
                                             Self::store_jid_digits(&bot_phone_inner, pn.user())
@@ -1438,24 +2790,61 @@ impl Channel for WhatsAppWebChannel {
                                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot LID from device: {}", digits));
                                     }
                                 }
+                                // Persist the linked account as an authorized
+                                // peer in canonical peer_groups (same shape
+                                // WeChat pairing writes). Idempotent, so the
+                                // reconnect-after-resume case is a no-op.
+                                if let Some(ref pn) = device.pn {
+                                    let digits = Self::jid_digits(pn.user());
+                                    if !digits.is_empty()
+                                        && let Err(e) =
+                                            crate::identity_persist::persist_external_peer(
+                                                persist_inner.as_ref(),
+                                                "whatsapp",
+                                                alias.as_ref(),
+                                                &format!("+{digits}"),
+                                            )
+                                            .await
+                                    {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to persist linked WhatsApp identity: {e}"));
+                                    }
+                                }
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "WhatsApp Web was logged out — will clear session and reconnect");
+                                crate::login_events::LoginEvent::LoggedOut.emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web was logged out — will clear session and reconnect",
+                                );
                                 let _ = logout_tx.send(());
                             }
                             Event::StreamError(stream_error) => {
                                 ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("stream error: {:?}", stream_error));
                             }
                             Event::PairingCode { code, .. } => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "pair code received");
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Link your phone by entering this code in WhatsApp > Linked Devices");
+                                crate::login_events::LoginEvent::PairCode { code: code.as_str() }
+                                    .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web pair code received — enter it in WhatsApp > Linked Devices",
+                                );
                                 eprintln!();
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
                             Event::PairingQrCode { code, .. } => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
+                                crate::login_events::LoginEvent::Qr {
+                                    payload: code.as_str(),
+                                    image_url: None,
+                                    attempt: None,
+                                    max_attempts: None,
+                                }
+                                .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+                                );
                                 match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
                                         eprintln!();
@@ -1687,6 +3076,118 @@ impl Channel for WhatsAppWebChannel {
         );
         Ok(())
     }
+
+    /// Ask the operator to approve a tool call, over the chat this request came
+    /// from, and wait up to `approval_timeout_secs` for a reply.
+    ///
+    /// Before this existed the channel inherited the trait default of
+    /// `Ok(None)`, so an `always_ask` tool failed closed immediately and
+    /// `approval_timeout_secs` was accepted by the config and never read.
+    /// Failing closed was safe, but it made configured
+    /// interactive approval unavailable on this transport.
+    ///
+    /// The request half mirrors the Cloud transport: token, prompt, wait,
+    /// deny-on-timeout, and remove the token on the way out so a late reply
+    /// cannot resolve a request nobody is waiting for. The RESOLUTION half does
+    /// not mirror it, and [`resolve_approval_reply`] says why.
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
+        // Bind the token to the issuing alias AND the chat it is about to be
+        // posted into, so a reply from anywhere else cannot answer it. The
+        // alias matters because the map is process-wide: without it, a second
+        // configured alias sharing this chat would resolve this request under
+        // ITS allowlist rather than ours.
+        let binding = ApprovalBinding {
+            alias: self.alias.clone(),
+            chat: Self::compute_reply_target(recipient),
+            is_group: recipient.contains("@g.us"),
+        };
+        let PendingApprovalRegistration {
+            token,
+            receiver,
+            binding,
+            mut guard,
+        } = register_pending_approval(binding).await;
+
+        // Shared with the Cloud transport, discord, signal and slack, so the
+        // prompt's prose comes from the runtime Fluent catalogue while the
+        // token and the yes/no/always keywords stay protocol-exact ASCII that
+        // `parse_approval_reply` can still read.
+        let mut text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
+        );
+        if binding.is_group {
+            // Say so in the prompt. The token is now readable by everyone in
+            // this group, and the reason a stranger's reply will bounce is not
+            // obvious from the prompt alone.
+            //
+            // The authority named here has to match what the code consults,
+            // which is the canonical peer resolver backed by
+            // `[peer_groups.<name>].external_peers` scoped to this alias.
+            // V3 has no `allowed_numbers` field: that key was a V2 spelling
+            // and migrates into a peer group, so naming it would send an
+            // operator whose reply bounced to configure something that no
+            // longer exists.
+            text.push_str("\n\n");
+            text.push_str(&i18n::get_required_cli_string(
+                "channel-approval-group-visibility-warning",
+            ));
+        }
+
+        if let Err(e) = self
+            .send_approval_prompt(&SendMessage::new(text, recipient))
+            .await
+        {
+            // Never leave a token pending for a prompt that was never
+            // delivered; it would sit until the timeout and deny anyway, but
+            // with no operator ever having seen it.
+            //
+            // Removal is generation-checked rather than by token alone. A
+            // resolver can take this entry out while this branch is still in
+            // flight, and a later request can then reserve the same
+            // six-character code, at which point an unconditional remove here
+            // would delete that unrelated request instead of ours.
+            remove_pending_approval_if_matches(&token, guard.registration_id).await;
+            guard.disarm();
+            return Err(e);
+        }
+
+        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
+        let response = match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(response)) => response,
+            // Timed out, or the sender was dropped. Either way deny, and drop
+            // the token so a later reply cannot resolve a dead request.
+            _ => {
+                // Generation-checked for the same reason as the send-error
+                // branch above: by the time this fires, the entry may already
+                // belong to a different request that reused the code.
+                remove_pending_approval_if_matches(&token, guard.registration_id).await;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "tool": request.tool_name,
+                            "timeout_secs": self.approval_timeout_secs,
+                        })),
+                    "approval request denied: no reply before approval_timeout_secs"
+                );
+                ChannelApprovalResponse::Deny
+            }
+        };
+        // Both arms above reached a decision through a normal path and own their
+        // own removal, so the guard has nothing left to clean up. Disarming only
+        // HERE is deliberate: every path that skips this line is a path where
+        // the entry would otherwise be orphaned, which is exactly what the
+        // guard exists to cover.
+        guard.disarm();
+        Ok(Some(response))
+    }
 }
 
 // Stub implementation when feature is not enabled
@@ -1778,6 +3279,277 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn clear_persisted_session_removes_db_triple_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("session.db");
+        let db_str = db.to_string_lossy().into_owned();
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(format!("{db_str}-wal"), b"wal").unwrap();
+        std::fs::write(format!("{db_str}-shm"), b"shm").unwrap();
+
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert_eq!(removed.len(), 3);
+        for path in WhatsAppWebChannel::session_file_paths(&db_str) {
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} must be removed"
+            );
+        }
+
+        // Relinking an already unpaired channel is a safe no-op that
+        // must not create the database.
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert!(removed.is_empty());
+        assert!(!db.exists());
+
+        // Empty session_path (channel saved without one) clears nothing.
+        assert!(
+            WhatsAppWebChannel::clear_persisted_session("")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_markers_reuse_shared_parser_kinds() {
+        let (cleaned, raw) = super::super::util::parse_attachment_markers(
+            "send [IMAGE:photo.png] [DOCUMENT:report.pdf] [VOICE:voice.ogg]",
+        );
+        let markers = raw
+            .into_iter()
+            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
+            .collect::<Vec<_>>();
+
+        assert_eq!(cleaned, "send");
+        assert_eq!(
+            markers
+                .iter()
+                .map(|marker| match marker {
+                    WhatsAppMarker::Media(m) => m.kind,
+                    WhatsAppMarker::Location(_) => panic!("expected media markers"),
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                WhatsAppMediaKind::Image,
+                WhatsAppMediaKind::Document,
+                WhatsAppMediaKind::Voice
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn from_shared_marker_routes_location_kind() {
+        let marker = WhatsAppMarker::from_shared_marker(
+            "LOCATION".to_string(),
+            "40.7128,-74.0060".to_string(),
+        );
+        assert!(matches!(marker, Some(WhatsAppMarker::Location(_))));
+        // An invalid target still routes to the Location variant: validation
+        // is deferred to the send path so the marker counts as a failed
+        // delivery instead of being stripped silently.
+        assert_eq!(
+            WhatsAppMarker::from_shared_marker("LOCATION".to_string(), "999,999".to_string()),
+            Some(WhatsAppMarker::Location("999,999".to_string()))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_location_target_refuses_invalid_coordinates() {
+        // Out-of-range and malformed targets are refused — the send loop
+        // counts these as failed deliveries rather than sending a bogus pin.
+        for target in ["999,999", "not-a-number,0.0", "40.7128", ""] {
+            let err = validate_whatsapp_location_target(target)
+                .expect_err("out-of-range or malformed target must be refused");
+            assert_eq!(err.kind(), WhatsAppMarkerFailure::Refused, "{target}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowed_groups_empty_permits_all() {
+        // Empty list is the default: every group passes (no behavior change).
+        assert!(super::is_group_chat_allowed("123456789012345@g.us", &[]));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_accepts_workspace_relative_file() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let file = workspace.path().join("photo.png");
+        std::fs::write(&file, b"png").expect("write fixture");
+
+        let resolved =
+            validate_whatsapp_marker_target("photo.png", Some(workspace.path())).expect("inside");
+
+        assert_eq!(resolved, file.canonicalize().expect("canonical fixture"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowed_groups_full_jid_match() {
+        let groups = vec!["123456789012345@g.us".to_string()];
+        assert!(super::is_group_chat_allowed(
+            "123456789012345@g.us",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+
+        let err = validate_whatsapp_marker_target(
+            outside.path().to_str().expect("utf8 path"),
+            Some(workspace.path()),
+        )
+        .expect_err("outside workspace must be refused");
+
+        assert_eq!(err.kind(), WhatsAppMarkerFailure::Refused);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowed_groups_jid_prefix_match() {
+        let groups = vec!["123456789012345".to_string()];
+        assert!(super::is_group_chat_allowed(
+            "123456789012345@g.us",
+            &groups
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_rejects_without_workspace() {
+        let err = validate_whatsapp_marker_target("photo.png", None)
+            .expect_err("workspace is required for local marker reads");
+
+        assert_eq!(err.kind(), WhatsAppMarkerFailure::Refused);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowed_groups_no_match_drops() {
+        let groups = vec!["123456789012345".to_string()];
+        assert!(!super::is_group_chat_allowed(
+            "999999999999999@g.us",
+            &groups
+        ));
+        // Blank / whitespace-only entries never match.
+        assert!(!super::is_group_chat_allowed(
+            "123@g.us",
+            &["   ".to_string()]
+        ));
+        // Prefix entries match the user part EXACTLY, not as a string prefix:
+        // "123" must admit "123@g.us" but never "123999@g.us".
+        assert!(super::is_group_chat_allowed(
+            "123@g.us",
+            &["123".to_string()]
+        ));
+        assert!(!super::is_group_chat_allowed(
+            "123999@g.us",
+            &["123".to_string()]
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_marks_missing_as_failed() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        let err = validate_whatsapp_marker_target("missing.png", Some(workspace.path()))
+            .expect_err("missing file should fail delivery");
+
+        assert_eq!(err.kind(), WhatsAppMarkerFailure::Failed);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn delivery_failure_note_is_count_only() {
+        let count: usize = 2;
+        let note = whatsapp_delivery_failure_note(count).expect("note");
+
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English phrase used to live here but the assertion would break
+        // on any CI runner with a non-English `$LANG`.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(count.to_string().as_str()),
+            "note must contain the failure count"
+        );
+        assert!(!note.contains("/"), "note must not contain path separators");
+        assert!(
+            !note.contains("workspace"),
+            "note must not echo local marker targets"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_marker_uses_opus_mime_for_ogg_family() {
+        assert_eq!(
+            WhatsAppMediaKind::Voice.mime_for_path(Path::new("voice.ogg")),
+            "audio/ogg; codecs=opus"
+        );
+        assert_eq!(
+            WhatsAppMediaKind::Audio.mime_for_path(Path::new("voice.ogg")),
+            "audio/ogg"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowed_groups_dm_bypasses_filter() {
+        // DMs bypass: the call site gates on `is_group`, so a direct message
+        // is admitted even when a non-empty allowed_groups would not match it.
+        let groups = vec!["123456789012345".to_string()];
+        let is_group = false;
+        let dm_jid = "987654321098765@s.whatsapp.net";
+        let admitted = !is_group || super::is_group_chat_allowed(dm_jid, &groups);
+        assert!(admitted);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passive_group_context_is_default_off_and_group_only() {
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            false, true, false
+        ));
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            true, false, false
+        ));
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            true, true, true
+        ));
+        assert!(WhatsAppWebChannel::should_record_passive_group_context(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passive_group_context_uses_reply_target_scope_for_groups() {
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(false, true),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(true, false),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(true, true),
+            ChannelConversationScope::ReplyTarget
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_channel_name() {
         let mention_only = false;
         let self_chat_mode = false;
@@ -1792,6 +3564,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(ch.name(), "whatsapp");
     }
@@ -1812,6 +3585,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(!ch.is_number_allowed("+9876543210"));
@@ -1833,6 +3607,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["*".into()]),
+            Arc::new(Vec::new),
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
@@ -1850,7 +3625,12 @@ mod tests {
             self_chat_mode,
             ..Default::default()
         };
-        let ch = WhatsAppWebChannel::new(&cfg, "whatsapp_web_test_alias", Arc::new(Vec::new));
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
@@ -1871,6 +3651,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(ch.normalize_phone("1234567890"), "+1234567890");
     }
@@ -1891,6 +3672,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(ch.normalize_phone("+1234567890"), "+1234567890");
     }
@@ -1911,6 +3693,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(
             ch.normalize_phone("1234567890@s.whatsapp.net"),
@@ -1989,13 +3772,6 @@ mod tests {
         );
     }
 
-    // ── lid_rejection_diagnostic: scoped LID warning ────
-    //
-    // The diagnostic fires only inside the `Allowlist::normalized.is_none()`
-    // branch. These tests pin the three shapes the function returns; the
-    // call-site composition (suffix appended to the rejection log) is
-    // covered by reading the surrounding code path.
-
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn lid_rejection_diagnostic_empty_for_non_lid_sender() {
@@ -2060,8 +3836,230 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert!(!ch.health_check().await);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[derive(Default)]
+    struct TestCacheStore {
+        entries: tokio::sync::RwLock<std::collections::HashMap<(String, String), Vec<u8>>>,
+        changed: tokio::sync::Notify,
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    impl TestCacheStore {
+        async fn contains(&self, namespace: &str, key: &str) -> bool {
+            self.entries
+                .read()
+                .await
+                .contains_key(&(namespace.to_string(), key.to_string()))
+        }
+
+        async fn wait_until_present(&self, namespace: &str, key: &str) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let changed = self.changed.notified();
+                    if self.contains(namespace, key).await {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("client cache warm-up must complete");
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[async_trait::async_trait]
+    impl wacore::store::CacheStore for TestCacheStore {
+        async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self
+                .entries
+                .read()
+                .await
+                .get(&(namespace.to_string(), key.to_string()))
+                .cloned())
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: &[u8],
+            _ttl: Option<std::time::Duration>,
+        ) -> anyhow::Result<()> {
+            self.entries
+                .write()
+                .await
+                .insert((namespace.to_string(), key.to_string()), value.to_vec());
+            self.changed.notify_waiters();
+            Ok(())
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+            self.entries
+                .write()
+                .await
+                .remove(&(namespace.to_string(), key.to_string()));
+            Ok(())
+        }
+
+        async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+            self.entries
+                .write()
+                .await
+                .retain(|(entry_namespace, _), _| entry_namespace != namespace);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_client_persistent_lid_mapping_drives_allowlist() {
+        use wacore::store::CacheStore;
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+        use wacore::types::events::Event;
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust::{CacheConfig, CacheStores, TokioRuntime};
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+
+        const LID_NAMESPACE: &str = "lid_pn_by_lid";
+        const PN_NAMESPACE: &str = "lid_pn_by_pn";
+        const SENTINEL_LID: &str = "37207519834000";
+        const SENTINEL_PHONE: &str = "15550000000";
+        const ALLOWED_LID: &str = "37207519834264";
+        const WRONG_LID: &str = "37207519834265";
+        const MISSING_LID: &str = "37207519834266";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        ProtocolStore::put_lid_mapping(
+            &*store,
+            &LidPnMappingEntry {
+                lid: SENTINEL_LID.to_string(),
+                phone_number: SENTINEL_PHONE.to_string(),
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_000,
+                learning_source: "usync".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let cache = Arc::new(TestCacheStore::default());
+        let bot = Bot::builder()
+            .with_backend(store.clone())
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .with_cache_config(CacheConfig {
+                cache_stores: CacheStores {
+                    lid_pn_cache: Some(cache.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        cache.wait_until_present(LID_NAMESPACE, SENTINEL_LID).await;
+        cache.wait_until_present(PN_NAMESPACE, SENTINEL_PHONE).await;
+        cache.clear(LID_NAMESPACE).await.unwrap();
+        cache.clear(PN_NAMESPACE).await.unwrap();
+
+        for (lid, phone) in [(ALLOWED_LID, "15551234567"), (WRONG_LID, "15550001111")] {
+            ProtocolStore::put_lid_mapping(
+                &*store,
+                &LidPnMappingEntry {
+                    lid: lid.to_string(),
+                    phone_number: phone.to_string(),
+                    created_at: 1_700_000_100,
+                    updated_at: 1_700_000_100,
+                    learning_source: "usync".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!cache.contains(LID_NAMESPACE, lid).await);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new("persistent-lid-test".to_string()),
+            peer_resolver: Arc::new(|| vec!["+15551234567".to_string()]),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: zeroclaw_config::schema::WhatsAppWebMode::Personal,
+            dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            group_policy: zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        let message_event = |lid: &str| {
+            Event::Message(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some("persistent LID mapping".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: Jid::lid(lid),
+                        sender: Jid::lid(lid),
+                        is_from_me: false,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("lid-test-{lid}"),
+                    r#type: "text".to_string(),
+                    push_name: "LID Test Sender".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let accepted_event = message_event(ALLOWED_LID);
+        WhatsAppWebChannel::handle_inbound_message_event(&accepted_event, &client, &context).await;
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("allowed mapped sender must reach shared dispatch")
+            .expect("shared dispatch sender must remain open");
+        assert_eq!(dispatched.sender, "+15551234567");
+        assert_eq!(dispatched.content, "persistent LID mapping");
+        assert!(cache.contains(LID_NAMESPACE, ALLOWED_LID).await);
+
+        let wrong_event = message_event(WRONG_LID);
+        WhatsAppWebChannel::handle_inbound_message_event(&wrong_event, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "mapped phone outside the allowlist must not dispatch"
+        );
+
+        let missing_event = message_event(MISSING_LID);
+        WhatsAppWebChannel::handle_inbound_message_event(&missing_event, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "missing persistent mapping must fail closed before dispatch"
+        );
     }
 
     // ── Reconnect retry state machine tests (exercise production helpers) ──
@@ -2169,6 +4167,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         )
         .with_transcription(tc);
         assert!(ch.transcription.is_some());
@@ -2192,6 +4191,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         )
         .with_transcription(tc);
         assert!(ch.transcription.is_none());
@@ -2234,6 +4234,43 @@ mod tests {
                     ..Default::default()
                 },
             )),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn sticker_reply(
+        participant: &str,
+        quoted_message: Option<waproto::whatsapp::Message>,
+    ) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            sticker_message: Some(Box::new(waproto::whatsapp::message::StickerMessage {
+                mimetype: Some("image/webp".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    participant: Some(participant.to_string()),
+                    quoted_message: quoted_message.map(Box::new),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn image_mention(mentioned_jids: &[&str]) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/jpeg".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    mentioned_jid: mentioned_jids
+                        .iter()
+                        .map(|jid| (*jid).to_string())
+                        .collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
             ..Default::default()
         }
     }
@@ -2387,6 +4424,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn extract_mentioned_jids_reads_media_context_info() {
+        let msg = image_mention(&["100@s.whatsapp.net"]);
+        assert_eq!(
+            WhatsAppWebChannel::extract_mentioned_jids(&msg),
+            vec!["100@s.whatsapp.net".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn message_addressed_to_bot_accepts_reply_to_phone_jid() {
         let msg = extended_text_reply("100@s.whatsapp.net", &[]);
         assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
@@ -2407,6 +4454,142 @@ mod tests {
             "100",
             Some("200"),
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_media_reply_to_lid_jid() {
+        let msg = sticker_reply("200@lid", None);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "[Sticker]",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message_reads_media_context_info() {
+        let quoted = waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/png".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let msg = sticker_reply("200@lid", Some(quoted));
+        let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
+            .expect("sticker reply should expose the quoted message");
+        assert!(quoted.image_message.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_keeps_sticker_messages_addressable() {
+        let msg = sticker_reply("200@lid", None);
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Sticker]"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content("hello".to_string(), &msg),
+            "hello"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_leaves_non_media_messages_empty() {
+        let msg = waproto::whatsapp::Message::default();
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_parses_static_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                name: Some("NYC".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Location: 40.712800, -74.006000 — NYC]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_live_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                is_live: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_missing_coordinates() {
+        // Missing longitude — should silently drop, not fabricate 0,0
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: None,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+        // Missing latitude
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: None,
+                degrees_longitude: Some(-74.0060),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension_uses_safe_subtype() {
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("image/jpeg; name=photo", "jpg"),
+            "jpg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("application/vnd.ms-excel", "bin"),
+            "vnd.ms-excel"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("image/../../png", "bin"),
+            "bin"
+        );
     }
 
     #[test]
@@ -2450,6 +4633,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["*".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
         assert_eq!(*ch.bot_lid.lock(), None);
@@ -2471,6 +4655,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["*".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(*ch.bot_phone.lock(), None);
     }
@@ -2604,5 +4789,1310 @@ mod tests {
         assert!(!fromme_outside_self_chat_is_operator_trigger(
             false, &dm, &group, ""
         ));
+    }
+
+    // -- request_approval on WhatsApp Web --
+    //
+    // These drive the decision helpers directly rather than a live socket,
+    // because the authorization and lifecycle gates are the behavior under
+    // test.
+
+    #[cfg(feature = "whatsapp-web")]
+    fn approval_cfg(approval_timeout_secs: u64) -> zeroclaw_config::schema::WhatsAppConfig {
+        zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp-approval.db".into()),
+            approval_timeout_secs,
+            ..Default::default()
+        }
+    }
+
+    /// Park a token bound to `chat` under the default test alias.
+    #[cfg(feature = "whatsapp-web")]
+    async fn park_token(
+        token: &str,
+        chat: &str,
+        is_group: bool,
+    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+        park_token_as("default", token, chat, is_group).await
+    }
+
+    /// Park a token bound to a NAMED alias, for the cross-alias cases.
+    #[cfg(feature = "whatsapp-web")]
+    async fn park_token_as(
+        alias: &str,
+        token: &str,
+        chat: &str,
+        is_group: bool,
+    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+        let (responder, rx) = tokio::sync::oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            token.to_string(),
+            PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                responder,
+                binding: ApprovalBinding {
+                    alias: alias.to_string(),
+                    chat: chat.to_string(),
+                    is_group,
+                },
+            },
+        );
+        rx
+    }
+
+    /// Drives the send-error branch of `request_approval` for real, rather than
+    /// calling the cleanup helper directly. A channel with no vendor client
+    /// fails `send` deterministically, which is the one production exit that
+    /// needs no cancellation and no reply to reach.
+    ///
+    /// WHAT IT DOES NOT COVER, stated first because the obvious reading is
+    /// wrong. This does NOT demonstrate the generation-scoped cleanup that the
+    /// same branch uses. It cannot: `request_approval` mints its own random
+    /// token, which never collides with the sentinel parked below, so an
+    /// unconditional `remove` of the generated token leaves the sentinel alone
+    /// too. Checked rather than assumed, by reverting the branch to the
+    /// unconditional removal and re-running this test, which still passed.
+    /// Proving that scoping needs the entry replaced while the branch is in
+    /// flight, which is what
+    /// [`send_error_cleanup_leaves_a_reused_token_alone`] does through the
+    /// send hook. The two are kept separate because they pin different things
+    /// and fail for different reasons.
+    ///
+    /// What it DOES pin is narrower and real: the send-error path is reachable
+    /// and terminates. A channel with no vendor client fails `send`
+    /// deterministically, so this drives the one production exit that needs
+    /// neither a reply nor a cancellation, and asserts the caller gets that
+    /// error back rather than a hang or a silent approval.
+    ///
+    /// It deliberately makes no assertion about the map's size or key set.
+    /// These tests share one process-global map and run in parallel, so a
+    /// whole-map assertion would be racing every other approval test.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn request_approval_surfaces_a_send_failure_to_the_caller() {
+        let sentinel = "snt001";
+        let sentinel_id = uuid::Uuid::new_v4();
+        let (responder, _keep_alive) = tokio::sync::oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            sentinel.to_string(),
+            PendingApproval {
+                registration_id: sentinel_id,
+                responder,
+                binding: ApprovalBinding {
+                    alias: "alias-a".to_string(),
+                    chat: "1@s.whatsapp.net".to_string(),
+                    is_group: false,
+                },
+            },
+        );
+
+        let cfg = zeroclaw_config::schema::WhatsAppConfig::default();
+        let channel =
+            WhatsAppWebChannel::new(&cfg, "alias-a", Arc::new(Vec::new), Arc::new(Vec::new));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            raw_arguments: None,
+        };
+
+        let err = channel
+            .request_approval("1@s.whatsapp.net", &request)
+            .await
+            .expect_err("a channel with no client must fail at send");
+        assert!(
+            err.to_string().contains("not connected"),
+            "fixture must fail at the send, not somewhere earlier: {err}"
+        );
+
+        let pending = PENDING_APPROVALS.lock().await;
+        let entry = pending
+            .get(sentinel)
+            .expect("the send-error branch removed an unrelated registration");
+        assert_eq!(
+            entry.registration_id, sentinel_id,
+            "the unrelated registration must be the original one, not a replacement"
+        );
+        drop(pending);
+        PENDING_APPROVALS.lock().await.remove(sentinel);
+    }
+
+    /// The approval prompt's prose comes from the Fluent catalogue, in BOTH
+    /// the direct-chat and the group shape.
+    ///
+    /// Driven through the real `request_approval` -> `send_approval_prompt`
+    /// seam rather than by rebuilding the string here, so it pins the text an
+    /// operator actually receives. The send hook returns `Err`, which lands
+    /// `request_approval` on its send-error branch: that exit needs neither a
+    /// reply nor the timeout clock, and it removes its own token on the way
+    /// out.
+    ///
+    /// Every catalogue lookup is also asserted NOT to be the missing-string
+    /// sentinel. Without that the test would pass vacuously on a typo'd or
+    /// undefined key, because `get_required_cli_string` falls back to
+    /// `{key}` and the production text and the expected text would then agree
+    /// on that same sentinel while the operator saw a raw key.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_prompt_prose_comes_from_the_catalogue_in_both_chat_shapes() {
+        async fn capture_prompt(recipient: &str) -> String {
+            let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+            let recorder = Arc::clone(&seen);
+            let channel = WhatsAppWebChannel::new(
+                &zeroclaw_config::schema::WhatsAppConfig::default(),
+                "alias-prompt",
+                Arc::new(Vec::new),
+                Arc::new(Vec::new),
+            )
+            .with_approval_send_hook(Arc::new(move |message: SendMessage| {
+                let recorder = Arc::clone(&recorder);
+                Box::pin(async move {
+                    *recorder.lock().unwrap() = Some(message.content.clone());
+                    Err(anyhow::Error::msg("send refused by the test hook"))
+                })
+            }));
+
+            let request = ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: "ls -la".to_string(),
+                raw_arguments: None,
+            };
+            channel
+                .request_approval(recipient, &request)
+                .await
+                .expect_err("the hook refuses the send, so the call must surface that error");
+
+            let captured = seen.lock().unwrap().clone();
+            captured.expect("request_approval must send a prompt before it fails")
+        }
+
+        fn token_of(prompt: &str) -> String {
+            prompt
+                .split_once('[')
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(token, _)| token.to_string())
+                .expect("the prompt must carry its token in brackets")
+        }
+
+        let catalogue = |key: &str| {
+            let value = i18n::get_required_cli_string(key);
+            assert_ne!(
+                value,
+                format!("{{{key}}}"),
+                "{key} resolves to the missing-string sentinel, so this test would pass vacuously"
+            );
+            value
+        };
+
+        let heading = catalogue("channel-approval-heading-shout");
+        let tool_label = catalogue("channel-approval-tool-label");
+        let args_label = catalogue("channel-approval-args-label");
+        let group_warning = catalogue("channel-approval-group-visibility-warning");
+
+        // Direct chat: catalogue prose, verbatim tool and args, and no group
+        // warning, because nobody else can read this token.
+        let dm = capture_prompt("1@s.whatsapp.net").await;
+        for part in [&heading, &tool_label, &args_label] {
+            assert!(
+                dm.contains(part.as_str()),
+                "the direct-chat prompt lost {part:?}: {dm:?}"
+            );
+        }
+        assert!(
+            dm.contains("shell") && dm.contains("ls -la"),
+            "the prompt must echo the tool name and args verbatim: {dm:?}"
+        );
+        assert!(
+            !dm.contains(group_warning.as_str()),
+            "a direct chat must not carry the group visibility warning: {dm:?}"
+        );
+
+        // Exact, not `contains`: this transport must emit the SHARED builder's
+        // output rather than a look-alike of its own. A hand-rolled prompt that
+        // happens to match today's English would drift the moment the
+        // catalogue text changes, and `contains` would not notice.
+        let dm_token = token_of(&dm);
+        assert_eq!(
+            dm,
+            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la"),
+            "the direct-chat prompt must be exactly what the shared builder produces"
+        );
+
+        // Group chat: the same prose plus the warning, because the token is
+        // now readable by every member of the group.
+        let group = capture_prompt("120363000000000000@g.us").await;
+        for part in [&heading, &tool_label, &args_label, &group_warning] {
+            assert!(
+                group.contains(part.as_str()),
+                "the group prompt lost {part:?}: {group:?}"
+            );
+        }
+        let group_token = token_of(&group);
+        assert_eq!(
+            group,
+            format!(
+                "{}\n\n{group_warning}",
+                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la")
+            ),
+            "the group prompt must be the shared builder's output plus exactly one warning"
+        );
+
+        // The protocol half. Whatever the catalogue says, the reply keywords
+        // embedded in the prompt must remain the literal ASCII words that
+        // `parse_approval_reply` reads, or a localized prompt would instruct
+        // the operator to send something the parser cannot decode.
+        for prompt in [&dm, &group] {
+            let token = token_of(prompt);
+            for (word, expected) in [
+                ("yes", ChannelApprovalResponse::Approve),
+                ("no", ChannelApprovalResponse::Deny),
+                ("always", ChannelApprovalResponse::AlwaysApprove),
+            ] {
+                let reply = format!("{token} {word}");
+                assert!(
+                    prompt.contains(&reply),
+                    "the prompt must show the exact reply {reply:?}: {prompt:?}"
+                );
+                let (parsed, response) = crate::util::parse_approval_reply(&reply)
+                    .unwrap_or_else(|| panic!("{reply:?} must parse"));
+                assert_eq!(parsed, token);
+                assert_eq!(response, expected);
+            }
+        }
+
+        // The group warning has to name BOTH things a group member can read.
+        // The token is the obvious one, and the one the warning used to stop
+        // at. The arguments are the other: `arguments_summary` is rendered
+        // verbatim into the prompt, so posting an approval into a group
+        // publishes the command line to every member. An operator deciding
+        // whether to approve in a group needs that stated rather than
+        // inferred from the fact that the args happen to be printed above.
+        //
+        // Read in English deliberately. This binary never initialises the
+        // i18n locale, so the in-crate English catalogue is what resolves,
+        // and the neighbouring-key assert names a locale change as the cause
+        // rather than letting it read as a deleted disclosure.
+        assert_eq!(
+            i18n::get_required_cli_string("channel-approval-args-label"),
+            "Args",
+            "this assertion reads the English catalogue, and a different one resolved"
+        );
+        assert!(
+            group_warning.to_lowercase().contains("arguments"),
+            "the group warning must disclose that the tool arguments are visible to every \
+             member, not only the reply code: {group_warning:?}"
+        );
+        assert!(
+            group.contains("ls -la"),
+            "the group prompt must carry the arguments the warning discloses: {group:?}"
+        );
+    }
+
+    /// No runtime assertion can catch a prompt that reverts to a hardcoded
+    /// English string, so this one reads the source instead.
+    ///
+    /// Under the `en` locale a correct literal renders byte-identically to what
+    /// the catalogue produces, so every assertion above passes against it. The
+    /// key-scanning guard in `util.rs` does not close that gap either: it finds
+    /// a key that is still referenced but misspelled, while a reverted prompt
+    /// stops referencing the key at all.
+    ///
+    /// Splitting on the test module is what makes this checkable, since the
+    /// needles below have to appear here in order to be searched for.
+    #[test]
+    fn production_carries_no_approval_prose_literal() {
+        const SRC: &str = include_str!("whatsapp_web.rs");
+        const TEST_MODULE: &str = "\n#[cfg(test)]\nmod tests {";
+
+        let (production, tests) = SRC
+            .split_once(TEST_MODULE)
+            .expect("the test module marker moved, so this guard searched the wrong text");
+        assert!(
+            !tests.is_empty(),
+            "the split produced an empty test half, so the marker matched something unintended"
+        );
+
+        for prose in ["APPROVAL REQUIRED", "Tool: {}", "so everyone here can see"] {
+            assert!(
+                !production.contains(prose),
+                "approval prose {prose:?} is hardcoded in production code; it belongs in the \
+                 Fluent catalogue so that every locale moves with it"
+            );
+        }
+    }
+
+    /// The approval-reply interception, driven through the real inbound
+    /// handler rather than by calling the resolver directly.
+    ///
+    /// This is the one piece of the approval path that lives in the shared
+    /// message handler instead of in a helper, which makes it the piece a
+    /// refactor of that handler can silently drop: every resolver-level test
+    /// in this file would still pass with the interception deleted, because
+    /// they call the resolver themselves. This calls
+    /// `handle_inbound_message_event`, which is what the live listener calls.
+    ///
+    /// It pins BOTH halves of the contract, because either alone is passable
+    /// with the interception broken: the decision must reach the waiting
+    /// request, AND the reply must not also travel on as conversation, since
+    /// an approval reply is a control message.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_is_intercepted_by_the_inbound_handler() {
+        use wacore::types::events::Event;
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+
+        const SENDER_PHONE: &str = "15551234567";
+        let chat = Jid::pn(SENDER_PHONE).to_string();
+        let alias = "approval-interception-test";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend(store.clone())
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        // A real pending request, registered the way `request_approval` does.
+        let PendingApprovalRegistration {
+            token,
+            receiver,
+            mut guard,
+            ..
+        } = register_pending_approval(ApprovalBinding {
+            alias: alias.to_string(),
+            chat: chat.clone(),
+            is_group: false,
+        })
+        .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new(alias.to_string()),
+            peer_resolver: Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: zeroclaw_config::schema::WhatsAppWebMode::Personal,
+            dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            group_policy: zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+
+        let reply_event = Event::Message(
+            Arc::new(waproto::whatsapp::Message {
+                conversation: Some(format!("{token} yes")),
+                ..Default::default()
+            }),
+            Arc::new(MessageInfo {
+                source: MessageSource {
+                    chat: Jid::pn(SENDER_PHONE),
+                    sender: Jid::pn(SENDER_PHONE),
+                    is_from_me: false,
+                    is_group: false,
+                    ..Default::default()
+                },
+                id: "approval-interception".to_string(),
+                r#type: "text".to_string(),
+                push_name: "Approval Replier".to_string(),
+                timestamp: chrono::Utc::now(),
+                ..Default::default()
+            }),
+        );
+
+        WhatsAppWebChannel::handle_inbound_message_event(&reply_event, &client, &context).await;
+
+        let decision = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+            .await
+            .expect("the interception must resolve the pending approval")
+            .expect("the approval sender must still be live");
+        assert_eq!(
+            decision,
+            ChannelApprovalResponse::Approve,
+            "a `<token> yes` reply must approve the pending request"
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "an approval reply is a control message and must not also dispatch as conversation"
+        );
+
+        // The interception already removed the entry, so the guard has nothing
+        // left to clean up.
+        guard.disarm();
+    }
+
+    /// Every ordinary decision, driven from `request_approval` all the way
+    /// through the production inbound boundary and back to the waiting caller.
+    ///
+    /// The test above starts at a hand-registered token, which leaves the first
+    /// half of the round trip unexercised: nothing checks that the prompt
+    /// `request_approval` actually sends carries a token the listener can read,
+    /// nor that the decision the listener delivers is the one the waiting trait
+    /// call returns. Every other approval test in this file either parks a
+    /// token itself or calls the resolver itself, so the two halves are only
+    /// ever proven separately, and a listener that derived the wrong alias,
+    /// chat or authorization signal would leave all of them green.
+    ///
+    /// The send hook is the join. It runs inside `request_approval`, after the
+    /// token is registered and while the caller is about to wait, so it is the
+    /// only place a test can read this request's real token and then answer it
+    /// the way a person would.
+    ///
+    /// `always` matters as much as `yes` here: the interception decodes the
+    /// keyword, and a parser that collapsed `always` into a plain approve would
+    /// silently downgrade a blanket grant. `no` is the one that needs the outer
+    /// deadline below, because a timed-out request ALSO denies. Without a guard
+    /// shorter than `approval_timeout_secs`, a completely broken interception
+    /// would return `Deny` after 300s and the `no` case would pass for the
+    /// wrong reason.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn every_decision_round_trips_from_the_send_seam_through_interception() {
+        use wacore::types::events::Event;
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+
+        const SENDER_PHONE: &str = "15557654321";
+        let chat = Jid::pn(SENDER_PHONE).to_string();
+        let alias = "approval-round-trip-test";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend(store.clone())
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new(alias.to_string()),
+            peer_resolver: Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: zeroclaw_config::schema::WhatsAppWebMode::Personal,
+            dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            group_policy: zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+
+        for (word, expected) in [
+            ("yes", ChannelApprovalResponse::Approve),
+            ("no", ChannelApprovalResponse::Deny),
+            ("always", ChannelApprovalResponse::AlwaysApprove),
+        ] {
+            // The hook publishes this request's real token the moment the
+            // prompt "sends", which is what lets the reply below be a genuine
+            // answer to it rather than a token the test chose.
+            let (token_tx, mut token_rx) = tokio::sync::mpsc::channel::<String>(1);
+            let channel = WhatsAppWebChannel::new(
+                &zeroclaw_config::schema::WhatsAppConfig::default(),
+                alias,
+                Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
+                Arc::new(Vec::new),
+            )
+            .with_approval_send_hook(Arc::new(move |message: SendMessage| {
+                let token_tx = token_tx.clone();
+                Box::pin(async move {
+                    let token = message
+                        .content
+                        .split_once('[')
+                        .and_then(|(_, rest)| rest.split_once(']'))
+                        .map(|(token, _)| token.to_string())
+                        .expect("the prompt must carry its token in brackets");
+                    token_tx
+                        .send(token)
+                        .await
+                        .expect("the driver must still be waiting for the token");
+                    // Delivered. Control reaches the wait, which is where the
+                    // inbound reply has to find it.
+                    Ok(())
+                })
+            }));
+
+            let request = ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: format!("echo {word}"),
+                raw_arguments: None,
+            };
+
+            let asking = channel.request_approval(&chat, &request);
+
+            let replying = async {
+                let token = token_rx
+                    .recv()
+                    .await
+                    .expect("the send hook must publish the token before the wait");
+                let reply_event = Event::Message(
+                    Arc::new(waproto::whatsapp::Message {
+                        conversation: Some(format!("{token} {word}")),
+                        ..Default::default()
+                    }),
+                    Arc::new(MessageInfo {
+                        source: MessageSource {
+                            chat: Jid::pn(SENDER_PHONE),
+                            sender: Jid::pn(SENDER_PHONE),
+                            is_from_me: false,
+                            is_group: false,
+                            ..Default::default()
+                        },
+                        id: format!("approval-round-trip-{word}"),
+                        r#type: "text".to_string(),
+                        push_name: "Approval Replier".to_string(),
+                        timestamp: chrono::Utc::now(),
+                        ..Default::default()
+                    }),
+                );
+                WhatsAppWebChannel::handle_inbound_message_event(&reply_event, &client, &context)
+                    .await;
+                token
+            };
+
+            // Shorter than `approval_timeout_secs`, on purpose. See the note
+            // above about `no`: this deadline is what separates "the reply was
+            // delivered" from "nobody answered and the timeout denied".
+            let (decision, token) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(asking, replying)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the {word:?} reply never reached the waiting request; a decision that \
+                     arrives through interception resolves in milliseconds, so this deadline \
+                     means the inbound boundary dropped it"
+                    )
+                });
+
+            assert_eq!(
+                decision.expect("a delivered decision must not surface as an error"),
+                Some(expected.clone()),
+                "a `<token> {word}` reply must resolve the waiting request to {expected:?}"
+            );
+
+            assert!(
+                !PENDING_APPROVALS.lock().await.contains_key(&token),
+                "a resolved request must leave no entry behind for a later reply to hit"
+            );
+
+            // Deterministic rather than timed: `handle_inbound_message_event`
+            // is awaited to completion above, so anything it dispatched is
+            // already queued by now.
+            assert!(
+                rx.try_recv().is_err(),
+                "an approval reply is a control message and must not also dispatch as \
+                 conversation"
+            );
+        }
+    }
+
+    /// The send-error branch's generation check, proven from outside.
+    ///
+    /// Scoping is only observable when the entry under THIS request's token is
+    /// replaced while the branch is in flight, which is the race the check
+    /// exists for: a resolver takes this registration out, a later request
+    /// reserves the same six-character code, and an unconditional `remove`
+    /// here would delete that unrelated request instead of ours.
+    ///
+    /// The send hook is what makes the replacement reachable. It runs after
+    /// the token is registered and before any cleanup, which is the only
+    /// window in which the map holds this request's entry untouched. Reverting
+    /// the branch to `PENDING_APPROVALS.lock().await.remove(&token)` fails
+    /// this test at the `expect` below, which is the check it is here to pin.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_error_cleanup_leaves_a_reused_token_alone() {
+        // The registration a later request would hold after reusing the code.
+        let reuser_id = uuid::Uuid::new_v4();
+        let seen_token = Arc::new(std::sync::Mutex::new(None::<String>));
+        // Hold the replacement's receiver open for the length of the test, so
+        // the entry the cleanup must spare is a live one rather than a husk.
+        let reuser_receiver = Arc::new(std::sync::Mutex::new(None));
+
+        let recorder = Arc::clone(&seen_token);
+        let receiver_slot = Arc::clone(&reuser_receiver);
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "alias-a",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+        .with_approval_send_hook(Arc::new(move |message: SendMessage| {
+            let recorder = Arc::clone(&recorder);
+            let receiver_slot = Arc::clone(&receiver_slot);
+            Box::pin(async move {
+                let token = message
+                    .content
+                    .split_once('[')
+                    .and_then(|(_, rest)| rest.split_once(']'))
+                    .map(|(token, _)| token.to_string())
+                    .expect("the prompt must carry its token in brackets");
+
+                let (responder, receiver) = tokio::sync::oneshot::channel();
+                PENDING_APPROVALS.lock().await.insert(
+                    token.clone(),
+                    PendingApproval {
+                        registration_id: reuser_id,
+                        responder,
+                        binding: ApprovalBinding {
+                            alias: "alias-b".to_string(),
+                            chat: "2@s.whatsapp.net".to_string(),
+                            is_group: false,
+                        },
+                    },
+                );
+                *receiver_slot.lock().unwrap() = Some(receiver);
+                *recorder.lock().unwrap() = Some(token);
+
+                Err(anyhow::Error::msg("send refused by the test hook"))
+            })
+        }));
+
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            raw_arguments: None,
+        };
+        let err = channel
+            .request_approval("1@s.whatsapp.net", &request)
+            .await
+            .expect_err("the hook must fail the send");
+        assert!(
+            err.to_string().contains("send refused by the test hook"),
+            "the caller must get the send's own error, not a later one: {err}"
+        );
+
+        let token = seen_token
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the hook must have run");
+        let pending = PENDING_APPROVALS.lock().await;
+        let entry = pending.get(&token).expect(
+            "the send-error cleanup removed a token that a later request had already reserved",
+        );
+        assert_eq!(
+            entry.registration_id, reuser_id,
+            "the surviving entry must be the reusing registration, not ours"
+        );
+        drop(pending);
+        PENDING_APPROVALS.lock().await.remove(&token);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn cancelled_request_leaves_no_live_token() {
+        let registration = register_pending_approval(ApprovalBinding {
+            alias: "alias-a".into(),
+            chat: "1@s.whatsapp.net".into(),
+            is_group: false,
+        })
+        .await;
+        let token = registration.token.clone();
+        assert!(PENDING_APPROVALS.lock().await.contains_key(&token));
+
+        let request = zeroclaw_spawn::spawn!(async move {
+            let _registration = registration;
+            std::future::pending::<()>().await;
+        });
+        request.abort();
+        let _ = request.await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while PENDING_APPROVALS.lock().await.contains_key(&token) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a registered request must remove its token");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_to_dropped_receiver_is_refused() {
+        let receiver = park_token_as("alias-a", "aaa012", "1@s.whatsapp.net", false).await;
+        drop(receiver);
+
+        let out = resolve_approval_reply(
+            "aaa012",
+            ChannelApprovalResponse::Approve,
+            "alias-a",
+            "1@s.whatsapp.net",
+            true,
+        )
+        .await;
+        assert_eq!(out, Err(ApprovalRefusal::ReceiverGone));
+        assert!(!PENDING_APPROVALS.lock().await.contains_key("aaa012"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn stale_cleanup_does_not_remove_reused_token() {
+        let old_registration_id = uuid::Uuid::new_v4();
+        let current_registration_id = uuid::Uuid::new_v4();
+        let (responder, _receiver) = tokio::sync::oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            "aaa013".to_string(),
+            PendingApproval {
+                registration_id: current_registration_id,
+                responder,
+                binding: ApprovalBinding {
+                    alias: "default".into(),
+                    chat: "1@s.whatsapp.net".into(),
+                    is_group: false,
+                },
+            },
+        );
+
+        assert!(
+            !remove_pending_approval_if_matches("aaa013", old_registration_id).await,
+            "cleanup from an older registration must not remove a reused token"
+        );
+        assert_eq!(
+            PENDING_APPROVALS
+                .lock()
+                .await
+                .get("aaa013")
+                .map(|entry| entry.registration_id),
+            Some(current_registration_id)
+        );
+        PENDING_APPROVALS.lock().await.remove("aaa013");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn group_admission_is_rechecked_before_an_approval_reply_resolves() {
+        const GROUP: &str = "123@g.us";
+        let mut receiver = park_token("aaa011", GROUP, true).await;
+        let allowed_groups = Arc::new(parking_lot::RwLock::new(vec![GROUP.to_string()]));
+        let live_groups = Arc::clone(&allowed_groups);
+        let resolver = move || live_groups.read().clone();
+
+        *allowed_groups.write() = vec!["other@g.us".to_string()];
+        let refused = resolve_approval_reply_with_group_admission(
+            "aaa011",
+            ChannelApprovalResponse::Approve,
+            "default",
+            GROUP,
+            true,
+            true,
+            &resolver,
+        )
+        .await;
+        assert_eq!(refused, Err(ApprovalRefusal::GroupNoLongerAllowed));
+        assert!(receiver.try_recv().is_err());
+        assert!(PENDING_APPROVALS.lock().await.contains_key("aaa011"));
+
+        allowed_groups.write().push(GROUP.to_string());
+        let accepted = resolve_approval_reply_with_group_admission(
+            "aaa011",
+            ChannelApprovalResponse::Approve,
+            "default",
+            GROUP,
+            true,
+            true,
+            &resolver,
+        )
+        .await;
+        assert_eq!(accepted, Ok(()));
+        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    /// `PENDING_APPROVALS` is process-wide, so before the alias was part of the
+    /// binding this was a real authorization bypass rather than a tidiness
+    /// issue: the reply path resolves the authorized peers using whichever
+    /// instance received the reply. A responder alias A refuses could therefore
+    /// approve alias A's tool call by answering through alias B, because B's
+    /// allowlist decided. Two aliases sharing a group is a supported
+    /// configuration, which is why binding the chat alone did not close it.
+    ///
+    /// The second half is the part worth pinning: the refusal must leave the
+    /// request PENDING, so the legitimate operator can still answer. A refusal
+    /// that consumed the token would hand any bystander a way to cancel an
+    /// approval by replying to it badly.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_from_another_alias_is_refused() {
+        const SHARED_GROUP: &str = "shared-group@g.us";
+        let _rx = park_token_as("alias-a", "aaa010", SHARED_GROUP, true).await;
+
+        // Alias B replies, and B's OWN allowlist says this responder is fine.
+        // That is exactly the bypass: B's policy must not decide A's request.
+        let out = resolve_approval_reply(
+            "aaa010",
+            ChannelApprovalResponse::Approve,
+            "alias-b",
+            SHARED_GROUP,
+            true,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(ApprovalRefusal::ForeignAlias),
+            "alias B must not resolve alias A's token, even in a shared chat \
+             and even when B's own allowlist would admit the responder"
+        );
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key("aaa010"),
+            "a refused cross-alias reply must leave the request PENDING so the \
+             real operator can still answer it"
+        );
+
+        // The issuing alias still resolves it normally.
+        let out = resolve_approval_reply(
+            "aaa010",
+            ChannelApprovalResponse::Approve,
+            "alias-a",
+            SHARED_GROUP,
+            true,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Ok(()),
+            "the issuing alias must still be able to answer"
+        );
+        PENDING_APPROVALS.lock().await.remove("aaa010");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_approves() {
+        let rx = park_token("aaa001", "1234@s.whatsapp.net", false).await;
+        let out = resolve_approval_reply(
+            "aaa001",
+            ChannelApprovalResponse::Approve,
+            "default",
+            "1234@s.whatsapp.net",
+            true,
+        )
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_denies() {
+        let rx = park_token("aaa002", "1234@s.whatsapp.net", false).await;
+        assert!(
+            resolve_approval_reply(
+                "aaa002",
+                ChannelApprovalResponse::Deny,
+                "default",
+                "1234@s.whatsapp.net",
+                true,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_always_approves() {
+        let rx = park_token("aaa003", "1234@s.whatsapp.net", false).await;
+        assert!(
+            resolve_approval_reply(
+                "aaa003",
+                ChannelApprovalResponse::AlwaysApprove,
+                "default",
+                "1234@s.whatsapp.net",
+                true,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    /// A reply carrying a VALID token, from the right chat, but from a number
+    /// that is not an authorized peer, must not decide anything. This is the
+    /// case slack, telegram and matrix currently allow.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_from_unauthorized_responder_is_refused() {
+        let mut rx = park_token("aaa004", "999@g.us", true).await;
+        assert_eq!(
+            resolve_approval_reply(
+                "aaa004",
+                ChannelApprovalResponse::Approve,
+                "default",
+                "999@g.us",
+                false,
+            )
+            .await,
+            Err(ApprovalRefusal::UnauthorizedResponder)
+        );
+        // Nothing was decided.
+        assert!(rx.try_recv().is_err());
+        // And the request is STILL PENDING, so a stranger cannot cancel an
+        // approval by answering it badly; the operator can still answer it.
+        assert!(
+            resolve_approval_reply(
+                "aaa004",
+                ChannelApprovalResponse::Approve,
+                "default",
+                "999@g.us",
+                true,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    /// A valid token replayed from a DIFFERENT chat is not this request's
+    /// answer, even from an allowlisted number.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_from_foreign_chat_is_refused() {
+        let mut rx = park_token("aaa005", "111@s.whatsapp.net", false).await;
+        assert_eq!(
+            resolve_approval_reply(
+                "aaa005",
+                ChannelApprovalResponse::Approve,
+                "default",
+                "222@s.whatsapp.net",
+                true,
+            )
+            .await,
+            Err(ApprovalRefusal::ForeignChat)
+        );
+        assert!(rx.try_recv().is_err());
+        PENDING_APPROVALS.lock().await.remove("aaa005");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_reply_unknown_token_is_refused() {
+        assert_eq!(
+            resolve_approval_reply(
+                "zzz999",
+                ChannelApprovalResponse::Approve,
+                "default",
+                "1@s.whatsapp.net",
+                true,
+            )
+            .await,
+            Err(ApprovalRefusal::UnknownToken)
+        );
+    }
+
+    /// `approval_timeout_secs` reaches the channel from config, so every
+    /// construction path picks it up rather than three call sites each
+    /// remembering to.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn approval_timeout_is_read_from_config() {
+        let ch = WhatsAppWebChannel::new(
+            &approval_cfg(45),
+            "alias",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        assert_eq!(ch.approval_timeout_secs, 45);
+    }
+
+    /// A config PARSED from TOML with the key absent gets 300, the documented
+    /// channel default. This is the path every real operator takes.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn approval_timeout_defaults_to_300_when_parsed() {
+        let cfg: zeroclaw_config::schema::WhatsAppConfig =
+            toml::from_str("enabled = true").expect("minimal whatsapp config parses");
+        assert_eq!(
+            cfg.approval_timeout_secs, 300,
+            "serde default = default_channel_approval_timeout_secs"
+        );
+        let ch = WhatsAppWebChannel::new(&cfg, "alias", Arc::new(Vec::new), Arc::new(Vec::new));
+        assert_eq!(ch.approval_timeout_secs, 300);
+    }
+
+    /// ...and a config built in Rust now agrees with one parsed from a file.
+    ///
+    /// This test used to assert the opposite. It pinned `Default::default()` at
+    /// 0 and reasoned that operators were unaffected because their config is
+    /// parsed. That reasoning was wrong: the supported alias-creation surfaces
+    /// build the struct in Rust and persist the result, so the zero reached a
+    /// file and survived reload, and zero is an already-elapsed deadline rather
+    /// than "wait forever". Every approval on such an alias denied at once.
+    ///
+    /// The split is fixed in `zeroclaw-config`, so this asserts the channel end
+    /// of it: whichever way an operator's alias came into being, the channel
+    /// waits the documented timeout. The `zeroclaw-config` side additionally
+    /// pins every field against the serde defaults so a new field cannot
+    /// reintroduce the divergence quietly.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_config_built_in_rust_waits_the_documented_timeout() {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig::default();
+        assert_eq!(
+            cfg.approval_timeout_secs, 300,
+            "the Rust default must match the documented serde default"
+        );
+        let ch = WhatsAppWebChannel::new(&cfg, "alias", Arc::new(Vec::new), Arc::new(Vec::new));
+        assert_eq!(
+            ch.approval_timeout_secs, 300,
+            "the channel must inherit that timeout rather than denying at once"
+        );
+    }
+
+    /// The timeout arm of `request_approval`, driven end to end.
+    ///
+    /// This replaces two tests that could not fail for the reason their names
+    /// gave. One asserted that `tokio::time::timeout` elapses at zero, which is
+    /// a property of tokio and holds whatever this channel does. The other
+    /// parked a token, performed the removal ITSELF under a comment reading
+    /// "what the timeout arm of request_approval does", and then observed that
+    /// the token was gone - so it re-proved its own setup line and never
+    /// executed the arm. Checked rather than assumed: with the arm's cleanup
+    /// deleted AND its `Deny` flipped to `AlwaysApprove`, both stayed green,
+    /// along with the other 1522 tests in this crate. A timed-out request
+    /// silently granting blanket approval is the worst outcome this transport
+    /// has, and nothing in the suite noticed.
+    ///
+    /// The send hook is what makes the real arm reachable: it stands in for the
+    /// vendor client, so the prompt "delivers" and control reaches the timeout
+    /// instead of returning early at the send error. `approval_timeout_secs` is
+    /// 0 so the deadline is already elapsed and the test does not sleep.
+    ///
+    /// Both assertions below are load-bearing and fail for different reasons.
+    /// The decision assert pins that a timeout DENIES; deleting the cleanup
+    /// alone leaves it green. The removal assert pins that the arm drops its
+    /// own token so a late reply cannot resolve a request nobody is waiting
+    /// on; flipping the decision alone leaves it green.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn timeout_denies_and_removes_its_own_token() {
+        let seen_token = Arc::new(std::sync::Mutex::new(None::<String>));
+        let recorder = Arc::clone(&seen_token);
+
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            approval_timeout_secs: 0,
+            ..Default::default()
+        };
+
+        let channel =
+            WhatsAppWebChannel::new(&cfg, "alias-a", Arc::new(Vec::new), Arc::new(Vec::new))
+                .with_approval_send_hook(Arc::new(move |message: SendMessage| {
+                    let recorder = Arc::clone(&recorder);
+                    Box::pin(async move {
+                        let token = message
+                            .content
+                            .split_once('[')
+                            .and_then(|(_, rest)| rest.split_once(']'))
+                            .map(|(token, _)| token.to_string())
+                            .expect("the prompt must carry its token in brackets");
+                        *recorder.lock().unwrap() = Some(token);
+                        // Delivered. Let the timeout arm run.
+                        Ok(())
+                    })
+                }));
+
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            raw_arguments: None,
+        };
+
+        let decision = channel
+            .request_approval("1@s.whatsapp.net", &request)
+            .await
+            .expect("a timeout must resolve to a decision, not an error");
+        assert_eq!(
+            decision,
+            Some(ChannelApprovalResponse::Deny),
+            "a request nobody answered must deny, never approve"
+        );
+
+        let token = seen_token
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the hook must have run, or the send never reached the timeout");
+        assert!(
+            !PENDING_APPROVALS.lock().await.contains_key(&token),
+            "the timeout arm must remove its own token, or a late reply can \
+             resolve a request whose receiver is already gone"
+        );
+    }
+
+    /// A POSITIVE `approval_timeout_secs` is waited out in full, then denies.
+    ///
+    /// The test above configures `0`, which reaches the same arm and cannot
+    /// distinguish waiting from not waiting: an already-elapsed deadline fires
+    /// identically whether the channel read its own configured duration, read
+    /// some other field, or hardcoded a constant. That gap is exactly the shape
+    /// of the defect this branch fixed on the config side, where an unset field
+    /// silently became `0` and every approval denied at once.
+    ///
+    /// So this asserts the DURATION, not just the decision, and does it twice
+    /// with different values. One value would be satisfied by a hardcoded
+    /// constant that happened to match; two are not.
+    ///
+    /// Paused time is what makes that affordable. Under
+    /// `#[tokio::test(start_paused = true)]` the runtime advances its clock to
+    /// the next deadline whenever nothing is runnable, so the 300-second wait
+    /// is measured exactly and costs no wall-clock. The send hook returns `Ok`
+    /// so control reaches the wait rather than returning early at the send.
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_positive_timeout_is_waited_out_in_full_before_denying() {
+        for configured_secs in [300_u64, 45_u64] {
+            let seen_token = Arc::new(std::sync::Mutex::new(None::<String>));
+            let recorder = Arc::clone(&seen_token);
+
+            let cfg = zeroclaw_config::schema::WhatsAppConfig {
+                approval_timeout_secs: configured_secs,
+                ..Default::default()
+            };
+            let channel = WhatsAppWebChannel::new(
+                &cfg,
+                "alias-paused",
+                Arc::new(Vec::new),
+                Arc::new(Vec::new),
+            )
+            .with_approval_send_hook(Arc::new(move |message: SendMessage| {
+                let recorder = Arc::clone(&recorder);
+                Box::pin(async move {
+                    let token = message
+                        .content
+                        .split_once('[')
+                        .and_then(|(_, rest)| rest.split_once(']'))
+                        .map(|(token, _)| token.to_string())
+                        .expect("the prompt must carry its token in brackets");
+                    *recorder.lock().unwrap() = Some(token);
+                    Ok(())
+                })
+            }));
+
+            let request = ChannelApprovalRequest {
+                tool_name: "shell".to_string(),
+                arguments_summary: "ls".to_string(),
+                raw_arguments: None,
+            };
+
+            let started = tokio::time::Instant::now();
+            let decision = channel
+                .request_approval("1@s.whatsapp.net", &request)
+                .await
+                .expect("a timeout must resolve to a decision, not an error");
+            let waited = started.elapsed();
+
+            assert_eq!(
+                decision,
+                Some(ChannelApprovalResponse::Deny),
+                "a request nobody answered must deny, never approve"
+            );
+
+            let configured = std::time::Duration::from_secs(configured_secs);
+            assert!(
+                waited >= configured,
+                "the channel returned after {waited:?}, short of the configured \
+                 {configured:?}; an operator who set that value is not getting it"
+            );
+            assert!(
+                waited < configured + std::time::Duration::from_secs(1),
+                "the channel waited {waited:?} against a configured {configured:?}; the \
+                 deadline must come from approval_timeout_secs, not from elsewhere"
+            );
+
+            let token = seen_token
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the hook must have run, or the send never reached the timeout");
+            assert!(
+                !PENDING_APPROVALS.lock().await.contains_key(&token),
+                "the timeout arm must remove its own token whatever the duration"
+            );
+        }
+    }
+
+    /// A late reply to a timed-out request is refused, from the caller's side.
+    ///
+    /// The removal assert above pins the map; this pins what the removal BUYS,
+    /// which is the property an operator actually depends on.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_reply_after_timeout_is_refused() {
+        let _rx = park_token("aaa006", "1@s.whatsapp.net", false).await;
+        assert!(PENDING_APPROVALS.lock().await.contains_key("aaa006"));
+        // Bind the id in its own statement. Reading it inline as an argument
+        // keeps the map guard alive for the whole call expression, and the
+        // helper takes the same lock, so that self-deadlocks - and because the
+        // map is process-global, it hangs every other approval test with it.
+        let registration_id = {
+            let pending = PENDING_APPROVALS.lock().await;
+            pending.get("aaa006").expect("just parked").registration_id
+        };
+        remove_pending_approval_if_matches("aaa006", registration_id).await;
+        assert_eq!(
+            resolve_approval_reply(
+                "aaa006",
+                ChannelApprovalResponse::Approve,
+                "default",
+                "1@s.whatsapp.net",
+                true,
+            )
+            .await,
+            Err(ApprovalRefusal::UnknownToken)
+        );
+    }
+
+    /// The prompt text the operator receives must round-trip through the
+    /// channel's own reply parser, or the instructions it prints are wrong.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn prompt_instructions_parse_back() {
+        let token = crate::util::new_approval_token();
+        assert_eq!(token.len(), 6, "parse_approval_reply requires 6 chars");
+        for (word, want) in [
+            ("yes", ChannelApprovalResponse::Approve),
+            ("no", ChannelApprovalResponse::Deny),
+            ("always", ChannelApprovalResponse::AlwaysApprove),
+        ] {
+            let (got_token, got) = crate::util::parse_approval_reply(&format!("{token} {word}"))
+                .expect("the prompt own instruction must parse");
+            assert_eq!(got_token, token.to_lowercase());
+            assert_eq!(got, want);
+        }
     }
 }

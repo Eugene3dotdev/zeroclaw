@@ -1,20 +1,5 @@
 #![allow(clippy::to_string_in_format_args)]
 //! ModelProvider subsystem for model inference backends.
-//!
-//! This module implements the factory pattern for AI model model_providers. Each model_provider
-//! implements the [`ModelProvider`] trait defined in [`traits`], and is registered in the
-//! factory function [`create_model_provider`] by its canonical string key (e.g., `"openai"`,
-//! `"anthropic"`, `"ollama"`, `"gemini"`). ModelProvider aliases are resolved internally
-//! so that user-facing keys remain stable.
-//!
-//! Each model_provider call goes through the [`ReliableModelProvider`] wrapper, which adds
-//! automatic retry with exponential backoff and API-key rotation on rate limits.
-//! Model routing across multiple model_providers is available via [`create_routed_model_provider_with_options`].
-//!
-//! # Extension
-//!
-//! To add a new model_provider, implement [`ModelProvider`] in a new submodule and register it
-//! in [`create_model_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
 pub mod auth;
@@ -23,6 +8,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
@@ -36,11 +22,18 @@ pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod openrouter_catalog;
+pub mod pricing;
 pub mod reliable;
 pub mod router;
 pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
+pub mod vision_override;
+
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
+
+mod request_payload;
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -48,7 +41,7 @@ pub use traits::{
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
-use reliable::ReliableModelProvider;
+use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -412,14 +405,6 @@ pub(crate) fn refresh_qwen_oauth_access_token(
     })
 }
 
-// ── MiniMax OAuth refresh ──────────────────────────────────────────────
-//
-// Restored as a per-alias schema-mirror flow: the operator's
-// `oauth_refresh_token` is exchanged at MinimaxModelProvider construction
-// time for a short-lived access token, which becomes the API credential.
-// Region selection follows the existing `MinimaxEndpoint` enum on the
-// alias config — no `MINIMAX_OAUTH_REGION` env-var needed.
-
 #[derive(Debug, Deserialize)]
 struct MinimaxOauthRefreshResponse {
     #[serde(default)]
@@ -583,15 +568,6 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
-// `canonical_china_provider_name` and the per-family `*_base_url(name)`
-// lookup helpers were deleted in #6273: post-Phase-8 migration the runtime
-// only sees canonical family names (`"moonshot"`, `"qwen"`, `"glm"`,
-// `"minimax"`, `"zai"`, `"doubao"`, `"qianfan"`), and per-instance URLs
-// flow through `ModelProviderRuntimeOptions.provider_api_url` (pre-resolved
-// from the typed alias's `*Endpoint::uri()` by
-// `provider_runtime_options_for_agent`). Synonym detection lives only in
-// `crates/zeroclaw-config/src/schema/v2.rs::normalize_model_provider_type`.
-
 #[derive(Debug, Clone)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
@@ -620,6 +596,9 @@ pub struct ModelProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// When `Some(false)`, strip assistant reasoning fields from outbound
+    /// history replay. `None` honours provider default.
+    pub replay_assistant_reasoning: Option<bool>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -631,8 +610,18 @@ pub struct ModelProviderRuntimeOptions {
     /// Enable or disable chain-of-thought thinking. Forwarded as
     /// `enable_thinking` in the request body. `None` lets the model decide.
     pub think: Option<bool>,
-    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    /// Override the provider's vision (image input) capability. `None` keeps
+    /// the provider family's built-in default; `Some(false)` marks a text-only
+    /// model served by a vision-capable family as non-vision. Mapped from
+    /// `ModelProviderConfig::vision`.
+    pub vision: Option<bool>,
+    /// Forwarded verbatim as a top-level `chat_template_kwargs` object in the
+    /// request body for OpenAI-compatible providers (folded into `extra_body`
+    /// by `apply_compat_options`). Consumed by chat-template-aware backends
+    /// such as vLLM, SGLang, and llama.cpp.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a custom CA certificate file for TLS connections.
+    pub tls_ca_cert_path: Option<String>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -651,22 +640,17 @@ impl Default for ModelProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            replay_assistant_reasoning: None,
             native_tools: None,
             wire_api: None,
             think: None,
+            vision: None,
             chat_template_kwargs: None,
+            tls_ca_cert_path: None,
         }
     }
 }
 
-/// Build `ModelProviderRuntimeOptions` from a *specific* `ModelProviderConfig`
-/// entry plus the global config's process-wide settings (zeroclaw_dir,
-/// secrets, runtime). Splits out the per-entry resolution so callers with
-/// agent context can pass in the alias-resolved entry instead of hitting
-/// `providers.models.find(type, alias)`.
-///
-/// Pass `None` when no model_provider entry is resolvable (e.g. tests or fresh
-/// config with no models configured); falls back to safe defaults.
 pub fn model_provider_runtime_options_from_model_provider_entry(
     config: &zeroclaw_config::schema::Config,
     entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
@@ -697,6 +681,8 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
+    let tls_ca_cert_path = entry.and_then(|e| e.tls_ca_cert_path.clone());
+
     ModelProviderRuntimeOptions {
         auth_profile_override: None,
         provider_kind: entry.and_then(|e| {
@@ -717,10 +703,13 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
+        replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
+        vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
+        tls_ca_cert_path,
     }
 }
 
@@ -746,20 +735,10 @@ pub fn provider_runtime_options_for_agent(
         {
             options.provider_api_url = Some(uri.to_string());
         }
-        // Family-specific typed extras (Azure resource, kilocli/gemini_cli
-        // binary_path, Gemini OAuth client credentials, OpenAI Codex
-        // auth-routing, etc.) are read directly by the factory branches
-        // from `config.providers.models.<family>.<alias>` — no flat
-        // dumping ground here.
     }
 
     options
 }
-/// Build runtime options for a specific dotted provider alias
-/// (`<family>.<alias>`). Mirrors `provider_runtime_options_for_agent` but
-/// keyed on the typed provider entry directly, so routed providers can
-/// resolve their alias-specific endpoint URI and other typed extras
-/// without going through an owning agent.
 pub fn provider_runtime_options_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -790,6 +769,10 @@ pub fn options_for_provider_ref(
             let mut options = fallback.clone();
             options.provider_kind = None;
             options.provider_api_url = None;
+            // `vision` is provider-specific: a bare family ref must not inherit
+            // the fallback provider's capability flag. Clearing it falls back to
+            // the family default (or the choke point's own resolution).
+            options.vision = None;
             options
         }
     }
@@ -811,12 +794,55 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
-/// Scrub known secret-like token prefixes from model_provider error strings.
+/// Remove complete query strings from HTTP(S) URLs embedded in error text.
 ///
+/// Query-value punctuation cannot safely identify where a credential ends:
+/// commas, apostrophes, and parentheses are all legal query data. Treat the
+/// URL's entire non-whitespace query tail as sensitive instead. This also
+/// covers credential parameter names that the sanitizer does not know about.
+fn scrub_url_queries(input: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let mut scrubbed = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        let remaining_lowercase = &lowercase[cursor..];
+        let next_http = remaining_lowercase.find("http://");
+        let next_https = remaining_lowercase.find("https://");
+        let Some(relative_url_start) = (match (next_http, next_https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(http), None) => Some(http),
+            (None, Some(https)) => Some(https),
+            (None, None) => None,
+        }) else {
+            scrubbed.push_str(remaining);
+            break;
+        };
+        let url_start = cursor + relative_url_start;
+        scrubbed.push_str(&input[cursor..url_start]);
+
+        let url_tail = &input[url_start..];
+        let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
+        let url_token = &input[url_start..url_end];
+        if let Some(query_start) = url_token.find('?') {
+            scrubbed.push_str(&url_token[..query_start]);
+        } else {
+            scrubbed.push_str(url_token);
+        }
+        cursor = url_end;
+    }
+
+    scrubbed
+}
+
+/// Scrub known secret-like token prefixes from model_provider error strings.
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
+/// are removed from embedded HTTP(S) URLs because query parameters may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 8] = [
         "sk-",
         "xoxb-",
         "xoxp-",
@@ -824,9 +850,10 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "gho_",
         "ghu_",
         "github_pat_",
+        "AIza",
     ];
 
-    let mut scrubbed = input.to_string();
+    let mut scrubbed = scrub_url_queries(input);
 
     for prefix in PREFIXES {
         let mut search_from = 0;
@@ -901,10 +928,10 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
     ))
 }
 
-/// Resolve API key for a model_provider from config and environment variables.
-///
-/// Return the typed-alias `api_key` field, trimmed. Env-var overrides land on
-/// the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
+/// Resolve API key for a model_provider from the typed alias config/override.
+/// Env-var bridges land on the alias field at config-load via the
+/// `ZEROCLAW_*` schema-mirror grammar; this constructor boundary deliberately
+/// does not read provider-specific global variables.
 fn resolve_model_provider_credential(
     _name: &str,
     credential_override: Option<&str>,
@@ -930,11 +957,6 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("KEY-", "telnyx"),
 ];
 
-/// Check whether an API key's prefix matches the selected model model_provider.
-///
-/// Returns `Some("likely_model_provider")` when the key clearly belongs to a
-/// *different* model model_provider (cross-provider mismatch). Returns `None`
-/// when everything looks fine or the format is unrecognised.
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
     let likely_model_provider = KEY_PREFIX_MODEL_PROVIDERS
         .iter()
@@ -958,22 +980,6 @@ fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static
     }
 }
 
-// `parse_custom_provider_url` was deleted in #6273. The legacy colon-URL form
-// (`custom:https://...` and `anthropic-custom:https://...`) is collapsed
-// at TOML load time by `normalize_model_provider_type` in `schema/v2.rs` into
-// `[providers.models.custom.<alias>] uri = "..."` (or
-// `[providers.models.anthropic.custom] uri = "..."`). The factory's
-// `"custom"` arm reads `uri` from the alias entry via
-// `options.provider_api_url`; URL parsing/validation now happens at
-// schema validation time, not at runtime construction.
-
-/// Factory: create the right model_provider from config (without custom URL).
-///
-/// Legacy entry point — no per-alias typed extras visible. Calls the
-/// `_for_alias` variant with default per-family config; suitable for
-/// tests and programmatic callers using compat families that don't read
-/// from the typed alias config struct. Production callers with agent
-/// context should use [`create_model_provider_for_alias`].
 pub fn create_model_provider(
     name: &str,
     api_key: Option<&str>,
@@ -989,7 +995,6 @@ pub fn create_model_provider(
 }
 
 /// Factory: create model_provider with runtime options.
-///
 /// Legacy entry point — see [`create_model_provider`].
 pub fn create_model_provider_with_options(
     name: &str,
@@ -1000,7 +1005,6 @@ pub fn create_model_provider_with_options(
 }
 
 /// Factory: create model_provider with optional custom base URL.
-///
 /// Legacy entry point — see [`create_model_provider`].
 pub fn create_model_provider_with_url(
     name: &str,
@@ -1017,12 +1021,6 @@ pub fn create_model_provider_with_url(
     )
 }
 
-/// Factory: create model_provider with full alias context.
-///
-/// `(config, family, alias)` lets each family branch read its own typed
-/// alias config (`config.providers.models.<family>.get(alias)`) directly
-/// — no flat per-family extras dumping ground. Production callers with
-/// agent context (delegate, llm_task, model routing, gateway) use this.
 pub fn create_model_provider_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1045,15 +1043,6 @@ pub fn create_model_provider_for_alias_with_url(
     create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)
 }
 
-/// Map a V2 model-provider family name (synonyms, regional variants, OAuth
-/// suffixes) to its V3 canonical family. Production configs are normalised at
-/// TOML load time by `normalize_provider_type` in
-/// `zeroclaw-config/src/schema/v2.rs`. This helper duplicates the same table
-/// at the runtime factory boundary so callers that bypass the schema
-/// migration (programmatic factory invocations, tests, the
-/// `create_model_provider_with_url` colon-URL legacy entry point) still
-/// resolve. Inputs that are already canonical or unknown pass through
-/// unchanged.
 #[must_use]
 pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
     match name {
@@ -1137,11 +1126,6 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
     }
 }
 
-/// Split a V2 colon-URL family name (`custom:https://...`,
-/// `anthropic-custom:https://...`) into a `(name, url)` pair. The V3 typed
-/// schema stores custom endpoints as `[providers.models.<family>.<alias>]
-/// uri = "..."`; this helper preserves runtime-factory compatibility for
-/// callers that still pass the legacy single-token form.
 fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
     if let Some(idx) = name.find(':') {
         let (prefix, rest) = name.split_at(idx);
@@ -1163,6 +1147,18 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
+/// Mark a freshly constructed provider as a known leaf and apply its optional
+/// config `vision` capability override. Called at every exit of
+/// `create_model_provider_inner`, before Reliable/Router composition.
+fn apply_factory_leaf_metadata(
+    provider: Box<dyn ModelProvider>,
+    vision: Option<bool>,
+) -> Box<dyn ModelProvider> {
+    Box::new(vision_override::VisionOverrideProvider::factory_leaf(
+        provider, vision,
+    ))
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1173,11 +1169,6 @@ fn create_model_provider_inner(
     api_url: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    // Pre-normalise the family name for callers that bypass the schema
-    // migration (tests, programmatic factory calls, V2 colon-URL form).
-    // Detect the bare `custom:` and `anthropic-custom:` forms (colon present,
-    // URL missing or malformed) and surface a useful error before falling
-    // into the unknown-family arm.
     if let Some(idx) = raw_name.find(':') {
         let prefix = &raw_name[..idx];
         let url = raw_name[idx + 1..].trim();
@@ -1207,7 +1198,6 @@ fn create_model_provider_inner(
     // clients in active runtime paths. Codex-family access must route through
     // Codex CLI/app/Agents SDK/ACP instead of this provider factory.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        let _ = (alias, options, api_key);
         anyhow::bail!(
             "Direct OpenAI Codex provider runtime is disabled by the EugOT runtime policy. \
              Use Codex CLI/app/Agents SDK/ACP instead of direct OpenAI/Codex API construction."
@@ -1241,18 +1231,6 @@ fn create_model_provider_inner(
         }
     }
 
-    // The factory dispatches by canonical model model_provider family name only —
-    // legacy synonyms ("openai-codex", "azure-openai", "google", etc.) are
-    // collapsed at TOML load time by `normalize_model_provider_type` in
-    // `crates/zeroclaw-config/src/schema/v2.rs`. Multi-endpoint families
-    // (moonshot/qwen/glm/minimax/zai) get their URI pre-resolved into
-    // `options.provider_api_url` from the typed alias's `endpoint` field
-    // by `provider_runtime_options_for_agent`. Local-only families
-    // (lmstudio/llamacpp/sglang/vllm/osaurus) accept either an explicit
-    // `api_url` operator override or fall back to the family's localhost
-    // default. Codex variant routing is handled by `create_model_provider_with_options`
-    // via `options.requires_openai_auth` before this function is called.
-
     // Resolve the effective endpoint URL for the dispatch arms below.
     // Precedence: `api_url` parameter (operator-set base.uri), then
     // `options.provider_api_url` (pre-resolved family endpoint URI from the
@@ -1274,22 +1252,19 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(factory::apply_compat_options(
-            factory::build_kimi_code_compat(alias, key, base_url),
-            options,
+        return Ok(apply_factory_leaf_metadata(
+            factory::apply_compat_options(
+                factory::build_kimi_code_compat(alias, key, base_url),
+                options,
+            ),
+            options.vision,
         ));
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
+        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
-/// Wrap the primary model_provider in a retry/backoff harness, threading auth runtime options.
-///
-/// Legacy entry point — no per-alias typed extras. Codex routing now
-/// happens inside `OpenAIModelProviderConfig::create_provider` driven by
-/// the alias's `base.requires_openai_auth` flag. Production callers that
-/// have agent context should use [`create_resilient_model_provider_for_alias`]
-/// to surface family-specific config like Azure resource/deployment.
 pub fn create_resilient_model_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1324,16 +1299,39 @@ pub fn create_resilient_model_provider_for_alias(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_resilient_model_provider_for_alias_with_model_override(
+        config,
+        family,
+        alias,
+        api_key,
+        api_url,
+        reliability,
+        options,
+        None,
+    )
+}
+
+fn create_resilient_model_provider_for_alias_with_model_override(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
-    let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
+    let mut model_providers: Vec<ReliableModelProviderEntry> = Vec::new();
     push_pinned_entries(
         &mut model_providers,
         config,
         family,
         alias,
         primary_model_provider,
+        primary_model_override,
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
@@ -1344,10 +1342,10 @@ pub fn create_resilient_model_provider_for_alias(
             &entry.fallback,
             &mut visited,
             1,
-        );
+        )?;
     }
 
-    let reliable = ReliableModelProvider::new(
+    let reliable = ReliableModelProvider::new_with_entries(
         alias,
         model_providers,
         reliability.provider_retries,
@@ -1358,74 +1356,74 @@ pub fn create_resilient_model_provider_for_alias(
     Ok(Box::new(reliable))
 }
 
-/// Wrap a freshly-built provider in one model-pinned entry per model the alias
-/// serves — its primary `model` first, then each `fallback_models` entry in
-/// order — so the resilient loop tries every model on this provider before the
-/// next alias. When the alias has no configured model, a single unpinned entry
-/// is pushed and the requested model flows through unchanged.
 fn push_pinned_entries(
-    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    out: &mut Vec<ReliableModelProviderEntry>,
     config: &zeroclaw_config::schema::Config,
     family: &str,
     alias: &str,
     built: Box<dyn ModelProvider>,
+    primary_model_override: Option<&str>,
 ) {
     let entry = config.providers.models.find(family, alias);
-    let primary_model = entry.and_then(|e| e.model.as_deref());
+    let primary_model = primary_model_override
+        .and_then(|model| {
+            let trimmed = model.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .or_else(|| entry.and_then(|e| e.model.as_deref()));
     let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
+    let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push((family.to_string(), built));
+        out.push(ReliableModelProviderEntry::new_with_candidate(
+            family,
+            cooldown_key.clone(),
+            cooldown_key,
+            built,
+        ));
         return;
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push((
-        family.to_string(),
-        Box::new(crate::model_pin::ModelPinnedProvider::new(
-            alias,
-            primary_model,
-            Box::new(std::sync::Arc::clone(&built)),
-        )),
+    out.push(ReliableModelProviderEntry::new_pinned(
+        family,
+        cooldown_key.clone(),
+        alias,
+        primary_model,
+        Box::new(std::sync::Arc::clone(&built)),
     ));
     for model in extra_models {
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
-        out.push((
-            family.to_string(),
-            Box::new(crate::model_pin::ModelPinnedProvider::new(
-                alias,
-                model,
-                Box::new(std::sync::Arc::clone(&built)),
-            )),
+        out.push(ReliableModelProviderEntry::new_pinned(
+            family,
+            cooldown_key.clone(),
+            alias,
+            model,
+            Box::new(std::sync::Arc::clone(&built)),
         ));
     }
 }
 
-/// Depth-first walk of an alias's `fallback` refs. Each resolvable target is
-/// built with its OWN credentials/endpoint/model and appended (model-pinned)
-/// before descending into its own `fallback`. Dangling refs, cycles, and chains
-/// deeper than `MAX_FALLBACK_DEPTH` are skipped — `Config::collect_warnings`
-/// already surfaces all three to operators.
 fn append_fallback_chain(
-    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    out: &mut Vec<ReliableModelProviderEntry>,
     config: &zeroclaw_config::schema::Config,
     refs: &[zeroclaw_config::providers::ModelProviderRef],
     visited: &mut Vec<String>,
     depth: usize,
-) {
+) -> anyhow::Result<()> {
     if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({
-                    "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
+                        "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
                 })),
             "fallback chain exceeds max depth; pruning"
         );
-        return;
+        return Ok(());
     }
     for fallback_ref in refs {
         let raw = fallback_ref.as_str().trim();
@@ -1455,6 +1453,21 @@ fn append_fallback_chain(
         }
 
         let opts = provider_runtime_options_for_alias(config, family, &alias);
+        if !factory::fallback_auth_ready_for_alias(
+            config,
+            family,
+            &alias,
+            entry.api_key.as_deref(),
+            &opts,
+        ) {
+            let profile = format!("[providers.models.{family}.{alias}]");
+            anyhow::bail!(
+                "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) but no \
+                 profile-resolved credential exists. Set `api_key` on {profile}, configure \
+                 the alias's external auth flow, or remove it from `fallback`."
+            );
+        }
+
         match create_model_provider_inner(
             Some(config),
             family,
@@ -1463,32 +1476,23 @@ fn append_fallback_chain(
             entry.uri.as_deref(),
             &opts,
         ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built),
+            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
             Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"fallback": resolved, "error": format!("{e}")})
-                        ),
-                    "fallback provider failed to build; skipping"
+                let profile = format!("[providers.models.{family}.{alias}]");
+                anyhow::bail!(
+                    "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) failed to \
+                     build: {e}"
                 );
-                continue;
             }
         }
 
         visited.push(resolved.clone());
-        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1);
+        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1)?;
         visited.pop();
     }
+    Ok(())
 }
 
-/// Build a resilient model provider from a name that may be either a bare
-/// family (`"openai"`) or a dotted alias (`"openai.work"`). Dotted names
-/// dispatch through the typed alias factory so endpoint URI, family
-/// extras, and per-alias credentials from `[providers.models.<family>.<alias>]`
-/// are honored; bare names route through the family factory directly.
 pub fn create_resilient_model_provider_from_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -1497,8 +1501,111 @@ pub fn create_resilient_model_provider_from_ref(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_resilient_model_provider_from_ref_with_model_override(
+        config,
+        name,
+        api_key,
+        api_url,
+        reliability,
+        options,
+        None,
+    )
+}
+
+/// A provider resolved from a config reference together with the model declared
+/// by that same alias. The model is an on-demand view of Config, not stored
+/// provider state.
+pub struct ResolvedModelProviderRef {
+    pub provider: Box<dyn ModelProvider>,
+    pub model: Option<String>,
+}
+
+/// Build a **bare** (non-resilient) provider named by `name` - a bare family
+/// (`"llamacpp"`), a dotted alias (`"llamacpp.text_model"`), or a `custom:<url>`
+/// ref - resolving its alias-specific runtime options from `config`: the
+/// `vision` capability override, the endpoint URI, and per-alias credentials
+/// from `[providers.models.<family>.<alias>]`.
+///
+/// Unlike the legacy `create_model_provider(name, None)` (which passes
+/// `config = None` and `ModelProviderRuntimeOptions::default()`, so it cannot see
+/// any per-alias config), this honors the alias's `vision` override and typed
+/// config while returning an un-wrapped provider - the shape the dedicated
+/// vision route needs so its configured `[multimodal] vision_model_provider`
+/// respects a per-alias `vision = true/false`.
+pub fn create_model_provider_from_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_model_provider_from_ref_with_model(config, name).map(|resolved| resolved.provider)
+}
+
+/// Resolve a provider reference and its alias-owned model as one materialized
+/// view. Callers may apply their own explicit model override after resolution;
+/// when the reference is bare or URL-based, `model` is `None`.
+pub fn create_model_provider_from_ref_with_model(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<ResolvedModelProviderRef> {
+    // A dotted `<family>.<alias>` that names a REAL configured entry resolves
+    // through the alias factory (honoring the alias's `vision` override, endpoint
+    // URI and credentials). Two exclusions keep the intact name flowing to the
+    // factory instead:
+    //   * a `custom:<url>` / `anthropic-custom:<url>` colon ref whose host carries
+    //     dots (the pre-dot segment holds the scheme colon, e.g. `custom:https://api`
+    //     from `custom:https://api.example.com/v1`) - splitting would truncate it;
+    //   * a dotted ref to a NON-existent alias - splitting it and building the bare
+    //     family would silently fall OPEN to a family-default provider (e.g. a
+    //     typoed `vision_model_provider = "llamacpp.typo"` would route images to a
+    //     default llama.cpp instead of erroring).
+    // In both cases the intact name reaches `create_model_provider_inner`, which
+    // applies family defaults or errors on an unknown provider - keeping a bad ref
+    // fail-closed, exactly as the legacy `create_model_provider(vp, None)` did.
+    if let Some((family, alias)) = name.split_once('.')
+        && !family.contains(':')
+        && let Some(entry) = config.providers.models.find(family, alias)
+    {
+        let options = provider_runtime_options_for_alias(config, family, alias);
+        let provider = create_model_provider_inner(
+            Some(config),
+            family,
+            alias,
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
+            &options,
+        )?;
+        let model = entry
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+        return Ok(ResolvedModelProviderRef { provider, model });
+    }
+    let provider = create_model_provider_inner(
+        None,
+        name,
+        "default",
+        None,
+        None,
+        &ModelProviderRuntimeOptions::default(),
+    )?;
+    Ok(ResolvedModelProviderRef {
+        provider,
+        model: None,
+    })
+}
+
+fn create_resilient_model_provider_from_ref_with_model_override(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     match name.split_once('.') {
-        Some((family, alias)) => create_resilient_model_provider_for_alias(
+        Some((family, alias)) => create_resilient_model_provider_for_alias_with_model_override(
             config,
             family,
             alias,
@@ -1506,6 +1613,7 @@ pub fn create_resilient_model_provider_from_ref(
             api_url,
             reliability,
             options,
+            primary_model_override,
         ),
         None => create_resilient_model_provider_with_options(
             name,
@@ -1517,11 +1625,6 @@ pub fn create_resilient_model_provider_from_ref(
     }
 }
 
-/// Build a router fronted by `primary_name` plus one provider per unique
-/// `model_routes` entry. Each dotted `<family>.<alias>` name resolves
-/// through the typed `[providers.models.<family>.<alias>]` config (endpoint
-/// URI, Azure resource, Gemini OAuth, etc.); bare family names use family
-/// defaults.
 pub fn create_routed_model_provider_with_options(
     config: &zeroclaw_config::schema::Config,
     primary_name: &str,
@@ -1533,13 +1636,14 @@ pub fn create_routed_model_provider_with_options(
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     if model_routes.is_empty() {
-        return create_resilient_model_provider_from_ref(
+        return create_resilient_model_provider_from_ref_with_model_override(
             config,
             primary_name,
             api_key,
             api_url,
             reliability,
             options,
+            Some(default_model),
         );
     }
 
@@ -1557,6 +1661,7 @@ pub fn create_routed_model_provider_with_options(
     // upstream for the owning agent).
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
+        let is_primary = name == primary_name;
         let routed_credential = model_routes
             .iter()
             .find(|r| &r.model_provider == name)
@@ -1581,36 +1686,26 @@ pub fn create_routed_model_provider_with_options(
                         (!trimmed.is_empty()).then_some(trimmed)
                     })
             })
-            .or(api_key);
-        let url = if name == primary_name { api_url } else { None };
-        let entry_options = if name == primary_name {
+            .or_else(|| is_primary.then_some(api_key).flatten());
+        let url = if is_primary { api_url } else { None };
+        let entry_options = if is_primary {
             options.clone()
         } else {
             options_for_provider_ref(config, name, options)
         };
 
-        match create_resilient_model_provider_from_ref(
+        match create_resilient_model_provider_from_ref_with_model_override(
             config,
             name,
             key,
             url,
             reliability,
             &entry_options,
+            is_primary.then_some(default_model),
         ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
-                if name == primary_name {
-                    return Err(e);
-                }
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"model_provider": name.as_str(), "error": format!("{}", e)})
-                        ),
-                    "Ignoring routed model_provider that failed to initialize"
-                );
+                anyhow::bail!("Routed model_provider `{name}` failed to initialize: {e}");
             }
         }
     }
@@ -1705,73 +1800,7 @@ impl ModelProviderCategory {
 /// multi-region, CLI shims).
 #[must_use]
 pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
-    use factory::CompatFamilySpec;
-    use zeroclaw_config::schema::{
-        Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
-        ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
-        BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
-        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
-        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
-        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
-        HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
-        InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
-        NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-        OpencodeModelProviderConfig, PerplexityModelProviderConfig, RekaModelProviderConfig,
-        SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-        SyntheticModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-        VercelModelProviderConfig, VllmModelProviderConfig, YiModelProviderConfig,
-    };
-
-    match name {
-        "anthropic" => Some(anthropic::BASE_URL),
-        "openai" => Some(openai::BASE_URL),
-        "openrouter" => Some(openrouter::BASE_URL),
-        "ollama" => Some(ollama::BASE_URL),
-        "telnyx" => Some(telnyx::BASE_URL),
-        "gemini" => Some(gemini::BASE_URL),
-        "vercel" => Some(<VercelModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cloudflare" => Some(<CloudflareModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "synthetic" => Some(<SyntheticModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "opencode" => Some(<OpencodeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "doubao" => Some(<DoubaoModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "mistral" => Some(<MistralModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "deepseek" => Some(<DeepseekModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "together" => Some(<TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "fireworks" => Some(<FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "novita" => Some(<NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "perplexity" => Some(<PerplexityModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cohere" => Some(<CohereModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "sglang" => Some(<SglangModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "vllm" => Some(<VllmModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "astrai" => Some(<AstraiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "siliconflow" => Some(<SiliconflowModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "aihubmix" => Some(<AihubmixModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "litellm" => Some(<LitellmModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cerebras" => Some(<CerebrasModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "sambanova" => Some(<SambanovaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "hyperbolic" => Some(<HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "deepinfra" => Some(<DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "huggingface" => Some(<HuggingfaceModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "ai21" => Some(<Ai21ModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "reka" => Some(<RekaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "baseten" => Some(<BasetenModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nscale" => Some(<NscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "anyscale" => Some(<AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nebius" => Some(<NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "friendli" => Some(<FriendliModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "lepton" => Some(<LeptonModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "morph" => Some(<MorphModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "github_models" => Some(<GithubModelsModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "upstage" => Some(<UpstageModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "featherless" => Some(<FeatherlessModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        _ => None,
-    }
+    factory::endpoint_for_family(name).and_then(factory::ProviderEndpoint::fixed_url)
 }
 
 /// Append a section of provider families under one category. DRY builder so the
@@ -1792,6 +1821,19 @@ fn push_family(
                 category,
             }),
     );
+}
+
+/// Provider-specific runtime recommendations. This is deliberately separate
+/// from `local`: credential-free CLI shims can call cloud models, and local
+/// providers without native tool support must retain text-fallback prompting.
+#[must_use]
+pub fn recommended_runtime_profile(name: &str) -> Option<&'static str> {
+    match name {
+        "lmstudio" | "llamacpp" | "sglang" | "vllm" | "osaurus" => {
+            Some(zeroclaw_config::presets::LOCAL_SMALL_RUNTIME_PRESET_NAME)
+        }
+        _ => None,
+    }
 }
 
 /// Return the list of all known model_providers for display in `zeroclaw model_providers list`.
@@ -1825,8 +1867,10 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
         ModelProviderCategory::OpenAiCompatible,
         &[
             ("venice", "Venice", false),
+            ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
+            ("atlascloud", "Atlas Cloud", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -1862,6 +1906,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("atomic_chat", "Atomic Chat", true),
             ("astrai", "Astrai", false),
             ("deepmyst", "DeepMyst", false),
+            ("manifest", "Manifest", false),
             ("morph", "Morph (Fast Apply)", false),
             ("github_models", "GitHub Models", false),
             ("upstage", "Upstage Solar", false),
@@ -1892,7 +1937,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("baseten", "Baseten", false),
             ("nscale", "Nscale", false),
             ("anyscale", "Anyscale", false),
-            ("nebius", "Nebius AI Studio", false),
+            ("nebius", "Nebius Token Factory", false),
             ("friendli", "Friendli AI", false),
             ("lepton", "Lepton AI", false),
         ],
@@ -1928,11 +1973,6 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     out
 }
 
-/// Canonical model-provider slot names, generated directly from the
-/// `for_each_model_provider_slot!` macro in `zeroclaw-config`. This is the
-/// single source of truth for *which* provider families exist; the display
-/// metadata in [`list_model_providers`] is keyed against this set and a drift
-/// guard fails loudly if the two diverge.
 #[must_use]
 pub fn canonical_model_provider_slots() -> Vec<&'static str> {
     macro_rules! collect_slot_names {
@@ -1943,7 +1983,6 @@ pub fn canonical_model_provider_slots() -> Vec<&'static str> {
     zeroclaw_config::for_each_model_provider_slot!(collect_slot_names)
 }
 
-/// Shared test utilities for model_provider modules.
 #[cfg(test)]
 pub mod test_util {
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1997,6 +2036,47 @@ mod tests {
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
 
+    #[test]
+    fn runtime_recommendations_distinguish_local_backends_from_cli_shims() {
+        let providers = list_model_providers();
+        let recommendation = |name| {
+            providers
+                .iter()
+                .find(|provider| provider.name == name)
+                .and_then(|provider| recommended_runtime_profile(provider.name))
+        };
+
+        assert_eq!(
+            recommendation("lmstudio"),
+            Some(zeroclaw_config::presets::LOCAL_SMALL_RUNTIME_PRESET_NAME),
+        );
+        assert_eq!(recommendation("ollama"), None);
+        assert_eq!(recommendation("atomic_chat"), None);
+        assert_eq!(recommendation("gemini_cli"), None);
+        assert_eq!(recommendation("kilocli"), None);
+        assert_eq!(recommendation("anthropic"), None);
+    }
+
+    #[test]
+    fn recommended_runtime_profiles_require_native_tool_support() {
+        for provider in list_model_providers()
+            .into_iter()
+            .filter(|provider| recommended_runtime_profile(provider.name).is_some())
+        {
+            let instance = create_model_provider(provider.name, None).unwrap_or_else(|error| {
+                panic!(
+                    "recommended local provider {} should construct without credentials: {error}",
+                    provider.name,
+                )
+            });
+            assert!(
+                instance.supports_native_tools(),
+                "provider {} must not receive strict local_small defaults without native tools",
+                provider.name,
+            );
+        }
+    }
+
     fn assert_policy_error(result: anyhow::Result<Box<dyn ModelProvider>>, expected: &str) {
         let err = match result {
             Ok(_) => panic!("direct provider construction should be policy-blocked"),
@@ -2038,11 +2118,42 @@ mod tests {
         assert!(resolve_model_provider_credential("openrouter", None).is_none());
     }
 
-    // V0.8.0: tests that exercised env-var-driven credential resolution and
-    // OAuth env-var fallbacks (`MINIMAX_*`, `QWEN_OAUTH_*`, `ANTHROPIC_API_KEY`,
-    // `BEDROCK_API_KEY`, `API_KEY`, etc.) were deleted alongside the env-var
-    // match in `resolve_model_provider_credential`. See the comment above
-    // that fn for the schema-mirror replacement grammar.
+    #[test]
+    fn resolve_atlascloud_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ATLASCLOUD_API_KEY", Some("  atlas-env-key  "));
+        assert!(resolve_model_provider_credential("atlascloud", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("atlascloud", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+        assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn atlascloud_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("atlascloud"),
+            "atlascloud"
+        );
+        for alias in ["atlas", "atlas-cloud", "atlas_cloud"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn atlascloud_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let atlascloud = providers
+            .iter()
+            .find(|provider| provider.name == "atlascloud")
+            .expect("Atlas Cloud provider should be listed");
+        assert_eq!(atlascloud.display_name, "Atlas Cloud");
+        assert!(
+            create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
+            "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
+    }
 
     #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
@@ -2117,14 +2228,6 @@ mod tests {
         assert!(!is_qianfan_alias("cohere"));
         assert!(!is_doubao_alias("deepseek"));
     }
-
-    // Tests for the deleted `canonical_china_provider_name` function and
-    // the `*_base_url(name)` lookup helpers were removed alongside their
-    // subjects in #6273. Equivalent regional-collapse semantics are now
-    // covered by the migration tests at
-    // `crates/zeroclaw-config/tests/migration.rs` (`v2_model_providers_alias_wrapped`,
-    // `claude_code_folded_under_anthropic`, etc.) which exercise
-    // `normalize_model_provider_type` directly.
 
     // ── Primary model_providers ────────────────────────────────────
 
@@ -2202,6 +2305,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_nearai() {
+        let model_provider = create_model_provider("nearai", Some("nearai-key")).unwrap();
+        // NEAR AI Cloud is OpenAI-protocol-compatible: default Bearer auth +
+        // native OpenAI-style tool calling. No .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "NEAR AI Cloud should use OpenAI-compatible native tool calling"
+        );
+    }
+
+    #[test]
     fn factory_vercel() {
         assert!(create_model_provider("vercel", Some("key")).is_ok());
     }
@@ -2233,10 +2347,11 @@ mod tests {
                 provider.supports_vision(),
                 "alias `{alias}` should report vision capability"
             );
+            // Kimi Code moved to api.kimi.com.
             assert_eq!(
                 moonshot_code_base_url(),
-                "https://api.moonshot.cn/coder/v1",
-                "alias `{alias}` should resolve to the Moonshot code endpoint"
+                "https://api.kimi.com/coding/v1",
+                "alias `{alias}` should resolve to the Kimi Code endpoint"
             );
         }
     }
@@ -2375,6 +2490,129 @@ mod tests {
     fn factory_llamacpp() {
         assert!(create_model_provider("llamacpp", Some("key")).is_ok());
         assert!(create_model_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn vision_override_applies_once_at_construction_for_any_family() {
+        // llama.cpp and the generic custom endpoint both default to
+        // vision-capable. `vision = Some(false)` must mark the constructed
+        // provider non-vision regardless of family, and show up in BOTH
+        // `supports_vision()` and `capabilities().vision` so every consumer
+        // (routing gate, media pipeline, model router) agrees.
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            let off = ModelProviderRuntimeOptions {
+                vision: Some(false),
+                ..Default::default()
+            };
+            let provider =
+                create_model_provider_inner(None, name, "default", None, None, &off).unwrap();
+            assert!(
+                !provider.supports_vision(),
+                "{name}: vision=false should mark the provider non-vision"
+            );
+            assert!(
+                !provider.capabilities().vision,
+                "{name}: capabilities().vision must stay consistent with supports_vision()"
+            );
+            // `None` preserves the family default (vision-capable here).
+            let provider = create_model_provider_inner(
+                None,
+                name,
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                provider.supports_vision(),
+                "{name}: no override should keep the family default"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_leaves_have_stable_request_identity() {
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            for vision in [None, Some(false)] {
+                let options = ModelProviderRuntimeOptions {
+                    vision,
+                    ..Default::default()
+                };
+                let provider =
+                    create_model_provider_inner(None, name, "default", None, None, &options)
+                        .unwrap();
+                assert!(
+                    provider.has_stable_request_identity("model"),
+                    "{name}: factory-created leaves must attest to a stable request identity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vision_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.vision, Some(false));
+    }
+
+    #[test]
+    fn openai_responses_alias_resolves_options_but_stays_policy_blocked() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
+        };
+
+        // Upstream builds a Responses provider here and asserts its vision
+        // capability. Alias option resolution is unchanged, but the OpenAI
+        // family never reaches construction, so the capability assertion is
+        // replaced by the policy assertion.
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "responses_vision".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    wire_api: Some(WireApi::Responses),
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "responses_vision");
+        assert_eq!(options.vision, Some(true));
+
+        assert_policy_error(
+            create_model_provider_for_alias(
+                &config,
+                "openai",
+                "responses_vision",
+                Some("sk-test"),
+                &options,
+            ),
+            "Codex CLI/app/Agents SDK/ACP",
+        );
+    }
+
+    #[test]
+    fn options_for_bare_provider_ref_does_not_inherit_fallback_vision() {
+        use zeroclaw_config::schema::Config;
+        // A bare family ref (no alias) must not inherit the fallback provider's
+        // `vision` flag — otherwise a `-p llamacpp` override would carry the
+        // agent provider's capability. Falls back to the family default.
+        let fallback = ModelProviderRuntimeOptions {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let resolved = options_for_provider_ref(&Config::default(), "llamacpp", &fallback);
+        assert_eq!(resolved.vision, None);
     }
 
     #[test]
@@ -2529,11 +2767,6 @@ mod tests {
 
     #[test]
     fn provider_runtime_options_from_config_propagates_native_tools() {
-        // End-to-end path: setting `native_tools` on the first configured
-        // model_provider entry must reach `ModelProviderRuntimeOptions` so the
-        // Groq factory branch sees it. There is no global fallback; the
-        // orchestrator resolves per-agent via explicit `<type>.<alias>`
-        // resolution.
         use zeroclaw_config::schema::{GroqModelProviderConfig, ModelProviderConfig};
         let mut config = zeroclaw_config::schema::Config::default();
         config.providers.models.groq.insert(
@@ -2553,6 +2786,32 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active model_provider entry to runtime options"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_tls_ca_cert_path() {
+        // Regression guard: tls_ca_cert_path on a ModelProviderConfig entry must
+        // reach ModelProviderRuntimeOptions so apply_compat_options can call
+        // with_tls_ca_cert_path on the provider. Same pattern as native_tools above.
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "corp".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    tls_ca_cert_path: Some("/tmp/example-ca.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let entry = config.providers.models.find("openai", "corp");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
+        assert_eq!(
+            options.tls_ca_cert_path.as_deref(),
+            Some("/tmp/example-ca.pem"),
+            "tls_ca_cert_path must propagate from ModelProviderConfig to ModelProviderRuntimeOptions"
         );
     }
 
@@ -2577,6 +2836,90 @@ mod tests {
             options.provider_api_url.as_deref(),
             Some("http://primary.example/v1")
         );
+    }
+
+    #[tokio::test]
+    async fn routed_alias_uses_call_model_instead_of_configured_pin() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *capture.lock().expect("capture lock poisoned") = Some(model);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.custom.insert(
+            "primary".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    model: Some("old-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "custom.primary",
+            Some("test-key"),
+            Some(&format!("http://{addr}/v1")),
+            &config.reliability,
+            &[],
+            "new-model",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("provider should build");
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let response = provider
+            .chat(request, "new-model", None)
+            .await
+            .expect("chat should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        let model = capture
+            .lock()
+            .expect("capture lock poisoned")
+            .take()
+            .expect("server should capture request");
+        assert_eq!(model, "new-model");
+        server.abort();
     }
 
     #[test]
@@ -2621,7 +2964,67 @@ mod tests {
     }
 
     #[test]
+    /// The subject here is kind leakage, not the route's family. Upstream used
+    /// `openrouter` as an arbitrary second family; upstream now builds the
+    /// canonical route provider eagerly, which the EugOT policy refuses for
+    /// OpenRouter, so the route uses an allowed family instead. Routed refusal
+    /// of a blocked family is pinned separately by
+    /// `routed_policy_blocked_family_fails_closed`.
     fn routed_primary_alias_kind_does_not_leak_to_canonical_route_provider() {
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("http://primary.example/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "route".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig::default(),
+                ..Default::default()
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
+
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "openai.primary",
+            Some("sk-test"),
+            None,
+            &config.reliability,
+            &[ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "ollama.route".to_string(),
+                model: "llama3".to_string(),
+                api_key: None,
+            }],
+            "gpt-test",
+            &options,
+        )
+        .expect("primary alias kind should build without poisoning route provider kind");
+
+        assert!(
+            provider.supports_vision(),
+            "primary openai-compatible provider should remain the router default"
+        );
+    }
+
+    /// Upstream builds the canonical route provider eagerly, so a route that
+    /// names a policy-blocked family must fail closed rather than silently
+    /// yielding a working direct-provider path.
+    #[test]
+    fn routed_policy_blocked_family_fails_closed() {
         use zeroclaw_config::schema::{
             ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
             OpenRouterModelProviderConfig,
@@ -2645,9 +3048,8 @@ mod tests {
             },
         );
         let options = provider_runtime_options_for_alias(&config, "openai", "primary");
-        assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
 
-        let provider = create_routed_model_provider_with_options(
+        let Err(error) = create_routed_model_provider_with_options(
             &config,
             "openai.primary",
             Some("sk-test"),
@@ -2661,12 +3063,15 @@ mod tests {
             }],
             "gpt-test",
             &options,
-        )
-        .expect("primary alias kind should build without poisoning route provider kind");
+        ) else {
+            panic!("routed OpenRouter must be refused by the EugOT runtime policy");
+        };
 
         assert!(
-            provider.supports_vision(),
-            "primary openai-compatible provider should remain the router default"
+            error
+                .to_string()
+                .contains("Direct OpenRouter provider runtime is disabled"),
+            "refusal must come from the direct-provider policy, got: {error}"
         );
     }
 
@@ -2740,6 +3145,15 @@ mod tests {
         assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
     }
 
+    #[test]
+    fn factory_nvidia_supports_vision() {
+        let provider = create_model_provider("nvidia", Some("nvapi-test")).unwrap();
+        assert!(
+            provider.supports_vision(),
+            "nvidia provider must report supports_vision()=true for multimodal models"
+        );
+    }
+
     // ── AI inference routers ─────────────────────────────────
 
     #[test]
@@ -2804,6 +3218,25 @@ mod tests {
     #[test]
     fn default_url_matches_compat_spec_for_new_providers() {
         assert_eq!(
+            default_model_provider_url("groq"),
+            Some("https://api.groq.com/openai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("nvidia"),
+            Some("https://integrate.api.nvidia.com/v1")
+        );
+        assert_eq!(default_model_provider_url("moonshot"), None);
+        assert_eq!(default_model_provider_url("azure"), None);
+        assert_eq!(default_model_provider_url("openai"), None);
+        assert_eq!(default_model_provider_url("gemini"), None);
+        assert_eq!(default_model_provider_url("copilot"), None);
+        assert_eq!(default_model_provider_url("custom"), None);
+        assert_eq!(default_model_provider_url("gemini_cli"), None);
+        assert_eq!(
+            default_model_provider_url("qianfan"),
+            Some(QIANFAN_BASE_URL)
+        );
+        assert_eq!(
             default_model_provider_url("morph"),
             Some("https://api.morphllm.com/v1")
         );
@@ -2834,21 +3267,31 @@ mod tests {
         );
     }
 
-    // ── Custom / BYOP model model_provider ─────────────────────────
-    //
-    // The legacy colon-URL form ("custom:https://..." / "anthropic-custom:...")
-    // and its in-process URL parser were deleted in #6273. The surface is
-    // `[providers.models.custom.<alias>] uri = "https://..."` for OpenAI-
-    // compatible endpoints (or `[providers.models.anthropic.<alias>] uri = ...`
-    // for Anthropic-compatible). URL validation now happens at schema-load
-    // time in `crates/zeroclaw-config/src/schema.rs::validate`, not at runtime
-    // construction; tests for that validation belong with the schema, not here.
-    //
-    // Migration of legacy colon-URL configs is exercised by the integration
-    // tests in `crates/zeroclaw-config/tests/migration.rs`
-    // (`anthropic_custom_colon_url_default_provider_folds_under_anthropic`,
-    // `custom_colon_url_default_provider_splits_into_uri`,
-    // `agent_inline_brain_colon_url_provider_splits_into_uri`).
+    #[test]
+    fn openrouter_context_window_url_uses_the_shared_default() {
+        for uri in [None, Some(""), Some("<unset>")] {
+            let config = zeroclaw_config::schema::ModelProviderConfig {
+                uri: uri.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                openrouter_context_window_url(&config),
+                "https://openrouter.ai/api/v1/models"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_context_window_url_preserves_the_configured_uri() {
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            uri: Some("https://proxy.example.test/openrouter/models".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            openrouter_context_window_url(&config),
+            "https://proxy.example.test/openrouter/models"
+        );
+    }
 
     #[test]
     fn factory_custom_with_resolved_uri() {
@@ -2870,6 +3313,46 @@ mod tests {
                 panic!("Expected error when custom model model_provider has no URI configured")
             }
         }
+    }
+
+    #[test]
+    fn create_model_provider_from_ref_preserves_custom_url_with_dotted_host() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::Config;
+        // A `custom:<url>` vision route whose host contains dots (e.g. 127.0.0.1)
+        // must NOT be split on '.' into a bogus `<family>.<alias>` - the whole ref
+        // must reach the factory intact, exactly as the legacy
+        // `create_model_provider(vp, None)` did. Regression for the alias-aware ref
+        // factory added for the dedicated vision route.
+        let config = Config::default();
+        let url = "custom:http://127.0.0.1:9999/v1";
+        let via_ref =
+            create_model_provider_from_ref(&config, url).expect("ref factory builds custom URL");
+        let via_legacy =
+            create_model_provider(url, None).expect("legacy factory builds custom URL");
+        assert_eq!(
+            via_ref.alias(),
+            via_legacy.alias(),
+            "custom:<url> with a dotted host must build identically to the legacy \
+             factory (not be mis-split into a bogus family/alias)"
+        );
+    }
+
+    #[test]
+    fn create_model_provider_from_ref_fails_closed_on_nonexistent_dotted_alias() {
+        use zeroclaw_config::schema::Config;
+        // A dotted `vision_model_provider` that names no configured alias (e.g. a
+        // typo) must fail CLOSED - an error the operator sees - not silently fall
+        // open to a family-default provider. `llamacpp` builds a default endpoint
+        // for a bare family, so without the entry-exists guard `llamacpp.typo`
+        // would (wrongly) succeed and route images to a default llama.cpp.
+        let config = Config::default();
+        assert!(
+            create_model_provider_from_ref(&config, "llamacpp.typo").is_err(),
+            "a dotted ref to a non-existent alias must fail closed, not fall open to a default provider"
+        );
+        // Same fail-closed behavior as the legacy factory the vision route used.
+        assert!(create_model_provider("llamacpp.typo", None).is_err());
     }
 
     // ── Error cases ──────────────────────────────────────────
@@ -3026,11 +3509,6 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
-        // Canonical family names only — legacy synonyms are collapsed by
-        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
-        // the runtime. `azure` is excluded (typed-config required, see
-        // `listed_model_providers_are_constructible` skip list); `custom` is
-        // excluded (URI required, covered by `factory_custom_*` tests).
         let canonical = [
             "openrouter",
             "anthropic",
@@ -3038,6 +3516,7 @@ mod tests {
             "ollama",
             "gemini",
             "venice",
+            "nearai",
             "vercel",
             "cloudflare",
             "moonshot",
@@ -3099,11 +3578,6 @@ mod tests {
         }
     }
 
-    /// `list_model_providers()` must cover exactly the canonical slot set the
-    /// `for_each_model_provider_slot!` macro emits — no missing display entries
-    /// (a constructible provider invisible in the list / docs / dashboard) and
-    /// no phantom entries (a display row for a slot the factory can't build).
-    /// Adding a slot to the macro without a matching display entry fails here.
     #[test]
     fn listed_model_providers_match_canonical_slots() {
         let listed: std::collections::BTreeSet<&str> =
@@ -3122,11 +3596,6 @@ mod tests {
     #[test]
     fn listed_model_providers_are_constructible() {
         for model_provider in list_model_providers() {
-            // Azure requires typed config (resource + deployment) per #6273.
-            // create_model_provider with default options has no azure context — that's
-            // by design (env-var fallback eradicated). Tests that exercise the
-            // Azure factory pass a populated ModelProviderRuntimeOptions through
-            // create_model_provider_with_options.
             if model_provider.name == "azure" {
                 continue;
             }
@@ -3269,6 +3738,56 @@ mod tests {
         let result = sanitize_api_error(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         assert!(!result.contains("sk-abcdef123"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_gemini_key_in_reqwest_url() {
+        let key = "AIzaSyDUMMYKEYFORTESTINGONLY1234567890";
+        let input = format!(
+            "error sending request for url (https://127.0.0.1:1/v1beta/models/x:generateContent?key={key})"
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains(key), "key leaked: {result}");
+        assert!(result.contains("generateContent"));
+        assert!(!result.contains("?key="));
+    }
+
+    #[test]
+    fn sanitize_scrubs_bare_gemini_key_prefix() {
+        // An `AIza` key that appears outside a query string (e.g. a JSON body)
+        // is still redacted by the prefix rule.
+        let input = r#"{"error":"invalid api key AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_query_regardless_of_parameter_name() {
+        let input =
+            "GET HTTPS://api.example.com/v1/thing?region=us&access_token=hunter2secret failed";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("hunter2secret"), "{result}");
+        assert!(!result.contains("region=us"), "{result}");
+        assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_query_values_containing_url_punctuation() {
+        let secret = "abc,def'ghi(jkl)";
+        let input = format!("GET https://api.example.com/v1/thing?api_key={secret} failed");
+        let result = sanitize_api_error(&input);
+
+        assert!(!result.contains(secret), "{result}");
+        assert!(!result.contains("def'ghi(jkl)"), "{result}");
+        assert!(result.contains("https://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_leaves_non_url_key_value_text_unchanged() {
+        let input = "playing monkey=banana in the query";
+        let result = sanitize_api_error(input);
+        assert_eq!(result, input);
     }
 
     #[test]
@@ -3450,11 +3969,6 @@ mod tests {
 
     #[test]
     fn provider_runtime_options_for_agent_unknown_agent_returns_safe_defaults() {
-        // Per HEAD's explicit-resolution policy (48a386f55 — delete
-        // first_model_provider*), unknown agents do NOT fall back to a
-        // first-configured provider. They return safe defaults (no URL) so
-        // dispatch surfaces a setup error instead of silently routing to an
-        // arbitrary provider the operator never bound to the agent.
         let config = config_with_two_anthropic_aliases();
         let opts = provider_runtime_options_for_agent(&config, "nonexistent");
         assert!(
@@ -3482,7 +3996,9 @@ mod tests {
         assert_eq!(tuning.num_predict, 4096);
         assert_eq!(tuning.temperature_override, Some(0.5));
 
-        let provider = ollama::OllamaModelProvider::new("test", None, None).with_tuning(tuning);
+        let provider = ollama::OllamaModelProvider::builder("test")
+            .tuning(tuning)
+            .build();
         assert_eq!(provider.tuning(), tuning);
     }
 
@@ -3645,6 +4161,79 @@ mod tests {
     }
 
     #[test]
+    fn routed_model_provider_fails_when_routed_provider_fallback_lacks_profile_credential() {
+        use zeroclaw_config::schema::{
+            Config, GroqModelProviderConfig, ModelProviderConfig, ModelRouteConfig,
+            ReliabilityConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.groq.insert(
+            "routed".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.1-8b-instant".to_string()),
+                    api_key: Some("route-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "groq.bad",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.groq.insert(
+            "bad".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.1-8b-instant".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let routes = [ModelRouteConfig {
+            hint: "test".to_string(),
+            model_provider: "groq.routed".to_string(),
+            model: "llama-3.1-8b-instant".to_string(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "groq.primary",
+            Some("primary-key"),
+            None,
+            &ReliabilityConfig::default(),
+            &routes,
+            "llama-3.3-70b-versatile",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "route provider fallback failures must not be silently ignored"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("groq.routed"),
+            "error must name the routed provider that failed: {message}"
+        );
+        assert!(
+            message.contains("groq.bad"),
+            "error must preserve the failed fallback alias: {message}"
+        );
+    }
+
+    #[test]
     fn dotted_alias_blocks_openai_codex_direct_runtime() {
         use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
 
@@ -3684,6 +4273,7 @@ mod tests {
             GroqModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
                     fallback_models: vec!["llama-3.1-8b-instant".to_string()],
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
                         "groq.backup",
@@ -3697,6 +4287,7 @@ mod tests {
             GroqModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("llama-3.1-8b-instant".to_string()),
+                    api_key: Some("backup-key".to_string()),
                     ..Default::default()
                 },
             },
@@ -3715,6 +4306,391 @@ mod tests {
         assert!(
             result.is_ok(),
             "multi-alias fallback chain must build: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_resolved_fallback_lacks_profile_credential() {
+        use zeroclaw_config::schema::{Config, GroqModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "groq.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.groq.insert(
+            "backup".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.1-8b-instant".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "missing fallback credential must fail loudly"
+        );
+        let err = result.err().unwrap();
+        let message = err.to_string();
+        assert!(
+            message.contains("groq.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("[providers.models.groq.backup]"),
+            "error must name the profile to fix: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "error must name the credential field to set: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_resolved_fallback_uri_lacks_profile_credential() {
+        use zeroclaw_config::schema::{Config, GroqModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "groq.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.groq.insert(
+            "backup".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.1-8b-instant".to_string()),
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("https://api.groq.com/openai/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "uri and kind alone must not make a fallback auth-ready"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("groq.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("[providers.models.groq.backup]"),
+            "error must name the profile to fix: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "error must name the credential field to set: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_minimax_fallback_lacks_auth_source() {
+        use zeroclaw_config::schema::{
+            Config, GroqModelProviderConfig, MinimaxModelProviderConfig, ModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "minimax.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.minimax.insert(
+            "backup".to_string(),
+            MinimaxModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("minimax-text-01".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "MiniMax fallback without api_key or oauth_refresh_token must fail loudly"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("minimax.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "error must name the credential field to set: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_resolved_fallback_factory_fails() {
+        use zeroclaw_config::schema::{
+            Config, CustomModelProviderConfig, GroqModelProviderConfig, ModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "custom.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("custom-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "resolved fallback factory failure must abort build"
+        );
+        let err = result.err().unwrap();
+        let message = err.to_string();
+        assert!(
+            message.contains("custom.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("[providers.models.custom.backup]"),
+            "error must name the profile to fix: {message}"
+        );
+        assert!(
+            message.contains("uri"),
+            "factory error must preserve the missing field detail: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_openai_external_auth_fallback_is_policy_blocked() {
+        use zeroclaw_config::schema::{
+            Config, GroqModelProviderConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        // Upstream allows an OpenAI external-auth fallback to omit `api_key`
+        // and build. Auth-readiness still passes here — `requires_openai_auth`
+        // is a valid credential source — but construction is fail-closed, so
+        // the chain must surface the policy error, not a silent success.
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.codex",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-5-codex".to_string()),
+                    requires_openai_auth: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "an OpenAI external-auth fallback must not build a direct runtime"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("openai.codex"),
+            "error must name the resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("Codex CLI/app/Agents SDK/ACP"),
+            "error must point at the approved Codex runtime: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_allows_xai_oauth_fallback_without_api_key() {
+        use zeroclaw_config::schema::{
+            Config, GroqModelProviderConfig, ModelProviderConfig, XaiModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "xai.oauth",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.xai.insert(
+            "oauth".to_string(),
+            XaiModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("grok-4.3".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let temp = tempfile::tempdir().expect("temp zeroclaw dir");
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "xAI OAuth fallbacks may intentionally omit api_key: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn resilient_alias_allows_local_fallback_without_profile_api_key() {
+        use zeroclaw_config::schema::{
+            Config, GroqModelProviderConfig, ModelProviderConfig, OllamaModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.groq.insert(
+            "primary".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "ollama.local",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama3.2".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "groq",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "local fallback providers may intentionally omit api_key: {}",
             result.err().unwrap()
         );
     }
@@ -3762,6 +4738,7 @@ mod tests {
             GroqModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("llama-3.3-70b-versatile".to_string()),
+                    api_key: Some("a-key".to_string()),
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new("groq.b")],
                     ..Default::default()
                 },
@@ -3772,6 +4749,7 @@ mod tests {
             GroqModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("llama-3.1-8b-instant".to_string()),
+                    api_key: Some("b-key".to_string()),
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new("groq.a")],
                     ..Default::default()
                 },
@@ -3790,6 +4768,75 @@ mod tests {
         assert!(
             result.is_ok(),
             "a fallback cycle must be pruned, never loop or abort the build"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_cross_family_no_leak() {
+        // Two different provider families (openai and anthropic) each with
+        // distinct max_tokens. Each agent resolves only its own provider's
+        // options, so a different provider's max_tokens cannot leak across
+        // agent boundaries.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+
+        // OpenAI alias with max_tokens = 16384.
+        config.providers.models.openai.insert(
+            "gpt".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("fake-openai-key-not-real".to_string()),
+                    max_tokens: Some(16_384),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        // Anthropic alias with a different max_tokens.
+        config.providers.models.anthropic.insert(
+            "sonnet".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".to_string()),
+                    api_key: Some("fake-anthropic-key-not-real".to_string()),
+                    max_tokens: Some(8_192),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "openai_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.gpt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "anthropic_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.sonnet".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
+        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+
+        assert_eq!(
+            openai_opts.provider_max_tokens,
+            Some(16_384),
+            "openai agent must get its own max_tokens, not the anthropic provider's"
+        );
+        assert_eq!(
+            anthropic_opts.provider_max_tokens,
+            Some(8_192),
+            "anthropic agent must get its own max_tokens, not the openai provider's"
         );
     }
 
@@ -3813,6 +4860,7 @@ mod tests {
                 GroqModelProviderConfig {
                     base: ModelProviderConfig {
                         model: Some("llama-3.3-70b-versatile".to_string()),
+                        api_key: Some(format!("a{i}-key")),
                         fallback,
                         ..Default::default()
                     },
@@ -3834,4 +4882,89 @@ mod tests {
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
+}
+
+/// Attempt to fetch context window from provider's /models endpoint.
+/// Returns `None` on any failure (network, parsing, missing field) — caller uses fallback.
+pub async fn fetch_context_window(
+    provider_type: &str,
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    match provider_type {
+        "openrouter" => fetch_openrouter_context_window(config).await,
+        "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
+        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
+        _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
+    }
+}
+
+async fn fetch_openrouter_context_window(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let url = openrouter_context_window_url(config);
+    let resp = client
+        .get(url.as_ref())
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let model = config.model.as_deref().unwrap_or("");
+    resp["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?["context_length"]
+        .as_u64()
+        .map(|v| v as usize)
+}
+
+fn openrouter_context_window_url(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> std::borrow::Cow<'_, str> {
+    config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .map_or_else(
+            || std::borrow::Cow::Owned(openrouter::endpoint_url("models")),
+            std::borrow::Cow::Borrowed,
+        )
+}
+
+async fn fetch_openai_compatible_context_window(
+    provider_type: &str,
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let default_uri = default_model_provider_url(provider_type);
+    let base_url = config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .or(default_uri)
+        .unwrap_or("");
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let Some(key) = config.api_key.as_deref() {
+        req = req.bearer_auth(key);
+    }
+    let resp = req
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let model = config.model.as_deref().unwrap_or("");
+    let model_entry = resp["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?;
+    model_entry
+        .get("context_length")
+        .or_else(|| model_entry.get("context_window"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
 }

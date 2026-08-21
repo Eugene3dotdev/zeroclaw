@@ -1,16 +1,6 @@
 //! Curated sections surface — a flat ordered set of [`Section`]s the
 //! operator walks (new install) or scans (returning user) to configure
 //! a working ZeroClaw deployment.
-//!
-//! Every fact about a section (its enum variant, its on-the-wire key,
-//! its UI shape, its help blurb, its canonical position) lives in ONE
-//! table — the `sections!` invocation below. The macro expands that
-//! table into the [`Section`] enum, every per-variant `match` helper,
-//! and the [`QUICKSTART_SECTIONS`] const, so adding a section is exactly
-//! one row, no hand-listed variant set anywhere else.
-//!
-//! Consumers (CLI runtime, gateway, dashboard) dispatch off this enum;
-//! drift is a compile error.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,11 +25,91 @@ pub enum SectionShape {
     BackendPicker,
 }
 
-/// Humanize a section wire key for display (`risk_profiles` → `Risk profiles`,
-/// `providers.models` → `Model providers`). Single source of truth for section
-/// labels across the gateway dashboard, zerocode Config pane, and docs. Specific
-/// wording overrides are listed explicitly; everything else is mechanically
-/// title-cased from the key.
+/// Display group for a curated or schema-derived configuration section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SectionGroup {
+    /// Quickstart-walked essentials: providers, profiles, channels,
+    /// agents — the most-edited sections, surfaced first.
+    Foundation,
+    /// Agent loop, scheduling, and orchestration tuning.
+    Agent,
+    /// Multi-agent / delegation.
+    MultiAgent,
+    /// Tool integrations the agent can call.
+    Tools,
+    /// External services / vendor integrations.
+    Integrations,
+    /// Networking / multi-node infrastructure.
+    Network,
+    /// Storage, identity, secrets.
+    Storage,
+    /// Operations / monitoring / safety / cost.
+    Operations,
+    /// Catch-all for keys no one has curated yet.
+    Other,
+}
+
+impl SectionGroup {
+    /// UI label. These exact strings are what `ConfigSectionEntry.group`
+    /// carries on the wire and what the dashboard's `GROUP_ORDER`
+    /// (web/src/pages/Config.tsx) and the zerocode Config pane group
+    /// by — change one, change all of them together.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Foundation => "Foundation",
+            Self::Agent => "Agent",
+            Self::MultiAgent => "Multi-agent",
+            Self::Tools => "Tools",
+            Self::Integrations => "Integrations",
+            Self::Network => "Network",
+            Self::Storage => "Storage",
+            Self::Operations => "Operations",
+            Self::Other => "Other",
+        }
+    }
+
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        SECTION_GROUPS.iter().copied().find(|g| g.label() == label)
+    }
+}
+
+impl std::fmt::Display for SectionGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Canonical display order for section groups across every Config
+/// surface (dashboard sidebar, zerocode Config pane). "All sections"
+/// is not a group — a surface that offers a flat default view renders
+/// that view itself; this list orders the grouped presentation.
+pub const SECTION_GROUPS: &[SectionGroup] = &[
+    SectionGroup::Foundation,
+    SectionGroup::Agent,
+    SectionGroup::MultiAgent,
+    SectionGroup::Tools,
+    SectionGroup::Integrations,
+    SectionGroup::Network,
+    SectionGroup::Storage,
+    SectionGroup::Operations,
+    SectionGroup::Other,
+];
+
+#[must_use]
+pub fn section_group_for_key(key: &str) -> SectionGroup {
+    if let Some(s) = Section::from_key(key) {
+        return s.group();
+    }
+    crate::schema::Config::nested_section_group(key)
+        .or_else(|| crate::schema::Config::nested_section_group(&key.replace('-', "_")))
+        .and_then(SectionGroup::from_label)
+        .unwrap_or(SectionGroup::Other)
+}
+
 #[must_use]
 pub fn humanize_section_key(key: &str) -> String {
     match key {
@@ -48,42 +118,25 @@ pub fn humanize_section_key(key: &str) -> String {
         "providers.transcription" => return "Transcription providers".to_string(),
         _ => {}
     }
-    let mut s = key.replace(['_', '-'], " ");
+    let mut s = key.replace(['_', '-', '.'], " ");
     if let Some(c) = s.get_mut(0..1) {
         c.make_ascii_uppercase();
     }
     s
 }
 
-/// Single source of truth for every pickable config section. Each row
-/// maps 1:1 to a dashboard `/config/<key>` page, a CLI
-/// `zeroclaw quickstart` flow and the gateway section picker handler.
-/// Adding/removing a section is one row here and every consumer's
-/// `match` either compiles cleanly or fails with an exhaustiveness
-/// error pointing at exactly what needs an arm.
-///
-/// Row order is the canonical order operators see in the dashboard
-/// and walk through in the CLI. It is dependency-correct: every
-/// downstream alias reference an Agent carries (model_provider,
-/// risk_profile, runtime_profile, channels, *_bundles) appears earlier
-/// in the list than [`Section::Agents`], so walking top-to-bottom
-/// never produces a dangling reference.
 macro_rules! sections {
     (
         $(
             $var:ident => {
                 key:   $key:literal,
                 shape: $shape:ident,
+                group: $group:ident,
                 help:  $help:expr $(,)?
             }
         ),+ $(,)?
     ) => {
-        /// One pickable section. The variant ordering follows the
-        /// `sections!` macro invocation.
-        ///
-        /// With the `clap` feature on, this enum doubles as the
-        /// `zeroclaw quickstart` and curated-section endpoints — no separate
-        /// mirror enum in the binary crate.
+        /// One configuration section exposed by the curated section registry.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[cfg_attr(feature = "clap", derive(clap::Subcommand))]
@@ -121,6 +174,13 @@ macro_rules! sections {
                 }
             }
 
+            #[must_use]
+            pub const fn group(self) -> SectionGroup {
+                match self {
+                    $( Self::$var => SectionGroup::$group, )+
+                }
+            }
+
             /// Per-section help blurb — single source of truth for
             /// the copy shown above the section's picker / form on
             /// every surface (CLI `ui.note(...)`, TUI heading,
@@ -149,17 +209,6 @@ macro_rules! sections {
                 }
             }
 
-            /// Parse a stable wire key, tolerating both the snake and
-            /// kebab spellings of any section. The schema mixes the two:
-            /// `model_providers` (snake) and `peer-groups` (kebab) are
-            /// both valid wire forms produced elsewhere in the codebase.
-            /// Callers (dashboard URL routing, gateway picker dispatch,
-            /// CLI clap subcommands) can pass either form; `from_key`
-            /// resolves to the same variant. Returns `None` for keys
-            /// outside the known section table. Named `from_key` rather
-            /// than `from_str` so clippy doesn't flag it as confusable
-            /// with `std::str::FromStr` (parse failure is `None`, not
-            /// `Err(_)`).
             #[must_use]
             pub fn from_key(s: &str) -> Option<Self> {
                 let try_match = |s: &str| -> Option<Self> {
@@ -198,10 +247,31 @@ sections! {
     ModelProviders => {
         key:   "providers.models",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Pick a model provider to configure (Anthropic, OpenAI, OpenRouter, \
                 Ollama, custom OpenAI-compatible gateways, etc.). Multiple aliases per \
                 provider are supported — e.g. anthropic.production and anthropic.dev \
                 can coexist.",
+    },
+
+    // Tier 1b — Routing. Named hints that map a short alias to a
+    // provider + model combo. Routes depend on providers, so they
+    // follow Tier 1.
+    ModelRoutes => {
+        key:   "model_routes",
+        shape: OneTierAliasMap,
+        group: Foundation,
+        help:  "Named model routing hints (e.g. reasoning, fast, code). Each \
+                route maps a hint to a specific provider + model combo. Use \
+                `hint:<name>` as the model parameter to dispatch through a route.",
+    },
+    EmbeddingRoutes => {
+        key:   "embedding_routes",
+        shape: OneTierAliasMap,
+        group: Foundation,
+        help:  "Named embedding routing hints (e.g. semantic, archive, faq). \
+                Each route maps a hint to an embedding-capable provider + model \
+                combo. Use `hint:<name>` as the embedding_model parameter.",
     },
 
     // Tier 2 — Behavior shape. agents.<alias>.risk_profile and
@@ -210,12 +280,14 @@ sections! {
     RiskProfiles => {
         key:   "risk_profiles",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named risk profiles binding allowlists, denylists, and approval \
                 thresholds. Agents reference one via `agents.<alias>.risk_profile`.",
     },
     RuntimeProfiles => {
         key:   "runtime_profiles",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named runtime tuning profiles (token limits, retry policy, timeouts). \
                 Agents reference one via `agents.<alias>.runtime_profile`.",
     },
@@ -225,6 +297,7 @@ sections! {
     Storage => {
         key:   "storage",
         shape: TypedFamilyMap,
+        group: Storage,
         help:  "SQLite is the safe default for single-node installs (file-based, \
                 zero-config, no extra services). Pick Postgres for shared or \
                 multi-instance deployments, Qdrant for vector search, Markdown or \
@@ -234,6 +307,7 @@ sections! {
     Memory => {
         key:   "memory",
         shape: BackendPicker,
+        group: Foundation,
         help:  "Persistent memory backend. SQLite is the default; pick `none` to \
                 disable long-term recall entirely.",
     },
@@ -243,6 +317,7 @@ sections! {
     Skills => {
         key:   "skills",
         shape: DirectForm,
+        group: Foundation,
         help:  "Skills tool settings — where skill markdown lives on disk (defaults \
                 to the data dir), and how the skills loader handles community \
                 repositories. Add skill BUNDLES under `skill-bundles` below.",
@@ -250,18 +325,21 @@ sections! {
     SkillBundles => {
         key:   "skill_bundles",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named bundles of skill files. Agents reference a bundle to load a \
                 set of capabilities at startup.",
     },
     Mcp => {
         key:   "mcp",
         shape: DirectForm,
+        group: Tools,
         help:  "Model Context Protocol settings. Toggle `enabled` and pick deferred \
                 or eager loading. Individual MCP servers live under `mcp.servers[]`.",
     },
     McpServers => {
         key:   "mcp.servers",
         shape: OneTierAliasMap,
+        group: Tools,
         help:  "Individual Model Context Protocol servers. Each entry binds a \
                 transport (stdio, http, sse), the command or URL to reach it, \
                 optional headers, and a `tool_timeout_secs` cap (≤ 600). Each \
@@ -272,12 +350,15 @@ sections! {
     McpBundles => {
         key:   "mcp_bundles",
         shape: OneTierAliasMap,
-        help:  "Named bundles of MCP servers. Agents reference a bundle to pull in \
-                a set of MCP tools as one unit.",
+        group: Tools,
+        help:  "Named bundles of MCP servers, granted to agents that list the bundle \
+                in their `mcp_bundles`. Secure by default: an agent gets only the \
+                servers its bundles grant; with no bundle it gets no MCP servers.",
     },
     KnowledgeBundles => {
         key:   "knowledge_bundles",
         shape: OneTierAliasMap,
+        group: Tools,
         help:  "Named bundles of knowledge sources (RAG indexes, doc folders). Agents \
                 reference a bundle to surface relevant snippets at inference time.",
     },
@@ -286,12 +367,14 @@ sections! {
     TtsProviders => {
         key:   "providers.tts",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Text-to-speech providers (OpenAI, ElevenLabs, Google, Edge, Piper). \
                 Configure one per voice / language; agents reference them by alias.",
     },
     TranscriptionProviders => {
         key:   "providers.transcription",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Speech-to-text providers (OpenAI Whisper, Groq, Deepgram, AssemblyAI, \
                 Google, local Whisper). Configure one per pipeline; agents reference \
                 them by alias.",
@@ -302,24 +385,23 @@ sections! {
     Channels => {
         key:   "channels",
         shape: TypedFamilyMap,
-        help:  "Pick which chat platforms ZeroClaw should listen on. You can \
-                configure multiple — each channel gets its own alias.",
+        group: Foundation,
+        help:  "Pick which chat platforms ZeroClaw should listen on. Global \
+                channel settings live on `[channels]`; each configured platform \
+                still gets its own alias.",
     },
     Hardware => {
         key:   "hardware",
         shape: DirectForm,
+        group: Foundation,
         help:  "Optional: hardware peripherals (Arduino, STM32, GPIO, etc.). \
                 Skip if you don't need them.",
     },
 
-    // Tier 7 — Bind. Pulls tiers 1–6 together. Every alias ref an
-    // Agent carries exists by this point.
-    // Personality is intentionally NOT a top-level section —
-    // markdown personality files live per-agent and surface inside the
-    // agent edit form.
     Agents => {
         key:   "agents",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "An agent binds a model provider, profiles, bundles, and channels \
                 into one dispatchable unit. Add one per persona; reuse the same \
                 alias across channels to share state.",
@@ -330,6 +412,7 @@ sections! {
     PeerGroups => {
         key:   "peer_groups",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named groups binding a channel, member agents, and external peers. \
                 Mutual opt-in: two agents become peers only when both appear in the \
                 same group's `agents` list.",
@@ -337,6 +420,7 @@ sections! {
     Cron => {
         key:   "cron",
         shape: OneTierAliasMap,
+        group: Agent,
         help:  "Scheduled tasks. Each cron entry binds a schedule expression to a \
                 prompt, channel, and target.",
     },
@@ -346,19 +430,15 @@ sections! {
     Tunnel => {
         key:   "tunnel",
         shape: BackendPicker,
+        group: Foundation,
         help:  "Optional: expose your gateway over the public internet via Cloudflare \
                 or ngrok. Pick `none` to keep it localhost-only.",
     },
 
-    // Tier 10 — Lifecycle state. Not part of any agent dependency
-    // chain. Tracks whether the Quickstart has completed on this
-    // install; surfaces dispatch on it to decide whether to auto-open
-    // the Quickstart on launch. The on-disk TOML key stays
-    // `onboard_state` for backwards compatibility with installs that
-    // already wrote against it; only the in-code symbol is renamed.
     QuickstartState => {
         key:   "onboard_state",
         shape: DirectForm,
+        group: Operations,
         help:  "Quickstart lifecycle state. `quickstart_completed` flips to true \
                 once the Quickstart finishes a successful run; while false, the \
                 web gateway and TUI auto-launch the Quickstart on startup. \
@@ -396,24 +476,6 @@ pub fn is_known_section(key: &str) -> bool {
     Section::from_key(key).is_some()
 }
 
-/// Help blurb for a section key, covering both `Section` variants and
-/// the long tail of top-level `Config` fields the dashboard / TUI config
-/// editor surface (gateway, scheduler, observability, …). Single source
-/// of truth shared by every surface — the gateway sidebar, the CLI
-/// Quickstart flow, and the future TUI config editor all call this rather
-/// than maintaining parallel tables.
-///
-/// Resolution order:
-/// 1. `Section` variants (curated `help` text next to the variant
-///    declaration in the `sections!` macro).
-/// 2. The `Config` struct's `#[nested]` field-level `///` docstring,
-///    harvested by the `Configurable` derive into
-///    `Config::nested_section_help`. This is what makes adding a new
-///    top-level section a one-line schema change with no parallel
-///    help table to update.
-///
-/// Returns `""` for keys without a docstring so callers can decide
-/// whether to omit the help row or show a fallback.
 #[must_use]
 pub fn section_help(key: &str) -> &'static str {
     if let Some(s) = Section::from_key(key) {
@@ -430,38 +492,19 @@ pub fn section_for_path(path: &str) -> Option<Section> {
     Section::from_key(path.split('.').next()?)
 }
 
-/// Does this section show any signal of having been touched on this
-/// install? Used by callers (RPC config-list filtering, lifecycle
-/// dispatch) to decide whether to surface a section as "untouched".
-///
-/// Each variant decides what counts as a real signal vs a default
-/// value that round-trips identically across a fresh install.
 pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool {
     match section {
         Section::ModelProviders => !cfg.providers.models.is_empty(),
-        // `channels.cli: bool` is a default-true scalar that lives directly
-        // under `channels.*`, so a bare `starts_with("channels.")` check
-        // fires on every fresh install. Require a nested channel config
-        // (e.g. `channels.telegram.bot-token`) — anything with a second dot
-        // segment — to count as user-driven signal.
         Section::Channels => cfg.prop_fields().iter().any(|f| {
             f.name
                 .strip_prefix("channels.")
                 .is_some_and(|rest| rest.contains('.'))
         }),
         Section::Hardware => cfg.hardware.enabled,
-        // Servers' existence in the Vec is the signal — a fresh install
-        // has an empty `mcp.servers`, so any element at all (even one
-        // with no command set) counts as user intent to use MCP. The
-        // parent `Mcp` section stays marker-only because its top-level
-        // booleans (`enabled`, `deferred_loading`) have meaningful
-        // defaults that are indistinguishable from user choice.
         Section::McpServers => !cfg.mcp.servers.is_empty(),
-        // Memory's default backend is "sqlite" and Tunnel's is "none" —
-        // both are valid user choices indistinguishable from untouched
-        // defaults. TTS / transcription providers and agents start
-        // empty; their existence in the typed family map IS the signal,
-        // not a derivable default-divergence. Marker-only for these.
+        // Routes' existence in the Vec is the signal, same as McpServers.
+        Section::ModelRoutes => !cfg.model_routes.is_empty(),
+        Section::EmbeddingRoutes => !cfg.embedding_routes.is_empty(),
         Section::TtsProviders
         | Section::TranscriptionProviders
         | Section::Memory
@@ -485,11 +528,18 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
 mod tests {
     use super::*;
 
-    /// Round-trip every entry in the canonical list. `from_key`,
-    /// `as_str`, `section_index`, and `QUICKSTART_SECTIONS` are all
-    /// generated from the same `sections!` row, so this test exercises
-    /// the table — adding a row that breaks any of them fails here
-    /// without listing variants by hand.
+    #[test]
+    fn humanize_strips_dots_underscores_and_hyphens() {
+        assert_eq!(humanize_section_key("mcp.servers"), "Mcp servers");
+        assert_eq!(humanize_section_key("mcp_bundles"), "Mcp bundles");
+        assert_eq!(
+            humanize_section_key("knowledge-bundles"),
+            "Knowledge bundles"
+        );
+        assert_eq!(Section::McpServers.label(), "Mcp servers");
+        assert_eq!(Section::McpBundles.label(), "Mcp bundles");
+    }
+
     #[test]
     fn sections_round_trip() {
         for s in QUICKSTART_SECTIONS {
@@ -503,10 +553,6 @@ mod tests {
         assert_eq!(Section::from_key("not_a_section"), None);
     }
 
-    /// Every section the dashboard URL surface points at must resolve
-    /// through `Section::from_key`. The dashboard URL form is kebab-case
-    /// (`peer-groups`), the canonical wire form may be snake_case
-    /// (`peer_groups`); both must parse to the same variant.
     #[test]
     fn dashboard_url_sections_round_trip_kebab_and_snake() {
         let kebab_then_snake: &[(&str, &str, Section)] = &[
@@ -546,10 +592,6 @@ mod tests {
         }
     }
 
-    /// Every OneTierAliasMap section's wire key must appear verbatim
-    /// in `Config::map_key_sections()`. That table is what
-    /// `Config::create_map_key` dispatches off, so a mismatch silently
-    /// breaks the dashboard's `+ Add` affordance.
     #[test]
     fn alias_map_section_wire_keys_match_map_key_sections() {
         use crate::schema::Config;
@@ -575,13 +617,6 @@ mod tests {
         }
     }
 
-    /// `Section::McpServers` is the per-server editor page. It must
-    /// be the `OneTierAliasMap` shape so the dashboard / TUI dispatch
-    /// it to the alias-list renderer (matching `risk_profiles` etc.).
-    /// `Section::Mcp` keeps its `DirectForm` shape so the parent's
-    /// `enabled` / `deferred_loading` toggles render as a normal
-    /// field list. Both must coexist; the parent must not collapse
-    /// into the child when both appear in the curated section list.
     #[test]
     fn mcp_servers_section_has_alias_map_shape_and_parent_keeps_direct_form() {
         assert_eq!(Section::Mcp.shape(), SectionShape::DirectForm);
@@ -603,11 +638,6 @@ mod tests {
         assert!(idx(Section::McpServers) < idx(Section::McpBundles));
     }
 
-    /// Canonical order is dependency-correct: every Section that
-    /// `AliasedAgentConfig` references through an alias field appears
-    /// earlier in the list than `Section::Agents`. Walking
-    /// `QUICKSTART_SECTIONS` top-to-bottom never asks the operator to
-    /// configure an Agent before the things it has to bind to exist.
     #[test]
     fn ordering_respects_agent_dependency_tiers() {
         let idx = |s: Section| {
@@ -648,11 +678,201 @@ mod tests {
         }
     }
 
-    /// Storage help must steer first-time operators toward SQLite as the
-    /// safe default. Pins the contract: SQLite is named, flagged as a
-    /// default/safe/recommended choice, and positioned before the
-    /// alternatives so the recommendation lands first instead of being
-    /// buried in a closing list.
+    #[test]
+    fn section_groups_const_is_exhaustive_unique_and_other_last() {
+        // Exhaustiveness guard: adding a SectionGroup variant without
+        // updating this list (and SECTION_GROUPS) fails to compile here.
+        let all = [
+            SectionGroup::Foundation,
+            SectionGroup::Agent,
+            SectionGroup::MultiAgent,
+            SectionGroup::Tools,
+            SectionGroup::Integrations,
+            SectionGroup::Network,
+            SectionGroup::Storage,
+            SectionGroup::Operations,
+            SectionGroup::Other,
+        ];
+        for g in all {
+            match g {
+                SectionGroup::Foundation
+                | SectionGroup::Agent
+                | SectionGroup::MultiAgent
+                | SectionGroup::Tools
+                | SectionGroup::Integrations
+                | SectionGroup::Network
+                | SectionGroup::Storage
+                | SectionGroup::Operations
+                | SectionGroup::Other => {}
+            }
+            assert!(
+                SECTION_GROUPS.contains(&g),
+                "{g:?} missing from SECTION_GROUPS",
+            );
+        }
+        assert_eq!(
+            SECTION_GROUPS.len(),
+            all.len(),
+            "duplicate group in SECTION_GROUPS"
+        );
+        assert_eq!(
+            SECTION_GROUPS.last(),
+            Some(&SectionGroup::Other),
+            "Other must render last in every grouped surface",
+        );
+    }
+
+    #[test]
+    fn group_labels_are_pinned_for_ui_compat() {
+        let expected = [
+            "Foundation",
+            "Agent",
+            "Multi-agent",
+            "Tools",
+            "Integrations",
+            "Network",
+            "Storage",
+            "Operations",
+            "Other",
+        ];
+        for (g, want) in SECTION_GROUPS.iter().zip(expected) {
+            assert_eq!(g.label(), want);
+            assert_eq!(g.to_string(), want);
+        }
+    }
+
+    #[test]
+    fn curated_sections_never_fall_into_other() {
+        for s in QUICKSTART_SECTIONS {
+            assert_ne!(
+                s.group(),
+                SectionGroup::Other,
+                "Section::{s:?} needs a real group in its sections! row",
+            );
+        }
+    }
+
+    #[test]
+    fn section_group_for_key_resolves_curated_tail_and_unknown() {
+        // Curated rows, including former gap sections.
+        assert_eq!(
+            section_group_for_key("providers.models"),
+            SectionGroup::Foundation
+        );
+        assert_eq!(
+            section_group_for_key("providers.tts"),
+            SectionGroup::Foundation
+        );
+        assert_eq!(section_group_for_key("mcp.servers"), SectionGroup::Tools);
+        assert_eq!(section_group_for_key("mcp_bundles"), SectionGroup::Tools);
+        assert_eq!(
+            section_group_for_key("knowledge_bundles"),
+            SectionGroup::Tools
+        );
+        assert_eq!(section_group_for_key("cron"), SectionGroup::Agent);
+        assert_eq!(section_group_for_key("storage"), SectionGroup::Storage);
+        // Kebab spelling resolves like snake.
+        assert_eq!(
+            section_group_for_key("peer-groups"),
+            SectionGroup::Foundation
+        );
+        // Hand-mapped long tail (formerly in the gateway).
+        assert_eq!(section_group_for_key("gateway"), SectionGroup::Network);
+        assert_eq!(
+            section_group_for_key("observability"),
+            SectionGroup::Operations
+        );
+        assert_eq!(section_group_for_key("delegate"), SectionGroup::MultiAgent);
+        assert_eq!(section_group_for_key("web_search"), SectionGroup::Tools);
+        assert_eq!(section_group_for_key("secrets"), SectionGroup::Storage);
+        // Kebab spelling of a SCHEMA-grouped (non-curated) root resolves
+        // through the kebab→snake fallback to the snake-keyed
+        // `nested_section_group` arm. (`web_search`/`data_retention` are
+        // schema `#[group]` fields, not curated `sections!` rows.)
+        assert_eq!(section_group_for_key("web-search"), SectionGroup::Tools);
+        assert_eq!(
+            section_group_for_key("data-retention"),
+            SectionGroup::Operations
+        );
+        // Unknown keys land in the catch-all, never disappear.
+        assert_eq!(section_group_for_key("not_a_section"), SectionGroup::Other);
+    }
+
+    #[test]
+    fn every_surfaced_root_has_a_group() {
+        use crate::schema::Config;
+        let cfg = Config::default();
+        let roots: std::collections::BTreeSet<String> = cfg
+            .prop_fields()
+            .iter()
+            .filter_map(|f| f.name.split('.').next().map(str::to_string))
+            .collect();
+
+        // System/bookkeeping root the explorer hides; resolved at
+        // runtime, never user-edited, so intentionally ungrouped.
+        const HIDDEN: &[&str] = &["schema_version"];
+
+        const UNGROUPED: &[&str] = &[
+            "escalation",
+            "locale",
+            "microsoft365",
+            "file_upload",
+            "file_upload_bundle",
+            "file_download",
+            "wss",
+        ];
+
+        let violations: Vec<&String> = roots
+            .iter()
+            .filter(|r| !HIDDEN.contains(&r.as_str()) && !UNGROUPED.contains(&r.as_str()))
+            .filter(|r| section_group_for_key(r) == SectionGroup::Other)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "these surfaced config roots resolve to SectionGroup::Other — add a \
+             `#[group = \"...\"]` to each in schema.rs (or, if intentionally \
+             uncurated, to the UNGROUPED allowlist): {violations:?}",
+        );
+
+        // Keep the allowlist from rotting: each entry must still be a
+        // surfaced root and still ungrouped.
+        for u in UNGROUPED {
+            assert!(
+                roots.contains(*u),
+                "UNGROUPED lists `{u}` but it is no longer a surfaced root — remove it",
+            );
+            assert_eq!(
+                section_group_for_key(u),
+                SectionGroup::Other,
+                "`{u}` now resolves to a real group — remove it from UNGROUPED",
+            );
+        }
+    }
+
+    #[test]
+    fn migrated_hand_list_roots_keep_their_groups() {
+        let expected = [
+            ("claude_code", SectionGroup::Integrations),
+            ("codex_cli", SectionGroup::Integrations),
+            ("gemini_cli", SectionGroup::Integrations),
+            ("opencode_cli", SectionGroup::Integrations),
+            ("sop", SectionGroup::Agent),
+            ("verifiable_intent", SectionGroup::Agent),
+            ("shell_tool", SectionGroup::Tools),
+            ("observability", SectionGroup::Operations),
+            ("gateway", SectionGroup::Network),
+            ("delegate", SectionGroup::MultiAgent),
+            ("secrets", SectionGroup::Storage),
+        ];
+        for (key, group) in expected {
+            assert_eq!(
+                section_group_for_key(key),
+                group,
+                "`{key}` should resolve to {group:?} via its #[group] attribute",
+            );
+        }
+    }
+
     #[test]
     fn storage_help_steers_to_sqlite_default() {
         let help = section_help("storage").to_lowercase();

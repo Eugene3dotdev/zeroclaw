@@ -324,12 +324,6 @@ api_token = "linq-api-token"
 from_phone = "+15555550103"
 allowed_senders = ["+15555550104"]
 
-[channels_config.wati]
-enabled = false
-api_token = "wati-api-token"
-api_url = "https://live-mt-server.wati.io"
-allowed_numbers = ["+15555550105"]
-
 [channels_config.nextcloud_talk]
 enabled = false
 base_url = "https://cloud.example.com"
@@ -534,6 +528,7 @@ allowed_domains = ["*"]
 backend = "agent_browser"
 native_headless = true
 native_webdriver_url = "http://127.0.0.1:9515"
+allowed_private_hosts = []
 
 [browser.computer_use]
 endpoint = "http://127.0.0.1:8787/v1/actions"
@@ -590,6 +585,7 @@ timeout_secs = 10
 [text_browser]
 enabled = false
 timeout_secs = 30
+allowed_private_hosts = []  # No private hosts by default; opt-in to allow localhost / RFC1918 / .local
 
 [web_search]
 enabled = true

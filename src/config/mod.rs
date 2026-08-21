@@ -40,7 +40,7 @@ pub use schema::{
 };
 
 pub use schema::ModelProviderConfig;
-// Per-family model model_provider configs (typed split — #6273). Re-exported here
+// Per-family model model_provider configs (typed split — Re-exported here
 // so tests + downstream binary callers can construct typed family entries
 // without reaching into `zeroclaw_config::schema` directly.
 pub use schema::{
@@ -94,6 +94,7 @@ mod tests {
         let telegram = TelegramConfig {
             enabled: true,
             bot_token: "token".into(),
+            api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
@@ -104,6 +105,7 @@ mod tests {
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
+            debounce_ms: None,
         };
 
         let discord = DiscordConfig {
@@ -115,11 +117,15 @@ mod tests {
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_command_scope: schema::SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            slash_commands: false,
+            intents_mask: None,
+            reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -140,13 +146,15 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
+            app_token: None,
+            bot_token: None,
             webhook_secret: None,
             proxy_url: None,
             bot_name: None,
