@@ -174,10 +174,10 @@ One type per family; pick the region via the typed `endpoint` field on the alias
 
 ### Custom OpenAI-compatible endpoint
 
-The `custom` slot requires `uri`. See [Custom providers](./custom.md). For a
-loopback OpenAI Responses gateway (for example CLIProxyAPI), set
-`wire_api = "responses"`, point `uri` at `http://127.0.0.1:<port>/v1`, inject the
-local token via `ZEROCLAW_providers__models__custom__<alias>__api_key`, and keep
+The `custom` slot requires `uri`. See [Custom providers](./custom.md). For the
+CLIProxyAPI gateway, point `uri` at `https://cliproxyapi.eu3.dev/v1`, set
+`wire_api = "responses"`, inject the ZeroClaw gateway key via
+`ZEROCLAW_providers__models__custom__<alias>__api_key`, and keep
 `requires_openai_auth` unset so the branded OpenAI / Codex subscription path is
 not reused.
 
