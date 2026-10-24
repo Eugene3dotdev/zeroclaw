@@ -2225,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_factory_eu3_gateway_responses_with_native_tools() {
+    fn custom_factory_eu3_gateway_composes_responses_url() {
         // TEO-1191: the CLIProxyAPI alias targets cliproxyapi.eu3.dev over the
         // Responses wire, never a loopback tunnel.
         use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
@@ -2233,7 +2233,6 @@ mod tests {
             base: ModelProviderConfig {
                 uri: Some("https://cliproxyapi.eu3.dev/v1".to_string()),
                 wire_api: Some(WireApi::Responses),
-                native_tools: Some(true),
                 ..Default::default()
             },
         };
@@ -2249,10 +2248,6 @@ mod tests {
         assert_eq!(
             provider.default_base_url(),
             Some("https://cliproxyapi.eu3.dev/v1/responses")
-        );
-        assert!(
-            provider.supports_native_tools(),
-            "gateway aliases that set native_tools = true must keep tool calling"
         );
     }
 

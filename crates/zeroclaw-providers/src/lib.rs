@@ -2965,15 +2965,17 @@ mod tests {
             let _lock = env_lock();
             let _key = EnvGuard::set(KEY_ENV, key);
             let mut config = Config::default();
+            zeroclaw_config::env_overrides::apply_env_overrides(&mut config)
+                .expect("env overrides apply");
             let entry = config
                 .providers
                 .models
                 .ensure("custom", "cliproxyapi")
                 .expect("custom slot");
+            // Set after the overrides so no ambient env var can redirect the
+            // request away from the stub.
             entry.uri = Some(format!("http://{addr}/v1"));
             entry.wire_api = Some(WireApi::Responses);
-            zeroclaw_config::env_overrides::apply_env_overrides(&mut config)
-                .expect("env overrides apply");
             config
         };
         let chat = |config: Config| async move {
