@@ -2225,12 +2225,13 @@ mod tests {
     }
 
     #[test]
-    fn custom_factory_loopback_gateway_responses_with_native_tools() {
-        // CEL-856: CLIProxyAPI-style custom alias (loopback + Responses + tools).
+    fn custom_factory_eu3_gateway_responses_with_native_tools() {
+        // TEO-1191: the CLIProxyAPI alias targets cliproxyapi.eu3.dev over the
+        // Responses wire, never a loopback tunnel.
         use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
         let cfg = CustomModelProviderConfig {
             base: ModelProviderConfig {
-                uri: Some("http://127.0.0.1:8317/v1".to_string()),
+                uri: Some("https://cliproxyapi.eu3.dev/v1".to_string()),
                 wire_api: Some(WireApi::Responses),
                 native_tools: Some(true),
                 ..Default::default()
@@ -2239,15 +2240,19 @@ mod tests {
         let provider = cfg
             .create_provider(
                 "cliproxyapi",
-                Some("local-gateway-token"),
-                Some("http://127.0.0.1:8317/v1"),
+                Some("teo-1191-placeholder-key"),
+                Some("https://cliproxyapi.eu3.dev/v1"),
                 &ModelProviderRuntimeOptions::default(),
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
+        assert_eq!(
+            provider.default_base_url(),
+            Some("https://cliproxyapi.eu3.dev/v1/responses")
+        );
         assert!(
             provider.supports_native_tools(),
-            "loopback gateway aliases that set native_tools = true must keep tool calling"
+            "gateway aliases that set native_tools = true must keep tool calling"
         );
     }
 
