@@ -1394,6 +1394,42 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         })
         .boxed()
     }
+
+    /// Sends one `GET <base>/models` with the configured key. It never retries
+    /// and never sends without a key, because gateways ban clients after
+    /// repeated auth failures.
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        use anyhow::Context as _;
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "{} model list needs an API key; none is configured",
+                self.alias
+            ))
+        })?;
+        let url = format!(
+            "{}/models",
+            self.responses_url.trim_end_matches("/responses")
+        );
+        let response = self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {credential}"))
+            .send()
+            .await
+            .with_context(|| format!("{} model list request failed: {url}", self.alias))?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "{} model list failed at {url}: HTTP {}",
+                self.alias,
+                response.status()
+            );
+        }
+        let body: crate::compatible::ModelsResponse = response
+            .json()
+            .await
+            .with_context(|| format!("{} model list returned invalid JSON", self.alias))?;
+        Ok(crate::compatible::normalize_model_ids(body))
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider {
@@ -2626,5 +2662,85 @@ mod tests {
             wire_tools.is_empty(),
             "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_list_models_reads_gateway_catalog_once_with_configured_key() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::{Arc, Mutex};
+
+        const KEY: &str = "teo-1095-synthetic-key";
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let app =
+            Router::new()
+                .route(
+                    "/v1/models",
+                    get(
+                        |State(seen): State<Arc<Mutex<Vec<Option<String>>>>>,
+                         headers: HeaderMap| async move {
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string);
+                            let authorized =
+                                auth.as_deref() == Some(format!("Bearer {KEY}").as_str());
+                            seen.lock().unwrap().push(auth);
+                            if authorized {
+                                Json(serde_json::json!({
+                                    "object": "list",
+                                    "data": [{"id": "stub-model-a"}, {"id": "stub-model-b"}]
+                                }))
+                                .into_response()
+                            } else {
+                                StatusCode::UNAUTHORIZED.into_response()
+                            }
+                        },
+                    ),
+                )
+                .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let gateway = |key: Option<&str>| {
+            OpenAiResponsesModelProvider::builder("cliproxyapi")
+                .api_url(&format!("http://{addr}/v1"))
+                .credential(key)
+                .build()
+        };
+
+        let models = gateway(Some(KEY))
+            .list_models()
+            .await
+            .expect("listing with the configured key succeeds");
+        assert_eq!(models, ["stub-model-a", "stub-model-b"]);
+
+        let err = gateway(Some("teo-1095-revoked-key"))
+            .list_models()
+            .await
+            .expect_err("a rejected key is a reported error");
+        assert!(err.to_string().contains("401"), "{err}");
+
+        gateway(None)
+            .list_models()
+            .await
+            .expect_err("listing without a key is a reported error");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Some(format!("Bearer {KEY}")),
+                Some("Bearer teo-1095-revoked-key".to_string())
+            ],
+            "one request per listing, no retry, and none without a key"
+        );
+        server.abort();
     }
 }

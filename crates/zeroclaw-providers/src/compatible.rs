@@ -248,7 +248,7 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
 }
 
 #[derive(Deserialize)]
-struct ModelsResponse {
+pub(crate) struct ModelsResponse {
     data: Vec<ModelEntry>,
 }
 
@@ -263,7 +263,7 @@ struct ModelEntry {
     pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
 }
 
-fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
+pub(crate) fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
     let mut ids: Vec<String> = body
         .data
         .into_iter()
