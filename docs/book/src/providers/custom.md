@@ -117,9 +117,13 @@ export ZEROCLAW_providers__models__custom__cliproxyapi__api_key="<zeroclaw gatew
 zeroclaw agent -a default -m "hello"
 ```
 
-Without the key, requests fail before they leave the process. The gateway bans
-clients after repeated authentication failures, so ZeroClaw does not retry a
-401 or 403, and a rejected key costs one request.
+Replace the placeholder with the real key. On hosts managed by the EugOT
+dotfiles, the `zeroclaw-proxy` wrapper exports this variable for you.
+
+With this alias and no key, the agent's requests fail before they leave the
+process. The gateway bans clients after repeated authentication failures.
+ZeroClaw does not retry a 401 or 403, so a rejected key costs one request per
+turn, and a long-running daemon still sends one for each incoming message.
 
 Do **not** set `requires_openai_auth = true` on this alias: that path reads the
 Codex / ChatGPT subscription login and is for the branded `openai` slot, not a
