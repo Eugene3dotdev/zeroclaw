@@ -1395,28 +1395,32 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         .boxed()
     }
 
-    /// Sends one `GET <base>/models` with the configured key. It never retries
-    /// and never sends without a key, because gateways ban clients after
-    /// repeated auth failures.
+    /// Never retries and never sends without a key, because a CLIProxyAPI-style
+    /// gateway bans a client after repeated auth failures.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        use anyhow::Context as _;
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "{} model list needs an API key; none is configured",
                 self.alias
             ))
         })?;
-        let url = format!(
-            "{}/models",
-            self.responses_url.trim_end_matches("/responses")
-        );
+        let base = self
+            .responses_url
+            .strip_suffix("/responses")
+            .unwrap_or(&self.responses_url);
+        let url = format!("{base}/models");
         let response = self
             .http_client()
             .get(&url)
             .header("Authorization", format!("Bearer {credential}"))
             .send()
             .await
-            .with_context(|| format!("{} model list request failed: {url}", self.alias))?;
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "{} model list request failed: {url}: {e}",
+                    self.alias
+                ))
+            })?;
         if !response.status().is_success() {
             anyhow::bail!(
                 "{} model list failed at {url}: HTTP {}",
@@ -1424,10 +1428,12 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 response.status()
             );
         }
-        let body: crate::compatible::ModelsResponse = response
-            .json()
-            .await
-            .with_context(|| format!("{} model list returned invalid JSON", self.alias))?;
+        let body: crate::compatible::ModelsResponse = response.json().await.map_err(|e| {
+            anyhow::Error::msg(format!(
+                "{} model list returned invalid JSON: {e}",
+                self.alias
+            ))
+        })?;
         Ok(crate::compatible::normalize_model_ids(body))
     }
 }
@@ -2694,7 +2700,7 @@ mod tests {
                             if authorized {
                                 Json(serde_json::json!({
                                     "object": "list",
-                                    "data": [{"id": "stub-model-a"}, {"id": "stub-model-b"}]
+                                    "data": [{"id": "stub-model-b"}, {"id": " stub-model-a "}]
                                 }))
                                 .into_response()
                             } else {
@@ -2726,12 +2732,15 @@ mod tests {
             .list_models()
             .await
             .expect_err("a rejected key is a reported error");
-        assert!(err.to_string().contains("401"), "{err}");
+        let err = format!("{err:#}");
+        assert!(err.contains("401"), "{err}");
+        assert!(!err.contains("teo-1095-revoked-key"), "{err}");
 
-        gateway(None)
+        let err = gateway(None)
             .list_models()
             .await
             .expect_err("listing without a key is a reported error");
+        assert!(err.to_string().contains("API key"), "{err}");
 
         assert_eq!(
             *seen.lock().unwrap(),
