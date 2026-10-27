@@ -1972,7 +1972,11 @@ api_token = "Bearer from-secret"
         // Spawn a minimal HTTP server that responds with a known body.
         let server_handle = zeroclaw_spawn::spawn!(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read the request first: tokio 1.54 starts accepted sockets as
+                // writable, so an early reply can race ahead of the request.
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello from ipv6!";
                 let _ = stream.write_all(response).await;
                 let _ = stream.flush().await;
