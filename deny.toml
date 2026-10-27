@@ -22,13 +22,6 @@ ignore = [
     # when the nostr-sdk 0.45 migration tracked in #9602 lands. The Security
     # job enforces the exact residual lockfile path before running cargo-deny.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16 remains transitive through nostr-sdk 0.44; affected caches use EventId keys and unit values; nostr-sdk 0.45 migration tracked in #9602" },
-    # rustls-webpki -- two versions in tree; direct dep bumped in #5786 but a
-    # second transitive copy via rumqttc v0.25.1 remains; all advisories below
-    # affect only the 0.102.x copy; the 0.103.x copy is patched
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL matching bug; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; 0.102.x copy via rumqttc v0.25.1 has no fix in 0.102.x series; 0.103.x copy patched at v0.103.13; awaiting rumqttc upgrade" },
 ]
 
 [licenses]
