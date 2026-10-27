@@ -88,6 +88,10 @@ zeroclaw-macros.workspace = true
 prometheus = { version = "0.14", default-features = false, optional = true }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
+# `reqwest-rustls` verifies the OTLP collector against the platform's native
+# trust roots. opentelemetry-otlp 0.33 removed `reqwest-rustls-webpki-roots`
+# (reqwest 0.13 dropped the embedded bundle), so hosts without system CA roots
+# need a custom exporter client built on `webpki-roots` instead.
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 # Optional deps for specific features
 
