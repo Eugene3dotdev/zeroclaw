@@ -577,6 +577,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-mqtt` is outside the default features too; this executes the
+      # MQTT listener tests, including the loopback TLS security tests.
+      - name: Run MQTT channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-mqtt --lib orchestrator::mqtt"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
