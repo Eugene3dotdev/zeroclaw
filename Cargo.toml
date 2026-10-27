@@ -129,7 +129,7 @@ tar = "0.4"
 tempfile = "3.26"
 
 # Zip extraction (plugin registry, self-update archives)
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
 anyhow = "1.0"
@@ -142,7 +142,7 @@ hex = "0.4"
 async-trait = "0.1"
 
 # Memory / persistence (migration.rs, behind agent-runtime)
-rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)

@@ -37,9 +37,8 @@ tool blocks the PR. What actually fails each tool differs by category:
   advisories are reported as allowed warnings and exit 0.
 - **`cargo deny check advisories`**: vulnerability *and* unmaintained
   advisories for crates in the resolved graph are errors (exit 1) —
-  that is exactly why the three live unmaintained denies
-  (`rustls-pemfile`, `proc-macro-error2`, `bitmaps`) must stay in
-  `deny.toml`.
+  that is exactly why the two live unmaintained denies
+  (`rustls-pemfile`, `anymap2`) must stay in `deny.toml`.
   A stale graph-ignore instead emits `advisory-not-detected`, which is
   a warning (exit 0); it is never triggered by removing an entry from
   `.cargo/audit.toml`.
@@ -99,23 +98,17 @@ Live, deny+audit (both files):
 - **`rustls-pemfile` (`RUSTSEC-2025-0134`)**: unmaintained;
   transitive dep awaiting upstream migration to `rustls-pki-types`.
   Present in both `deny.toml` and `audit.toml`.
-- **`proc-macro-error2` (`RUSTSEC-2026-0173`)**: unmaintained
-  derive/attribute macro helper. Still in `cargo deny`'s resolved graph
-  via `matrix-sdk` dev-deps (`aquamarine`) in `zeroclaw-channels`, so it
-  needs the ignore in both files.
-- **`bitmaps` (`RUSTSEC-2026-0247`)**: unmaintained; all versions are
-  affected and no patched version is available. Locked `matrix-sdk`
-  reaches `imbl -> bitmaps` both directly and through `eyeball-im`.
-  Remove the `deny.toml` entry only after `cargo deny` no longer resolves
-  an affected `bitmaps`; remove the `.cargo/audit.toml` entry only after
-  no affected `bitmaps` remains in `Cargo.lock`. Tracking #9899 and
-  matrix-org/matrix-rust-sdk#6859.
+- **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; no fixed release
+  exists. Reached only through `matrix-sdk` 0.19.1. Same ignore as
+  upstream zeroclaw-labs/zeroclaw#11433 (tracked there in #11429). Remove
+  the entry from both files once a `matrix-sdk` release no longer pulls
+  `anymap2`.
 
-The locked `bitmaps 3.2.1` also matches the separate informational
-unsoundness advisory `RUSTSEC-2025-0167`, which describes memory-corruption
-risk and has no patched release. The `RUSTSEC-2026-0247` waiver does not
-ignore that advisory. Under the repository's current Security-job commands,
-it remains an allowed `cargo audit` warning rather than a denied advisory.
+`bitmaps` (`RUSTSEC-2026-0247`) and `proc-macro-error2`
+(`RUSTSEC-2026-0173`) were both live here until the `matrix-sdk` 0.19
+bump (TEO-1240); see the change log entry below. Neither crate is in
+`Cargo.lock` any more, so the visible `bitmaps` unsoundness warning
+(`RUSTSEC-2025-0167`) is gone with them.
 
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
@@ -193,17 +186,14 @@ unaffected by the advisory):
   `Cargo.lock`. `rand` is removed from both files because every
   locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
   not because the crate left `Cargo.lock`. Remaining deny+audit live
-  ignores: `rustls-pemfile`, `proc-macro-error2`, `bitmaps`. Remaining
-  audit-only ignores: `rustls-webpki` (4) plus the 19 lockfile-stale
-  entries above.
+  ignores: `rustls-pemfile`, `anymap2`. Remaining audit-only ignores:
+  `rustls-webpki` (4) plus the 19 lockfile-stale entries above.
 - **#9899**: *Triage and remove bitmaps unmaintained advisory waiver.*
-  Tracks the `RUSTSEC-2026-0247` waiver described above and owns
-  acceptance and revisit of the visible `RUSTSEC-2025-0167` warning.
-  Re-evaluate both when Matrix SDK dependencies change; stop accepting
-  `RUSTSEC-2025-0167` once no affected `bitmaps` remains in `Cargo.lock`
-  or the advisory marks every locked version patched/unaffected. The
-  `RUSTSEC-2026-0247` waiver does not suppress that separate warning.
-  Upstream replacement work is tracked in matrix-org/matrix-rust-sdk#6859.
+  Closed by the `matrix-sdk` 0.19 bump (TEO-1240). The resolved graph and
+  `Cargo.lock` no longer contain `bitmaps` or an affected
+  `imbl-sized-chunks`, so `RUSTSEC-2026-0247`, `RUSTSEC-2026-0292`, and
+  the separate visible `RUSTSEC-2025-0167` warning are all gone, and the
+  waiver text is out of both tool files and this document.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
@@ -228,7 +218,8 @@ If `cargo audit` reports an error-class advisory that is not on the ignore
 list, either add a temporary ignore with rationale and tracking or fix the
 underlying dependency. An informational advisory may remain an unignored
 warning only when its acceptance, owner, and revisit/removal condition are
-documented; `RUSTSEC-2025-0167` is intentionally visible under that rule.
+documented. No advisory is currently accepted under that rule;
+`RUSTSEC-2025-0167` was, until `bitmaps` left `Cargo.lock`.
 
 If `cargo deny` reports an advisory that `cargo audit` does not, the
 two tools have drifted again. Open or update the tracking issue.
@@ -237,6 +228,18 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-10-27 (TEO-1240): Bumped `matrix-sdk` 0.18 to 0.19 (with
+  `rusqlite` 0.37 to 0.40 and the OpenTelemetry stack 0.32 to 0.33, both
+  forced by that bump), following upstream zeroclaw-labs/zeroclaw#11065.
+  Removed the waivers it clears: `RUSTSEC-2026-0247` (`bitmaps`) and
+  `RUSTSEC-2026-0173` (`proc-macro-error2`) came out of `deny.toml` and
+  `.cargo/audit.toml`, and the `RUSTSEC-2025-0167` acceptance note came
+  out of this document. The same bump also clears `RUSTSEC-2026-0292`
+  (`imbl-sized-chunks` 0.1 double free; now 0.2.0) and `RUSTSEC-2026-0318`
+  (`matrix-sdk-crypto` < 0.19 panic; now 0.19.1), neither of which was
+  ever waived here. Added `RUSTSEC-2026-0319` (`anymap2`, unmaintained, no
+  fixed release, reached only via `matrix-sdk` 0.19.1) to both files,
+  mirroring upstream #11433.
 - 2026-08-11: Mirrored the exact `RUSTSEC-2026-0247` `bitmaps` waiver
   from `deny.toml` into `.cargo/audit.toml` and added its dependency
   routes, #9899 lifecycle, and tool-specific removal conditions to this

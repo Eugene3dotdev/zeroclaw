@@ -50,7 +50,7 @@ rand = "0.10"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1.14.0"
@@ -86,9 +86,13 @@ zeroclaw-macros.workspace = true
 
 # Optional deps
 prometheus = { version = "0.14", default-features = false, optional = true }
-opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
+# `reqwest-rustls` verifies the OTLP collector against the platform's native
+# trust roots. opentelemetry-otlp 0.33 removed `reqwest-rustls-webpki-roots`
+# (reqwest 0.13 dropped the embedded bundle), so hosts without system CA roots
+# need a custom exporter client built on `webpki-roots` instead.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 # Optional deps for specific features
 
 [target.'cfg(target_os = "linux")'.dependencies]
