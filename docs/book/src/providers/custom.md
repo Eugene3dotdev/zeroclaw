@@ -84,17 +84,18 @@ wire_api = "responses"
 
 The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
 
-## Loopback OpenAI-compatible gateway (CLIProxyAPI)
+## CLIProxyAPI gateway (cliproxyapi.eu3.dev)
 
-For a local OpenAI-compatible / Responses gateway (for example CLIProxyAPI on
-`127.0.0.1:8317`), use the `custom` slot with an explicit loopback `uri` and
-`wire_api = "responses"`. Keep native OpenAI / Codex subscription aliases on a
-separate config (or leave them unset) so the gateway path stays opt-in:
+The EugOT fork reaches CLIProxyAPI only through its public gateway,
+`https://cliproxyapi.eu3.dev/v1`. Use the `custom` slot with that `uri` and
+`wire_api = "responses"`. Do not point the alias at a loopback tunnel. Keep
+native OpenAI / Codex subscription aliases on a separate config (or leave them
+unset) so the gateway path stays opt-in:
 
 ```toml
 [providers.models.custom.cliproxyapi]
-uri = "http://127.0.0.1:8317/v1"
-model = "gpt-5.6-sol"
+uri = "https://cliproxyapi.eu3.dev/v1"
+model = "<model id from the gateway catalog>"
 wire_api = "responses"
 native_tools = true
 
@@ -106,19 +107,28 @@ risk_profile = "supervised"
 level = "supervised"
 ```
 
-Inject the local gateway token at process start (never commit it). Schema-mirror
-env overrides are never persisted:
+The alias needs a ZeroClaw-specific gateway key, never the shared CLIProxyAPI
+`gateway.key`. Inject it at process start through the schema-mirror env
+override, which is never written back to `config.toml`:
 
 ```sh
 export ZEROCLAW_CONFIG_DIR="$HOME/.zeroclaw-cliproxyapi"
-export ZEROCLAW_providers__models__custom__cliproxyapi__api_key="$(cliproxyapi-client-token)"
+export ZEROCLAW_providers__models__custom__cliproxyapi__api_key="<zeroclaw gateway key>"
 zeroclaw agent -a default -m "hello"
 ```
 
+Replace the placeholder with the real key. On hosts managed by the EugOT
+dotfiles, the `zeroclaw-proxy` wrapper exports this variable for you.
+
+With this alias and no key, the agent's requests fail before they leave the
+process. The gateway bans clients after repeated authentication failures.
+ZeroClaw does not retry a 401 or 403, so a rejected key costs one request per
+turn, and a long-running daemon still sends one for each incoming message.
+
 Do **not** set `requires_openai_auth = true` on this alias: that path reads the
 Codex / ChatGPT subscription login and is for the branded `openai` slot, not a
-foreign loopback gateway. Leave empty `fallback` / `fallback_models` so an
-outage fails closed instead of falling through to another credential.
+foreign gateway. Leave empty `fallback` / `fallback_models` so an outage fails
+closed instead of falling through to another credential.
 
 ## Validation
 

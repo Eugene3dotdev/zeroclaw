@@ -2922,6 +2922,105 @@ mod tests {
         server.abort();
     }
 
+    /// TEO-1191: the documented CLIProxyAPI alias takes its bearer only from
+    /// the schema-mirror env var, sends nothing without one, and spends exactly
+    /// one request on a rejected key, because the gateway bans clients after
+    /// repeated auth failures.
+    #[tokio::test]
+    async fn gateway_alias_sends_env_key_once_and_nothing_without_it() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, WireApi};
+
+        const KEY_ENV: &str = "ZEROCLAW_providers__models__custom__cliproxyapi__api_key";
+
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let bearer = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                recorder.lock().expect("recorder lock").push(bearer);
+                async { (StatusCode::UNAUTHORIZED, "invalid api key") }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub gateway");
+        let addr = listener.local_addr().expect("stub gateway addr");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve stub gateway");
+        });
+
+        let config_with_env_key = |key: Option<&str>| {
+            let _lock = env_lock();
+            let _key = EnvGuard::set(KEY_ENV, key);
+            let mut config = Config::default();
+            zeroclaw_config::env_overrides::apply_env_overrides(&mut config)
+                .expect("env overrides apply");
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", "cliproxyapi")
+                .expect("custom slot");
+            // Set after the overrides so no ambient env var can redirect the
+            // request away from the stub.
+            entry.uri = Some(format!("http://{addr}/v1"));
+            entry.wire_api = Some(WireApi::Responses);
+            config
+        };
+        let chat = |config: Config| async move {
+            let entry = config
+                .providers
+                .models
+                .find("custom", "cliproxyapi")
+                .expect("gateway alias");
+            let provider = create_routed_model_provider_with_options(
+                &config,
+                "custom.cliproxyapi",
+                entry.api_key.as_deref(),
+                entry.uri.as_deref(),
+                &config.reliability,
+                &config.model_routes,
+                "stub-model",
+                &provider_runtime_options_for_alias(&config, "custom", "cliproxyapi"),
+            )
+            .expect("gateway provider builds");
+            provider
+                .chat_with_system(None, "hello", "stub-model", None)
+                .await
+                .expect_err("stub gateway rejects every request")
+                .to_string()
+        };
+
+        let rejected = chat(config_with_env_key(Some("teo-1191-placeholder-key"))).await;
+        assert!(rejected.contains("kind=auth"), "{rejected}");
+        assert_eq!(
+            *seen.lock().expect("recorder lock"),
+            vec![Some("Bearer teo-1191-placeholder-key".to_string())],
+            "one request carrying the env key, and no retry after the 401"
+        );
+
+        let missing = chat(config_with_env_key(None)).await;
+        assert!(missing.contains("non_retryable"), "{missing}");
+        assert_eq!(
+            seen.lock().expect("recorder lock").len(),
+            1,
+            "a missing key must never reach the gateway"
+        );
+
+        server.abort();
+    }
+
     #[test]
     fn route_provider_options_clear_primary_only_state_for_bare_routes() {
         let inherited = ModelProviderRuntimeOptions {
