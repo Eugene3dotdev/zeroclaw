@@ -532,7 +532,7 @@ impl Tool for ImageGenTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -549,6 +549,11 @@ mod tests {
 
         let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            // Wait for the request before replying: tokio 1.54 starts accepted
+            // sockets as writable, so an unconditional write would race ahead
+            // of the client's request and hyper would reject the early response.
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -798,8 +803,10 @@ mod tests {
     async fn fal_client_does_not_follow_redirects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        zeroclaw_spawn::spawn!(async move {
+        let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
             stream
                 .write_all(
                     b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/unchecked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -816,6 +823,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.unwrap();
     }
 
     #[test]
