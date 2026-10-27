@@ -1564,8 +1564,13 @@ mod tests {
             // Wait for the request before replying: tokio 1.54 starts accepted
             // sockets as writable, so an unconditional write would race ahead
             // of the client's request and hyper would reject the early response.
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
