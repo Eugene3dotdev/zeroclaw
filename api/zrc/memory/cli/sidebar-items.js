@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["create_cli_memory","create_memory_with_embedder","handle_clear","handle_clear_key","handle_command","handle_get","handle_list","handle_reindex","handle_stats","mt","mt_args","parse_category","print_entry","truncate_content","unsupported_clear_backend_message"]};

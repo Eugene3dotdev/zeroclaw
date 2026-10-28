@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["agent_delete_owned_state","agent_delete_precheck","agent_rename_owned_state","apply_delete","build_owned_state_handles","create_entry","delete_config","handle_agents","handle_channels","handle_providers","list_section","mt","mta","parse_provider_category","print_impact","rename_config","save","section_path"],"type":["OwnedStateHandles"]};
