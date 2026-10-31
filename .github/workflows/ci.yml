@@ -154,79 +154,10 @@ jobs:
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
+      - name: Windows targets stay dropped
+        run: bash scripts/ci/no_windows_targets.sh
       - name: act-local artifact compatibility tests
         run: bash scripts/dev/act-local.test.sh
-
-  windows-clippy-tools-changes:
-    name: Detect Windows Clippy changes
-    needs: [fmt]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run: ${{ steps.changed.outputs.run }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-      - name: Detect targeted Windows Clippy changes
-        id: changed
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          changed_files="$(mktemp)"
-
-          case "${{ github.event_name }}" in
-            pull_request)
-              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
-              ;;
-            push|merge_group)
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-            *)
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
-
-          if grep -Eq '^(crates/zeroclaw-tools/|scripts/ci/run_clippy\.sh$|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  windows-clippy-tools:
-    name: Clippy (x86_64-pc-windows-msvc, targeted)
-    needs: [windows-clippy-tools-changes]
-    if: needs.windows-clippy-tools-changes.outputs.run == 'true'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: 1.96.1
-          components: clippy
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        id: rust-cache
-        with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Ensure web/dist placeholder exists
-        shell: bash
-        run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Clippy
-        shell: bash
-        run: |
-          bash scripts/ci/run_clippy.sh \
-            --scope tools \
-            --target x86_64-pc-windows-msvc \
-            --summary-title "Targeted Windows Clippy diagnostics" \
-            --log-name cargo-clippy-windows-tools.log
-        env:
-          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
   # ── Post-format build + check fan-out ─────────────────────────────────────
 
@@ -245,10 +176,6 @@ jobs:
             label: Build
           - os: macos-14
             target: aarch64-apple-darwin
-            cmd: check
-            label: Check
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
             cmd: check
             label: Check
     steps:
@@ -963,7 +890,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, path-changes, lint, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
