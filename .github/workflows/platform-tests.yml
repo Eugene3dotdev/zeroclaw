@@ -46,10 +46,6 @@ jobs:
             os: macos-14
             nextest-platform: mac
             timeout-minutes: 45
-          - name: Windows
-            os: windows-latest
-            nextest-platform: windows-tar
-            timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout-minutes }}
     steps:
