@@ -323,6 +323,17 @@ pub trait RuntimeAdapter: Send + Sync {
         let _ = env_keys;
         self.build_shell_command(command, workspace_dir)
     }
+
+    /// Approve a command line the caller spawns without going through a
+    /// shell (for example a native argv launch of a coding CLI).
+    ///
+    /// Callers that bypass `build_shell_command*` must call this first and
+    /// must not spawn on `Err`. Runtimes without an external policy gate allow
+    /// everything; a gated runtime consults its gate here.
+    fn approve_command(&self, command: &str) -> anyhow::Result<()> {
+        let _ = command;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

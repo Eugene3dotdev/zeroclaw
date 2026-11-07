@@ -285,6 +285,11 @@ impl RuntimeAdapter for PolicyGatedRuntime {
         self.inner
             .build_shell_command_with_env_keys(command, workspace_dir, env_keys)
     }
+
+    fn approve_command(&self, command: &str) -> anyhow::Result<()> {
+        self.gate.check(command)?;
+        self.inner.approve_command(command)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -467,6 +472,27 @@ mod tests {
         assert!(status.success());
         assert!(marker.exists());
         assert_eq!(runtime.name(), "native");
+    }
+
+    #[test]
+    fn policy_gated_runtime_approve_command_consults_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let allow = fixture(dir.path(), "allow", "cat >/dev/null\nexit 0");
+        let block = fixture(
+            dir.path(),
+            "block",
+            "cat >/dev/null\necho 'argv launch denied' >&2\nexit 2",
+        );
+        gated_native(&[&allow])
+            .approve_command("codex exec hi")
+            .expect("an allowing gate approves");
+        let err = gated_native(&[&block])
+            .approve_command("codex exec hi")
+            .expect_err("a refusing gate denies");
+        assert!(format!("{err:#}").contains("argv launch denied"));
+        let ungated: Box<dyn RuntimeAdapter> =
+            Box::new(super::super::NativeRuntime::with_shell("/bin/sh".into()));
+        assert!(ungated.approve_command("anything").is_ok());
     }
 
     #[test]

@@ -52,6 +52,11 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
 
         let timeout_secs = command.timeout_secs;
         let mut process = if self.use_native_argv {
+            // Fork: the native argv launch bypasses `build_shell_command*`, so
+            // it asks the runtime (and its `runtime.policy_gate`) explicitly.
+            self.runtime
+                .approve_command(&shell_command(&command))
+                .map_err(CodingCliExecutionError::Prepare)?;
             native_command(&command)?
         } else {
             let env_keys: Vec<&OsStr> = command
@@ -422,6 +427,48 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "hello; exit 7 sandboxed"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn policy_gate_refusal_blocks_native_argv_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let gate = workspace.path().join("gate");
+        std::fs::write(
+            &gate,
+            "#!/bin/sh\ncat >/dev/null\necho 'native launch refused' >&2\nexit 2\n",
+        )
+        .expect("write gate fixture");
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755))
+            .expect("make gate executable");
+        let marker = workspace.path().join("ran");
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(zeroclaw_config::platform::PolicyGatedRuntime::new(
+                Box::new(FakeRuntime {
+                    seen_command: Arc::new(Mutex::new(None)),
+                }),
+                zeroclaw_config::platform::PolicyGate::from_argv(&[gate
+                    .to_string_lossy()
+                    .into_owned()])
+                .expect("gate argv"),
+            ));
+        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), true);
+        let mut command = CodingCliCommand::new("/bin/sh", workspace.path().to_path_buf(), 5);
+        command
+            .arg("-c")
+            .arg(format!("touch '{}'", marker.display()));
+
+        let error = executor
+            .output(command)
+            .await
+            .expect_err("a refused native launch must not run");
+        assert!(
+            error.to_string().contains("native launch refused"),
+            "unexpected error: {error}"
+        );
+        assert!(!marker.exists(), "a refused native launch must never spawn");
     }
 
     #[tokio::test]
