@@ -20,8 +20,8 @@ use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook, WebhookOutcome};
 use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
 use zeroclaw_config::providers::{ChannelRef, ModelProviderRef};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, AnthropicModelProviderConfig, Config, PluginChannelConfig,
-    PluginEntryConfig, RiskProfileConfig,
+    AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+    PluginChannelConfig, PluginEntryConfig, RiskProfileConfig,
 };
 use zeroclaw_plugins::PluginCapability;
 use zeroclaw_plugins::host::PluginHost;
@@ -104,9 +104,17 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
     config
         .risk_profiles
         .insert("default".to_string(), RiskProfileConfig::default());
-    config.providers.models.anthropic.insert(
+    // Fork: a `custom` alias, because the runtime provider policy refuses
+    // direct Anthropic construction. Nothing here builds or calls the
+    // provider; the agent only needs one that passes `Config::validate`.
+    config.providers.models.custom.insert(
         "default".to_string(),
-        AnthropicModelProviderConfig::default(),
+        CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://127.0.0.1:1".to_string()),
+                ..Default::default()
+            },
+        },
     );
     config.channels.plugin.insert(
         alias.to_string(),
@@ -119,7 +127,7 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
         "operator".to_string(),
         AliasedAgentConfig {
             channels: vec![ChannelRef::new(format!("plugin.{alias}"))],
-            model_provider: ModelProviderRef::new("anthropic.default"),
+            model_provider: ModelProviderRef::new("custom.default"),
             risk_profile: "default".into(),
             ..AliasedAgentConfig::default()
         },
