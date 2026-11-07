@@ -42,6 +42,7 @@ mod skills_bundle_cli;
 mod verifiable_intent_notice_visibility;
 #[cfg(feature = "gateway")]
 mod whatsapp_webhook_security;
+mod zrc_alias;
 
 #[cfg(feature = "plugins-wasm")]
 mod plugin_info_cli;

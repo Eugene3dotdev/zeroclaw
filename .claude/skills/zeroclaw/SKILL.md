@@ -26,11 +26,10 @@ Before running any ZeroClaw operation, make sure you know where things are. When
 1. **Find the binaries.** Probe both PATH installs before choosing a session binary, so collisions are visible up front:
    - `command -v zrc` (PATH)
    - `command -v zeroclaw` (PATH)
-   - The current project's alias build output: `./target/release/zrc` or `./target/debug/zrc`
    - The current project's build output: `./target/release/zeroclaw` or `./target/debug/zeroclaw` — this is the right choice when the user is working inside the ZeroClaw source tree and may have local changes
    - Common install locations: `~/.cargo/bin/zrc`, `~/.cargo/bin/zeroclaw`, `~/Downloads/zeroclaw-bin/zrc`, `~/Downloads/zeroclaw-bin/zeroclaw`
 
-   Use the selected binary consistently for later commands in the same session. Store it as `ZC=/path/to/zrc` or `ZC=/path/to/zeroclaw` in examples and replace every `$ZC` below with that same resolved path. If `zeroclaw` and `zrc` both exist but point to different installs, prefer `zrc` for the EugOT fork and report the collision before running stateful commands. If no binary is found anywhere, offer to build from source (see "Building from Source" below). If the user is a developer working on ZeroClaw itself, they'll likely want the local build — watch for cues like them editing source files, mentioning PRs, or being in the project directory.
+   Use the selected binary consistently for later commands in the same session. Store it as `ZC=/path/to/zrc` or `ZC=/path/to/zeroclaw` in examples and replace every `$ZC` below with that same resolved path. `zrc` is a symlink to the `zeroclaw` beside it, so compare resolved paths (`realpath "$(command -v zrc)"` against `realpath "$(command -v zeroclaw)"`): if they differ, `zeroclaw` and `zrc` point to different installs, so prefer `zrc` for the EugOT fork and report the collision before running stateful commands. A `zrc` that is a regular file rather than a link is another package or an older fork install; report it too. If no binary is found anywhere, offer to build from source (see "Building from Source" below). If the user is a developer working on ZeroClaw itself, they'll likely want the local build — watch for cues like them editing source files, mentioning PRs, or being in the project directory.
 
    In the normal EugOT fork path this means examples resolve to `zrc`, for example `ZC="$(command -v zrc)"` followed by `"$ZC" status` or `"$ZC" quickstart`. Keep `zeroclaw` as the fallback only when `zrc` is absent, and do not switch back to bare `zeroclaw` after `zrc` has been selected.
 
@@ -78,7 +77,7 @@ If the user wants to build ZeroClaw (or no binary is installed):
 cargo build --release
 ```
 
-This produces `target/release/zeroclaw` and, in the EugOT fork, `target/release/zrc`. For faster iteration during development, `cargo build` (debug mode) is quicker but produces slower binaries at `target/debug/zeroclaw` and `target/debug/zrc`.
+This produces `target/release/zeroclaw`. In the EugOT fork `zrc` is not built: `install.sh` and `zeroclaw update` create it as a `zrc -> zeroclaw` symlink beside the installed binary (for a local build, `ln -s zeroclaw target/release/zrc`). For faster iteration during development, `cargo build` (debug mode) is quicker but produces a slower binary at `target/debug/zeroclaw`.
 
 You can also run directly without a separate build step:
 ```bash
@@ -260,7 +259,7 @@ Only load these when you need precise details beyond what's in this file — for
 
 ## Troubleshooting
 
-**"zrc/zeroclaw: command not found"** — Binary not in PATH. Check `./target/release/zrc`, `./target/release/zeroclaw`, `~/.cargo/bin/zrc`, `~/.cargo/bin/zeroclaw`, or build from source with `cargo build --release`.
+**"zrc/zeroclaw: command not found"** — Binary not in PATH. Check `./target/release/zeroclaw`, `~/.cargo/bin/zrc`, `~/.cargo/bin/zeroclaw`, or build from source with `cargo build --release`.
 
 **"Connection refused" on REST calls** — Gateway isn't running. Start it with `$ZC gateway` or `$ZC daemon`.
 

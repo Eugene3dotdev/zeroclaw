@@ -51,7 +51,7 @@ For the guided Unix installer, source builds, app and feature selection, and PAT
 
 Run `./install.sh --help` for the complete Unix installer flag reference.
 
-The EugOT fork also builds `zrc` as a short, collision-free alias for the same CLI entry point. Existing `zeroclaw` invocations continue to work, and `./install.sh --skip-quickstart` lets you run `zrc quickstart` later.
+The EugOT fork also installs `zrc`, a short, collision-free alias for the same CLI: a `zrc -> zeroclaw` symlink that `install.sh` and `zeroclaw update` keep beside the binary, so the CLI is compiled once. Existing `zeroclaw` invocations continue to work, and `./install.sh --skip-quickstart` lets you run `zrc quickstart` later.
 
 > **Working on the docs?** The translated documentation catalogues live in a
 > git submodule (`docs/book/po`). The Rust build does not need it, but building

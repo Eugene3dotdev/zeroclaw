@@ -300,9 +300,9 @@ async fn run_from(
         writeln!(out, "{}", update_switching_to_standard_message())?;
     }
 
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
-    let alias_exe = sibling_alias_path(&current_exe);
+    // Fork: resolves an invoked `zrc` link to the binary it names.
+    let (current_exe, alias_exe) =
+        update_paths(std::env::current_exe().context("cannot determine current executable path")?)?;
 
     // Fail fast before downloading if the install directory is not writable
     // (e.g. a system-wide install that needs sudo / an elevated console).
@@ -336,8 +336,8 @@ async fn run_from(
     tokio::fs::copy(&current_exe, &backup_path)
         .await
         .context("failed to backup current binary")?;
-    let alias_backup_path = if let Some(alias) = alias_exe.as_deref() {
-        backup_existing_binary(alias).await?
+    let alias_prior = if let Some(alias) = alias_exe.as_deref() {
+        Some(capture_alias_prior(alias).await?)
     } else {
         None
     };
@@ -384,20 +384,18 @@ async fn run_from(
     );
     match smoke_test(&current_exe).await {
         Ok(()) => {
-            if let Some(alias) = alias_exe.as_deref()
+            // The alias is smoke-tested through its own path, so a `zrc` link
+            // proves the binary still runs when invoked by that name.
+            if let (Some(alias), Some(prior)) = (alias_exe.as_deref(), alias_prior.as_ref())
                 && let Err(e) = async {
-                    sync_alias_binary(&current_exe, alias).await?;
+                    sync_alias(&current_exe, alias).await?;
                     smoke_test(alias).await
                 }
                 .await
             {
-                rollback_binary_pair(
-                    &backup_path,
-                    &current_exe,
-                    Some((alias, alias_backup_path.as_deref())),
-                )
-                .await
-                .context("rollback after alias sync failure")?;
+                rollback_binary_pair(&backup_path, &current_exe, Some((alias, prior)))
+                    .await
+                    .context("rollback after alias sync failure")?;
                 bail!("Update rolled back — alias sync failed: {e}");
             }
 
@@ -408,7 +406,7 @@ async fn run_from(
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
             install_companion_artifacts(&staging, &current_exe, &host_dashboard_candidates()).await;
-            if let Some(alias_backup) = alias_backup_path.as_deref() {
+            if let Some(AliasPrior::File(alias_backup)) = alias_prior.as_ref() {
                 let _ = tokio::fs::remove_file(alias_backup).await;
             }
             writeln!(
@@ -1126,6 +1124,14 @@ async fn sweep_update_residue(parent: &Path, base: &str) {
     }
 }
 
+// ── Fork: the `zrc` alias ──────────────────────────────────────────
+//
+// `zrc` is the fork's short name for the same CLI, not a second compiled
+// binary. On Unix it is a `zrc -> zeroclaw` symlink beside the binary
+// (install.sh creates it) and the updater keeps it a link. Windows cannot rely
+// on symlinks without Developer Mode, so there `zrc.exe` stays a copy that the
+// updater refreshes, as before.
+
 /// Return the sibling alias path for `zeroclaw`/`zrc` binary names.
 fn sibling_alias_path(current_exe: &Path) -> Option<PathBuf> {
     let file_name = current_exe.file_name()?.to_str()?;
@@ -1139,31 +1145,135 @@ fn sibling_alias_path(current_exe: &Path) -> Option<PathBuf> {
     Some(current_exe.with_file_name(sibling_name))
 }
 
-/// Back up an existing binary if it is present at the given path.
-async fn backup_existing_binary(path: &Path) -> Result<Option<PathBuf>> {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) if meta.is_file() => {
-            let backup = path.with_extension("bak");
-            tokio::fs::copy(path, &backup)
+/// What was at the alias path before the update, so a rollback can put it back.
+#[derive(Debug, PartialEq, Eq)]
+enum AliasPrior {
+    /// Nothing; a rollback removes what the update created there.
+    Absent,
+    /// A symlink with this target, which a rollback recreates.
+    Link(PathBuf),
+    /// A regular file (a copy, as older fork releases installed), backed up
+    /// at this path.
+    File(PathBuf),
+}
+
+/// The binary the update replaces, and the alias path it keeps in step.
+///
+/// Invoked through the `zrc` link, the binary to replace is the link's target.
+/// On macOS `current_exe` names the link itself, and replacing that path would
+/// turn the link into a file and leave `zeroclaw` stale; Linux reports the
+/// target already. Invoked as a regular `zrc` copy beside `zeroclaw` (an older
+/// fork install), the update replaces `zeroclaw` and turns the copy into the
+/// link.
+#[cfg(not(windows))]
+fn update_paths(current_exe: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
+    if current_exe.file_name().and_then(|name| name.to_str()) != Some("zrc") {
+        let alias = sibling_alias_path(&current_exe);
+        return Ok((current_exe, alias));
+    }
+    let is_link = std::fs::symlink_metadata(&current_exe)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if is_link {
+        let target = std::fs::canonicalize(&current_exe)
+            .with_context(|| format!("cannot resolve the zrc alias {}", current_exe.display()))?;
+        return Ok((target, Some(current_exe)));
+    }
+    let primary = current_exe.with_file_name("zeroclaw");
+    if primary.is_file() {
+        Ok((primary, Some(current_exe)))
+    } else {
+        Ok((current_exe, None))
+    }
+}
+
+#[cfg(windows)]
+fn update_paths(current_exe: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
+    let alias = sibling_alias_path(&current_exe);
+    Ok((current_exe, alias))
+}
+
+/// Record what is at `alias` before the swap, backing up a regular file.
+async fn capture_alias_prior(alias: &Path) -> Result<AliasPrior> {
+    match tokio::fs::symlink_metadata(alias).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = tokio::fs::read_link(alias)
                 .await
-                .with_context(|| format!("failed to backup alias binary {}", path.display()))?;
-            Ok(Some(backup))
+                .with_context(|| format!("failed to read alias link {}", alias.display()))?;
+            Ok(AliasPrior::Link(target))
         }
-        Ok(_) => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.is_file() => {
+            let backup = alias.with_extension("bak");
+            tokio::fs::copy(alias, &backup)
+                .await
+                .with_context(|| format!("failed to backup alias binary {}", alias.display()))?;
+            Ok(AliasPrior::File(backup))
+        }
+        Ok(_) => Ok(AliasPrior::Absent),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AliasPrior::Absent),
         Err(err) => {
-            Err(err).with_context(|| format!("failed to stat alias binary {}", path.display()))
+            Err(err).with_context(|| format!("failed to stat alias binary {}", alias.display()))
         }
     }
 }
 
+/// Whether `alias` is a symlink that resolves to `primary`.
+#[cfg(not(windows))]
+async fn alias_links_to(alias: &Path, primary: &Path) -> bool {
+    let is_link = tokio::fs::symlink_metadata(alias)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if !is_link {
+        return false;
+    }
+    match (
+        tokio::fs::canonicalize(alias).await,
+        tokio::fs::canonicalize(primary).await,
+    ) {
+        (Ok(alias), Ok(primary)) => alias == primary,
+        _ => false,
+    }
+}
+
+/// The target to write into an alias link: the bare file name when the link
+/// sits beside the binary (so the pair can move together), else the full path.
+#[cfg(not(windows))]
+fn alias_link_target(primary: &Path, alias: &Path) -> PathBuf {
+    match (primary.parent(), alias.parent(), primary.file_name()) {
+        (Some(primary_dir), Some(alias_dir), Some(name)) if primary_dir == alias_dir => {
+            PathBuf::from(name)
+        }
+        _ => primary.to_path_buf(),
+    }
+}
+
+/// Make `alias` a symlink to the updated `primary`. A link that already
+/// resolves to it is kept as is: the swap replaced its target in place.
+#[cfg(not(windows))]
+async fn sync_alias(primary: &Path, alias: &Path) -> Result<()> {
+    if alias_links_to(alias, primary).await {
+        return Ok(());
+    }
+    match tokio::fs::remove_file(alias).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to replace alias {}", alias.display()));
+        }
+    }
+    tokio::fs::symlink(alias_link_target(primary, alias), alias)
+        .await
+        .with_context(|| format!("failed to link alias {}", alias.display()))
+}
+
 /// Copy the updated primary binary to its sibling alias path.
-async fn sync_alias_binary(current_exe: &Path, alias: &Path) -> Result<()> {
+#[cfg(windows)]
+async fn sync_alias(primary: &Path, alias: &Path) -> Result<()> {
     let _ = tokio::fs::remove_file(alias).await;
-    tokio::fs::copy(current_exe, alias)
+    tokio::fs::copy(primary, alias)
         .await
         .with_context(|| format!("failed to sync alias binary {}", alias.display()))?;
-    let perms = tokio::fs::metadata(current_exe)
+    let perms = tokio::fs::metadata(primary)
         .await
         .context("failed to read updated binary permissions")?
         .permissions();
@@ -1178,25 +1288,45 @@ async fn sync_alias_binary(current_exe: &Path, alias: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restore an optional alias backup, or remove an alias created during update.
-async fn rollback_optional_binary(target: &Path, backup: Option<&Path>) -> Result<()> {
-    if let Some(backup) = backup {
-        rollback_binary(backup, target).await
-    } else {
-        let _ = tokio::fs::remove_file(target).await;
-        Ok(())
+/// Put back what was at `alias` before the update.
+async fn restore_alias(alias: &Path, prior: &AliasPrior) -> Result<()> {
+    match prior {
+        AliasPrior::Absent => {
+            let _ = tokio::fs::remove_file(alias).await;
+            Ok(())
+        }
+        AliasPrior::Link(target) => restore_alias_link(alias, target).await,
+        AliasPrior::File(backup) => rollback_binary(backup, alias).await,
     }
 }
 
-/// Roll back the main binary and alias binary, attempting both paths.
+#[cfg(not(windows))]
+async fn restore_alias_link(alias: &Path, target: &Path) -> Result<()> {
+    let _ = tokio::fs::remove_file(alias).await;
+    tokio::fs::symlink(target, alias)
+        .await
+        .with_context(|| format!("failed to restore alias link {}", alias.display()))
+}
+
+#[cfg(windows)]
+async fn restore_alias_link(alias: &Path, target: &Path) -> Result<()> {
+    // The updater never creates links on Windows, but one an operator made
+    // (with Developer Mode) is put back as found.
+    let _ = tokio::fs::remove_file(alias).await;
+    tokio::fs::symlink_file(target, alias)
+        .await
+        .with_context(|| format!("failed to restore alias link {}", alias.display()))
+}
+
+/// Roll back the main binary and the alias, attempting both paths.
 async fn rollback_binary_pair(
     backup: &Path,
     target: &Path,
-    alias: Option<(&Path, Option<&Path>)>,
+    alias: Option<(&Path, &AliasPrior)>,
 ) -> Result<()> {
     let main_result = rollback_binary(backup, target).await;
-    let alias_result = if let Some((alias_target, alias_backup)) = alias {
-        rollback_optional_binary(alias_target, alias_backup).await
+    let alias_result = if let Some((alias_path, prior)) = alias {
+        restore_alias(alias_path, prior).await
     } else {
         Ok(())
     };
@@ -1315,8 +1445,9 @@ async fn install_companion_artifacts(
             continue;
         }
         if matches!(name_str, "zrc" | "zrc.exe") {
-            // Fork: the `zrc` alias is synced (with rollback) alongside the
-            // main binary, so the archive copy is not a companion.
+            // Fork: the `zrc` alias is kept in step (with rollback) alongside
+            // the main binary — a link on Unix, a copy on Windows — so a `zrc`
+            // in an older fork archive is not a companion.
             continue;
         }
         // Everything else must appear on `KNOWN_COMPANION_FILES` explicitly.
@@ -1726,20 +1857,149 @@ mod tests {
         std::fs::write(&alias, b"new-alias").unwrap();
         std::fs::write(&alias_backup, b"old-alias").unwrap();
 
-        let err = rollback_binary_pair(
-            &missing_main_backup,
-            &current,
-            Some((&alias, Some(alias_backup.as_path()))),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let prior = AliasPrior::File(alias_backup.clone());
+        let err = rollback_binary_pair(&missing_main_backup, &current, Some((&alias, &prior)))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("failed to rollback main binary"),
             "unexpected rollback error: {err}"
         );
         assert_eq!(std::fs::read(&alias).unwrap(), b"old-alias");
+    }
+
+    // ── Fork: the `zrc` alias is a symlink on Unix ─────────────────
+
+    #[cfg(not(windows))]
+    fn assert_zrc_links_to_zeroclaw(dir: &Path, contents: &[u8]) {
+        let alias = dir.join("zrc");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "zrc must be a symlink"
+        );
+        assert_eq!(std::fs::read_link(&alias).unwrap(), Path::new("zeroclaw"));
+        assert_eq!(std::fs::read(&alias).unwrap(), contents);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn update_paths_resolves_an_invoked_zrc_link_to_the_binary_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"main").unwrap();
+        std::os::unix::fs::symlink("zeroclaw", &alias).unwrap();
+
+        let (target, kept) = update_paths(alias.clone()).unwrap();
+        assert_eq!(target, std::fs::canonicalize(&primary).unwrap());
+        assert_eq!(kept.as_deref(), Some(alias.as_path()));
+
+        let (target, kept) = update_paths(primary.clone()).unwrap();
+        assert_eq!(target, primary);
+        assert_eq!(kept.as_deref(), Some(alias.as_path()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn update_paths_updates_zeroclaw_when_invoked_as_a_legacy_zrc_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"main").unwrap();
+        std::fs::write(&alias, b"legacy copy").unwrap();
+
+        let (target, kept) = update_paths(alias.clone()).unwrap();
+        assert_eq!(target, primary);
+        assert_eq!(kept.as_deref(), Some(alias.as_path()));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn updater_replaces_the_target_and_keeps_the_zrc_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        let staged = tmp.path().join("staged-zeroclaw");
+        std::fs::write(&primary, b"old-main").unwrap();
+        std::fs::write(&staged, b"new-main").unwrap();
+        std::os::unix::fs::symlink("zeroclaw", &alias).unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        assert_eq!(prior, AliasPrior::Link(PathBuf::from("zeroclaw")));
+        swap_binary(&staged, &primary).await.unwrap();
+        sync_alias(&primary, &alias).await.unwrap();
+
+        assert_eq!(std::fs::read(&primary).unwrap(), b"new-main");
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn updater_turns_a_legacy_zrc_copy_into_the_link_and_rollback_restores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"new-main").unwrap();
+        std::fs::write(&alias, b"legacy copy").unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        let AliasPrior::File(backup) = &prior else {
+            panic!("a regular zrc must be backed up, got {prior:?}");
+        };
+        assert_eq!(std::fs::read(backup).unwrap(), b"legacy copy");
+        sync_alias(&primary, &alias).await.unwrap();
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+
+        restore_alias(&alias, &prior).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "rollback restores the regular file"
+        );
+        assert_eq!(std::fs::read(&alias).unwrap(), b"legacy copy");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn updater_creates_a_missing_zrc_link_and_rollback_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"new-main").unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        assert_eq!(prior, AliasPrior::Absent);
+        sync_alias(&primary, &alias).await.unwrap();
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+
+        restore_alias(&alias, &prior).await.unwrap();
+        assert!(std::fs::symlink_metadata(&alias).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn rollback_recreates_a_zrc_link_that_pointed_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let other = tmp.path().join("other-zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"new-main").unwrap();
+        std::fs::write(&other, b"other install").unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        sync_alias(&primary, &alias).await.unwrap();
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+
+        restore_alias(&alias, &prior).await.unwrap();
+        assert_eq!(std::fs::read_link(&alias).unwrap(), other);
     }
 
     fn make_release(assets: &[&str]) -> serde_json::Value {

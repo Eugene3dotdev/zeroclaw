@@ -69,12 +69,11 @@ include = [
   "/locales/**/*",
 ]
 
+# Fork: `zrc` is not a second `[[bin]]` from src/main.rs (that compiled and
+# fat-LTO-linked the whole CLI twice). install.sh and the self-updater create
+# it as a `zrc -> zeroclaw` symlink beside the installed binary.
 [[bin]]
 name = "zeroclaw"
-path = "src/main.rs"
-
-[[bin]]
-name = "zrc"
 path = "src/main.rs"
 
 [[bin]]

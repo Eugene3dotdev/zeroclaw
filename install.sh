@@ -305,6 +305,24 @@ detect_target_triple() {
   esac
 }
 
+# ── Fork: the zrc alias ───────────────────────────────────────────
+#
+# `zrc` is the EugOT fork's short name for the same CLI. It is a symlink to
+# `zeroclaw` in the same directory, not a second binary. Replaces an older
+# install's regular `zrc` copy or a stale link; refuses to touch a directory.
+link_zrc_alias() {
+  zrc_dir="$1"
+  if [ ! -f "$zrc_dir/zeroclaw" ]; then
+    return 0
+  fi
+  if [ -d "$zrc_dir/zrc" ] && [ ! -L "$zrc_dir/zrc" ]; then
+    warn "Not linking $zrc_dir/zrc: a directory is in the way"
+    return 0
+  fi
+  rm -f "$zrc_dir/zrc"
+  ln -s zeroclaw "$zrc_dir/zrc"
+}
+
 # ── Pre-built binary install ──────────────────────────────────────
 
 install_prebuilt() {
@@ -343,7 +361,7 @@ install_prebuilt() {
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
-    info "[dry-run] Would install zrc to $CARGO_HOME/bin/zrc (if in tarball)"
+    info "[dry-run] Would link $CARGO_HOME/bin/zrc -> zeroclaw"
     info "[dry-run] Would install $TUI_BIN_NAME to $CARGO_HOME/bin/$TUI_BIN_NAME (if in tarball)"
     info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
@@ -395,11 +413,7 @@ install_prebuilt() {
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
-  if [ -f "$tmp_dir/zrc" ]; then
-    install -m 755 "$tmp_dir/zrc" "$CARGO_HOME/bin/zrc"
-  elif [ -f "$tmp_dir/zrc.exe" ]; then
-    install -m 755 "$tmp_dir/zrc.exe" "$CARGO_HOME/bin/zrc.exe"
-  fi
+  link_zrc_alias "$CARGO_HOME/bin"
   if [ -f "$tmp_dir/$TUI_BIN_NAME" ]; then
     install -m 755 "$tmp_dir/$TUI_BIN_NAME" "$CARGO_HOME/bin/$TUI_BIN_NAME"
   fi
@@ -488,6 +502,14 @@ do_uninstall() {
     info "Removed $bin"
   else
     warn "Binary not found at $bin"
+  fi
+
+  # Fork: remove the zrc alias only when it is this installer's link; a
+  # regular `zrc` may belong to another package.
+  local zrc_link="$CARGO_HOME/bin/zrc"
+  if [ -L "$zrc_link" ] && [ "$(readlink "$zrc_link")" = zeroclaw ]; then
+    rm -f "$zrc_link"
+    info "Removed $zrc_link"
   fi
 
   local tui_bin="$CARGO_HOME/bin/$TUI_BIN_NAME"
@@ -1359,10 +1381,11 @@ See all available features:
     else
       warn "Binary not found at expected path: $BIN"
     fi
+    # Fork: `cargo install` builds only `zeroclaw`; `zrc` is its link.
+    link_zrc_alias "$CARGO_HOME/bin"
     ZRC_BIN="$CARGO_HOME/bin/zrc"
-    if [ -f "$ZRC_BIN" ]; then
-      ZRC_SIZE=$(du -h "$ZRC_BIN" | awk '{print $1}')
-      info "Installed: $ZRC_BIN ($ZRC_SIZE)"
+    if [ -L "$ZRC_BIN" ]; then
+      info "Installed: $ZRC_BIN -> $(readlink "$ZRC_BIN")"
     fi
     TUI_BIN="$CARGO_HOME/bin/$TUI_BIN_NAME"
     if [ -f "$TUI_BIN" ]; then

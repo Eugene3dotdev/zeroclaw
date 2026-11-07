@@ -12,11 +12,13 @@ runner_os="${4:?runner OS is required}"
 mkdir -p staging/web
 cp "target/$target/release/$artifact" staging/
 extra=""
-# Fork: `zrc` is the short CLI alias binary; install.sh picks it up from the archive.
+# Fork: no `zrc` here. It is a `zrc -> zeroclaw` symlink that install.sh and
+# the self-updater create beside the installed binary, so the archive carries
+# one CLI binary and matches the release verifier's manifest.
 if [ "$runner_os" = Windows ]; then
-  companions=(zrc.exe zerocode.exe zerorelay.exe)
+  companions=(zerocode.exe zerorelay.exe)
 else
-  companions=(zrc zerocode zerorelay)
+  companions=(zerocode zerorelay)
 fi
 for b in "${companions[@]}"; do
   if [ -f "target/$target/release/$b" ]; then
