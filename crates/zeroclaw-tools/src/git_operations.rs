@@ -608,12 +608,14 @@ impl GitOperationsTool {
             }
             let hooks_values = Self::git_config_values(&config, &["--get-all", "core.hooksPath"])?;
             self.validate_configured_metadata_paths(&config, &keys, repository_root, write)?;
-            if write
-                && hooks_values.is_empty()
-                && keys
-                    .iter()
-                    .any(|key| key.eq_ignore_ascii_case("core.hookspath"))
-            {
+            // `git_config_values` drops empty values, so compare against the
+            // number of `core.hooksPath` entries: Git uses the last one, and an
+            // empty value after a valid one must not pass as the valid one.
+            let hooks_entries = keys
+                .iter()
+                .filter(|key| key.eq_ignore_ascii_case("core.hookspath"))
+                .count();
+            if write && hooks_values.len() < hooks_entries {
                 anyhow::bail!("Empty Git hooks path is not authorized");
             }
             for value in hooks_values {
