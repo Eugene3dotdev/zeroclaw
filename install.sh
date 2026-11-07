@@ -315,6 +315,12 @@ link_zrc_alias() {
   if [ ! -f "$zrc_dir/zeroclaw" ]; then
     return 0
   fi
+  # Checked here, where it is used, like the installer's other tools: a
+  # missing `ln` names itself and leaves the zeroclaw install intact.
+  if ! command -v ln >/dev/null 2>&1; then
+    warn "ln not found: zrc alias not created. Create it with: ln -s zeroclaw $zrc_dir/zrc"
+    return 0
+  fi
   if [ -d "$zrc_dir/zrc" ] && [ ! -L "$zrc_dir/zrc" ]; then
     warn "Not linking $zrc_dir/zrc: a directory is in the way"
     return 0
@@ -507,7 +513,8 @@ do_uninstall() {
   # Fork: remove the zrc alias only when it is this installer's link; a
   # regular `zrc` may belong to another package.
   local zrc_link="$CARGO_HOME/bin/zrc"
-  if [ -L "$zrc_link" ] && [ "$(readlink "$zrc_link")" = zeroclaw ]; then
+  if [ -L "$zrc_link" ] && command -v readlink >/dev/null 2>&1 &&
+    [ "$(readlink "$zrc_link")" = zeroclaw ]; then
     rm -f "$zrc_link"
     info "Removed $zrc_link"
   fi
@@ -1385,7 +1392,7 @@ See all available features:
     link_zrc_alias "$CARGO_HOME/bin"
     ZRC_BIN="$CARGO_HOME/bin/zrc"
     if [ -L "$ZRC_BIN" ]; then
-      info "Installed: $ZRC_BIN -> $(readlink "$ZRC_BIN")"
+      info "Installed: $ZRC_BIN -> zeroclaw"
     fi
     TUI_BIN="$CARGO_HOME/bin/$TUI_BIN_NAME"
     if [ -f "$TUI_BIN" ]; then

@@ -64,7 +64,8 @@ echo "PASS: cli_package_version ($pass cases)"
 fixture=$(mktemp -d)
 trap 'rm -f "$tmp"; rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/tools" "$fixture/archive" "$fixture/source" "$fixture/temp"
-for tool in awk basename cat chmod cp cut dirname du grep gzip head install mkdir mktemp paste rm sed sha256sum sort tar tr; do
+# Fork: `ln` and `readlink` maintain the `zrc -> zeroclaw` alias link.
+for tool in awk basename cat chmod cp cut dirname du grep gzip head install ln mkdir mktemp paste readlink rm sed sha256sum sort tar tr; do
   ln -s "$(command -v "$tool")" "$fixture/tools/$tool"
 done
 cat >"$fixture/tools/uname" <<'EOF'
@@ -146,6 +147,7 @@ for version_line in 'zeroclaw 0.8.7 (99bd353)' 'zeroclaw 0.8.7 (v0.8.7-33-ge6e4b
       args+=(--minimal --apps none)
     elif [[ "$mode" == uninstall ]]; then
       cp "$fixture/archive/zeroclaw" "$home/.cargo/bin/zeroclaw"
+      ln -s zeroclaw "$home/.cargo/bin/zrc"
     fi
     output="$fixture/output-$case_count"
     echo "Fixture: $mode, LC_ALL=C, non-TTY, input=$version_line, existing=$old_version_line"
@@ -158,7 +160,21 @@ for version_line in 'zeroclaw 0.8.7 (99bd353)' 'zeroclaw 0.8.7 (v0.8.7-33-ge6e4b
     if [[ "$mode" == uninstall ]]; then
       assert_output "$output" "Another zeroclaw found at $home/old-bin/zeroclaw (v$old_package_version)"
       [[ ! -e "$home/.cargo/bin/zeroclaw" ]]
+      if [[ -e "$home/.cargo/bin/zrc" || -L "$home/.cargo/bin/zrc" ]]; then
+        cat "$output" >&2
+        echo "FAIL: uninstall left the zrc -> zeroclaw link" >&2
+        exit 1
+      fi
     else
+      # Fork: both install routes link the alias beside the one binary.
+      if [[ ! -L "$home/.cargo/bin/zrc" || "$(readlink "$home/.cargo/bin/zrc")" != zeroclaw ]]; then
+        cat "$output" >&2
+        echo "FAIL: $mode install did not link zrc -> zeroclaw" >&2
+        exit 1
+      fi
+      if [[ "$mode" == source ]]; then
+        assert_output "$output" "Installed: $home/.cargo/bin/zrc -> zeroclaw"
+      fi
       if [[ "$mode" == prebuilt ]]; then
         assert_output "$output" "Checksum verified"
         if grep -Fq "source install" "$output"; then
