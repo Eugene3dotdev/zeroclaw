@@ -154,6 +154,8 @@ impl PolicyGate {
                 let mut chunk = [0_u8; 4096];
                 loop {
                     match stderr.read(&mut chunk) {
+                        // A signal interrupting the read is not EOF: retry.
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let mut buf = sink.lock().unwrap_or_else(|e| e.into_inner());

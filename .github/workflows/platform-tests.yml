@@ -75,7 +75,13 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install cargo-nextest
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
+        # Fork: the macOS image can lack the cargo bin directory, which made tar
+        # fail with "could not chdir"; create it and put it on PATH first.
+        run: |
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "$bin"
+          echo "$bin" >> "$GITHUB_PATH"
+          curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$bin"
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
