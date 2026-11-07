@@ -341,11 +341,14 @@ provider_backoff_ms = 0
 
 # Fork: the custom slot, because the EugOT runtime policy refuses direct
 # OpenAI construction; the fake provider speaks the same chat-completions wire.
+# `custom` defaults to prompt-guided tools, so native tool calling is turned on
+# explicitly: the smoke reads the offered tools from the request `tools` field.
 [providers.models.custom.smoke]
 api_key = "plugin-smoke"
 uri = "http://127.0.0.1:$provider_port"
 model = "plugin-smoke"
 wire_api = "chat_completions"
+native_tools = true
 
 [agents.default]
 model_provider = "custom.smoke"
