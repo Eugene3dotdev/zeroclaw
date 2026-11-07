@@ -579,7 +579,14 @@ mod tests {
     #[test]
     fn codex_cli_command_args_keep_empty_prompt_after_terminator() {
         let config = test_config();
-        assert_eq!(codex_exec_args(&config, ""), vec!["exec", "--", ""]);
+        // Fork: the default config also passes `-m` and the reasoning effort
+        // (see `codex_cli_command_args_include_model_and_reasoning`), so pin
+        // upstream's contract on the ends: `exec` first, then the terminator
+        // and the empty prompt last.
+        let args = codex_exec_args(&config, "");
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert_eq!(&args[args.len() - 2..], &["--", ""]);
+        assert_eq!(args.iter().filter(|arg| *arg == "--").count(), 1);
     }
 
     #[test]

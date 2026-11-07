@@ -594,9 +594,20 @@ mod tests {
                     .iter()
                     .map(|command| command.program.clone())
                     .collect::<Vec<_>>(),
-                ["claude", "codex", "gemini", "opencode"]
-                    .map(OsString::from)
-                    .to_vec()
+                // Fork: the Gemini-family adapter launches Antigravity (`agy`,
+                // `agy.cmd` on Windows) instead of the `gemini` CLI.
+                [
+                    "claude",
+                    "codex",
+                    if cfg!(target_os = "windows") {
+                        "agy.cmd"
+                    } else {
+                        "agy"
+                    },
+                    "opencode"
+                ]
+                .map(OsString::from)
+                .to_vec()
             );
 
             // Compare names only so assertion failures cannot expose host paths.
