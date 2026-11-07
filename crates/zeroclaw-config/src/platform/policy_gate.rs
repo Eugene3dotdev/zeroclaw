@@ -141,21 +141,29 @@ impl PolicyGate {
             }
         });
         let stderr = child.stderr.take();
-        let (reason_tx, reason_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // stderr is read chunk by chunk into a shared buffer capped at
+        // MAX_REASON_BYTES, and drained to EOF past the cap so a gate that
+        // writes more than the pipe buffer never blocks and runs into the
+        // timeout. Chunks are visible as they arrive, so the reason survives
+        // even when a grandchild keeps the pipe open past the gate's exit.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
+        let sink = std::sync::Arc::clone(&captured);
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let Some(mut stderr) = stderr else {
-                let _ = reason_tx.send(buf);
-                return;
-            };
-            // Keep the first MAX_REASON_BYTES as the reason and hand them over,
-            // then keep draining to EOF: a gate that writes more than the
-            // pipe buffer must never block on stderr and run into the timeout.
-            let _ = (&mut stderr)
-                .take(MAX_REASON_BYTES as u64)
-                .read_to_end(&mut buf);
-            let _ = reason_tx.send(buf);
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            if let Some(mut stderr) = stderr {
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut buf = sink.lock().unwrap_or_else(|e| e.into_inner());
+                            let room = MAX_REASON_BYTES.saturating_sub(buf.len());
+                            buf.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                    }
+                }
+            }
+            let _ = eof_tx.send(());
         });
 
         let deadline = Instant::now() + self.timeout;
@@ -187,9 +195,8 @@ impl PolicyGate {
         }
         // The gate has exited, so its stderr is at EOF unless a grandchild
         // still holds it; wait briefly for the reason, never unboundedly.
-        let stderr = reason_rx
-            .recv_timeout(STDERR_DRAIN_TIMEOUT)
-            .unwrap_or_default();
+        let _ = eof_rx.recv_timeout(STDERR_DRAIN_TIMEOUT);
+        let stderr = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut reason = String::from_utf8_lossy(&stderr[..stderr.len().min(MAX_REASON_BYTES)])
             .trim()
             .to_string();
