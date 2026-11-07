@@ -168,12 +168,18 @@ jobs:
     # job-level `if` runs before the matrix expands, so the empty matrix is
     # never handed to fromJSON.
     if: needs.changes.outputs.source_builds == 'true'
-    # Alpine's ARM64 release link needs more memory than the hosted runner.
-    # Upstream runs that entry on Blacksmith; the fork has no Blacksmith app,
-    # so it runs on GitHub's native ARM64 runner (free for public repos) with
-    # the bounded swap below. Every other entry keeps ubuntu-latest.
-    runs-on: ${{ matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    timeout-minutes: 90
+    # Every linux/arm64 entry (default and Alpine) runs out of resources on
+    # ubuntu-latest: Alpine's release link hit ResourceExhausted, and the default
+    # Dockerfile's aarch64 cross-compile lost its runner at about 22 min. Upstream
+    # gives these entries Blacksmith; the fork has no Blacksmith app, so they
+    # run natively on GitHub's ARM64 runner (free for public repos), with the
+    # bounded swap below. The default Dockerfile's arm64 branch still works
+    # there: its pinned rust:1.98-slim is trixie, which ships the
+    # aarch64-linux-gnu gcc/g++ names for arm64 hosts. amd64 keeps ubuntu-latest.
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # Fork: 90 was sized for Blacksmith 8-vCPU on the arm64 entries; the
+    # 4-vCPU ARM runner gets about 2x. amd64 entries keep upstream's 90.
+    timeout-minutes: ${{ matrix.platform == 'linux/arm64' && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.source_matrix) }}
