@@ -300,6 +300,14 @@ async fn interactive_agent_localizes_semantic_empty_terminal_failure() {
         .mount(&server)
         .await;
 
+    // Upstream's `openai.mock` is the native OpenAI chat provider, which does
+    // not stream, so the turn makes one non-streaming call. The `custom`
+    // compat provider streams by default, and since upstream 818024454 a
+    // semantic-empty stream with a single candidate earns one non-streaming
+    // recovery call (two requests). `thinking_passthrough` is the compat
+    // provider's documented switch that pins requests to the non-streaming
+    // wire; no native thinking is requested here, so request bodies are
+    // unchanged. That reproduces upstream's single non-streaming call.
     let config_dir = tempfile::tempdir().expect("temporary config directory");
     std::fs::write(
         config_dir.path().join("config.toml"),
@@ -319,6 +327,7 @@ api_key = "test-key"
 uri = "{}"
 model = "test-model"
 wire_api = "chat_completions"
+thinking_passthrough = true
 
 [agents.default]
 model_provider = "custom.mock"
