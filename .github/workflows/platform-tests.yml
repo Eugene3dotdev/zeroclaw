@@ -77,11 +77,18 @@ jobs:
         shell: bash
         # Fork: the macOS image can lack the cargo bin directory, which made tar
         # fail with "could not chdir"; create it and put it on PATH first.
+        # On Windows CARGO_HOME is a native `C:\...` path: GITHUB_PATH keeps
+        # it, while Git Bash's GNU tar gets the POSIX form, because it reads a
+        # `C:` prefix as a remote host. (macOS bsdtar has no --force-local.)
         run: |
           bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-          mkdir -p "$bin"
+          tar_dir="$bin"
+          if [ "$RUNNER_OS" = Windows ]; then
+            tar_dir="$(cygpath -u "$bin")"
+          fi
+          mkdir -p "$tar_dir"
           echo "$bin" >> "$GITHUB_PATH"
-          curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$bin"
+          curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$tar_dir"
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
