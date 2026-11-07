@@ -79,7 +79,7 @@ jobs:
     # is a checked-in constant rather than a repository variable, matching
     # ci.yml, so moving the Rust scan back to GitHub-hosted is one reviewed
     # edit here and no workflow depends on an Actions variable for runners.
-    runs-on: ${{ matrix.language == 'rust' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false

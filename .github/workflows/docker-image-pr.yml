@@ -170,7 +170,7 @@ jobs:
     if: needs.changes.outputs.source_builds == 'true'
     # Alpine's ARM64 release link needs more memory than the hosted runner.
     # Keep the existing x64 cross-build and release settings on the 32 GB class.
-    runs-on: ${{ matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/arm64' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false

@@ -599,7 +599,7 @@ windows_build = workflow.split("\n  windows-build:\n", 1)[1].split("\n  windows-
 gate = workflow.split("\n  gate:\n", 1)[1]
 assert "windows-required-changes" not in build
 assert "- os: windows-latest" not in build
-assert "- os: blacksmith-8vcpu-ubuntu-2404" in build
+assert "- os: ubuntu-latest" in build
 assert "target: aarch64-apple-darwin" in build
 assert "cargo metadata --locked --offline --no-deps --format-version 1" in required
 assert 'git diff --name-only "$BASE_SHA" HEAD' in required

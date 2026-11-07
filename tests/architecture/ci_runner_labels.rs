@@ -18,7 +18,10 @@ use regex::Regex;
 
 /// The one runner label the compile-heavy fleet may use. Moving the fleet means
 /// changing this constant and every job below in the same reviewed commit.
-const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
+///
+/// Fork: Eugene3dotdev has no Blacksmith GitHub App, so upstream's pinned
+/// labels would queue with no runner. Every class runs GitHub-hosted here.
+const RUNNER_LABEL: &str = "ubuntu-latest";
 
 /// The runner label for housekeeping jobs: formatting, change detection,
 /// repository guards, docs and policy gates, the Nix checks, the container
@@ -28,11 +31,11 @@ const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
 /// ran untouched, so the whole required gate stalled on jobs whose combined
 /// work is minutes. Hosting them on Blacksmith removes GitHub's hosted pool
 /// from the required gate's critical path entirely.
-const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
+const HOUSEKEEPING_LABEL: &str = "ubuntu-latest";
 
 /// Only task-owner recovery uses the measured Blacksmith Windows runner.
 /// Compilation and service smoke keep their GitHub-hosted images.
-const WINDOWS_RECOVERY_LABEL: &str = "blacksmith-8vcpu-windows-2025";
+const WINDOWS_RECOVERY_LABEL: &str = "windows-latest";
 
 /// Every housekeeping job in the two workflows on the Blacksmith 4-vCPU class.
 /// Workflow-qualified IDs keep same-named jobs in different workflows distinct.
@@ -194,6 +197,7 @@ fn compile_jobs_pin_the_runner_label_instead_of_reading_it_from_fmt() {
 }
 
 #[test]
+#[ignore = "fork: all runner classes share GitHub-hosted labels, so per-class inventories cannot be distinct"]
 fn only_the_declared_compile_jobs_claim_the_blacksmith_fleet() {
     let blocks = runner_workflow_jobs();
 
@@ -232,6 +236,7 @@ fn rust_cache_callers_pass_a_reviewed_provider_input() {
 }
 
 #[test]
+#[ignore = "fork: all runner classes share GitHub-hosted labels, so per-class inventories cannot be distinct"]
 fn windows_recovery_pins_its_runner_and_trusted_cache_writer() {
     let blocks = runner_workflow_jobs();
     let windows_label =
@@ -286,6 +291,7 @@ fn housekeeping_jobs_pin_the_four_vcpu_label() {
 }
 
 #[test]
+#[ignore = "fork: all runner classes share GitHub-hosted labels, so per-class inventories cannot be distinct"]
 fn only_the_declared_housekeeping_jobs_claim_the_four_vcpu_class() {
     let blocks = runner_workflow_jobs();
 
@@ -304,6 +310,7 @@ fn only_the_declared_housekeeping_jobs_claim_the_four_vcpu_class() {
 }
 
 #[test]
+#[ignore = "fork: all runner classes share GitHub-hosted labels, so per-class inventories cannot be distinct"]
 fn hosted_linux_stays_an_explicit_allowlist() {
     let blocks = runner_workflow_jobs();
 
