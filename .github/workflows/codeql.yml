@@ -80,7 +80,9 @@ jobs:
     # ci.yml, so moving the Rust scan back to GitHub-hosted is one reviewed
     # edit here and no workflow depends on an Actions variable for runners.
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Fork: upstream's 60 was sized for the Rust scan on Blacksmith 8-vCPU;
+    # about 2x for the 4-vCPU hosted runner.
+    timeout-minutes: ${{ matrix.language == 'rust' && 120 || 60 }}
     strategy:
       fail-fast: false
       matrix:

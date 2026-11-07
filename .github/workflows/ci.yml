@@ -522,7 +522,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 80 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     strategy:
       fail-fast: false
       matrix:
@@ -675,7 +675,7 @@ jobs:
     needs: [windows-required-changes, master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.windows-required-changes.result == 'success' && needs.windows-required-changes.outputs.windows_recovery == 'true' }}
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 80 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -711,7 +711,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
@@ -762,7 +762,12 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.timeout-minutes || 20 }}
+    # Fork: upstream sized these for Blacksmith 8-vCPU (default 20, runtime
+    # 30); hosted 4-vCPU runners get about 2x. On run 42387523495 the
+    # cranelift backend leg was cancelled at 20 min, 25 s into the egress
+    # e2e, and the runtime leg at 30 min inside test_component, with every
+    # suite that ran green: time limits, not a hang.
+    timeout-minutes: ${{ matrix.timeout-minutes || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -780,8 +785,8 @@ jobs:
             suite: runtime
             cache-key: plugins-cranelift-runtime
             # Six serial test steps. Warm-cache runs reached 18-20 minutes
-            # and hit the shared 20-minute limit (#10558).
-            timeout-minutes: 30
+            # and hit the shared 20-minute limit (#10558). Fork: 2x for hosted.
+            timeout-minutes: 60
           - name: plugins pulley backend
             features: plugins-wasm-pulley
             suite: check
@@ -1407,7 +1412,7 @@ jobs:
     # because the skipped push-only master-debounce is a transitive ancestor.
     if: ${{ !cancelled() && needs.installer-drift.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # Read the floor from the manifest instead of hardcoding it, so this job
@@ -1450,7 +1455,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -1481,7 +1486,7 @@ jobs:
     # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -1615,7 +1620,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     strategy:
       fail-fast: false
       matrix:
@@ -1714,7 +1719,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60 # fork: GitHub-hosted runner
+    timeout-minutes: 90 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -1755,7 +1760,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     services:
       postgres:
         image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73 # 17.11-alpine3.24
@@ -2110,7 +2115,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30 # fork: about 2x the Blacksmith 8-vCPU limit, for 4-vCPU hosted
     outputs:
       all_features: ${{ steps.all_features.outputs.value }}
     steps:
