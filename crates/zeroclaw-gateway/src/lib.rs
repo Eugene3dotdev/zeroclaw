@@ -1533,7 +1533,11 @@ pub async fn run_gateway_with_plugin_webhooks(
                      NativeRuntime so the gateway can still boot. Fix [runtime] and \
                      POST /admin/reload."
             );
-            Arc::new(platform::NativeRuntime::new())
+            // Fork: the fallback still honours `runtime.policy_gate`.
+            Arc::from(platform::apply_policy_gate(
+                Box::new(platform::NativeRuntime::new()),
+                &config.runtime,
+            ))
         }
     };
     let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(DefaultMemoryStrategy::with_config(

@@ -15277,6 +15277,25 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub shell: Option<String>,
 
+    /// External policy gate consulted before every shell command (fork-only).
+    ///
+    /// An argv list; empty or absent keeps the current behaviour. Before any
+    /// runtime builds a shell command (the shell tool, cron shell jobs, skill
+    /// shell tools, the coding-CLI executor, delegates, `claude_code_runner`)
+    /// the gate is spawned with this argv and receives
+    /// `{"tool_name":"bash","tool_input":{"command":"<full command>"}}` on
+    /// stdin. Exit status 0 allows the command. Anything else refuses it: a
+    /// non-zero exit, a spawn failure or missing binary, or running longer
+    /// than 10 seconds. The gate's stderr becomes the tool error and the
+    /// command never runs.
+    ///
+    /// ```toml
+    /// [runtime]
+    /// policy_gate = ["/abs/path/claude-hooks", "agent-policy", "zeroclaw", "PreToolUse"]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_gate: Vec<String>,
+
     /// Global reasoning override for model_providers that expose explicit controls.
     /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported

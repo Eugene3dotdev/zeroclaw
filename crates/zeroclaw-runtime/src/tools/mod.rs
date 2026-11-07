@@ -3230,6 +3230,11 @@ fn all_tools_with_runtime_on_thread(
                     security.clone(),
                     root_config.claude_code_runner.clone(),
                     gateway_url,
+                )
+                .with_policy_gate(
+                    zeroclaw_config::platform::PolicyGate::from_argv(
+                        &root_config.runtime.policy_gate,
+                    )
                 ),
                 security.clone(),
             ))

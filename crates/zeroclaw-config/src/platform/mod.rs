@@ -1,10 +1,12 @@
 pub mod docker;
 pub mod executable;
 pub mod native;
+pub mod policy_gate;
 
 pub use docker::DockerRuntime;
 pub use executable::{resolve_executable, resolve_executable_with_path};
 pub use native::NativeRuntime;
+pub use policy_gate::{PolicyGate, PolicyGateRefusal, PolicyGatedRuntime};
 pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfile};
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
@@ -16,7 +18,27 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
 
 /// Create a runtime, optionally resolving host launchers against an injected
 /// PATH before the runtime's child workspace is applied.
+///
+/// Fork: when `runtime.policy_gate` is set, the adapter is wrapped so every
+/// shell command it builds is first approved by that external gate.
 pub fn create_runtime_with_path(
+    config: &RuntimeConfig,
+    path: Option<&OsStr>,
+) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+    let runtime = create_ungated_runtime_with_path(config, path)?;
+    Ok(policy_gate::wrap_runtime(runtime, &config.policy_gate))
+}
+
+/// Apply `runtime.policy_gate` to an adapter built outside the factory (for
+/// example a fallback runtime), so no construction path skips the gate.
+pub fn apply_policy_gate(
+    runtime: Box<dyn RuntimeAdapter>,
+    config: &RuntimeConfig,
+) -> Box<dyn RuntimeAdapter> {
+    policy_gate::wrap_runtime(runtime, &config.policy_gate)
+}
+
+fn create_ungated_runtime_with_path(
     config: &RuntimeConfig,
     path: Option<&OsStr>,
 ) -> anyhow::Result<Box<dyn RuntimeAdapter>> {

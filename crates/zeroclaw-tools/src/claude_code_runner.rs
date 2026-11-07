@@ -6,6 +6,7 @@ use std::process::Output;
 use std::sync::Arc;
 use tokio::process::Command;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::platform::PolicyGate;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
@@ -36,6 +37,9 @@ pub struct ClaudeCodeRunnerTool {
     /// Base URL of the ZeroClaw gateway (e.g. `"http://localhost:3000"`).
     gateway_url: String,
     tmux_binary: PathBuf,
+    /// Fork: `runtime.policy_gate`, consulted before the shell line is typed
+    /// into tmux (this tool does not build commands through the runtime).
+    policy_gate: Option<PolicyGate>,
 }
 
 impl ClaudeCodeRunnerTool {
@@ -49,7 +53,16 @@ impl ClaudeCodeRunnerTool {
             config,
             gateway_url,
             tmux_binary: PathBuf::from("tmux"),
+            policy_gate: None,
         }
+    }
+
+    /// Require `gate` to approve the shell line before any tmux session is
+    /// created. `None` keeps the ungated behaviour.
+    #[must_use]
+    pub fn with_policy_gate(mut self, gate: Option<PolicyGate>) -> Self {
+        self.policy_gate = gate;
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -244,6 +257,18 @@ impl Tool for ClaudeCodeRunnerTool {
         }
         append_env_assignment(&mut full_command, "CLAUDE_CODE_HOOK_URL", &hook_url);
         append_shell_arguments(&mut full_command, &claude_args);
+
+        // Fork: the external policy gate sees the exact shell line before any
+        // tmux session exists; a refusal returns its reason and spawns nothing.
+        if let Some(gate) = &self.policy_gate
+            && let Err(refusal) = gate.check(&full_command)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(refusal.to_string()),
+            });
+        }
 
         // Create tmux session
         let create_result = Command::new(&self.tmux_binary)
@@ -825,6 +850,54 @@ mod tests {
         );
         let calls = std::fs::read_to_string(log).expect("read fake tmux calls");
         assert!(calls.lines().any(|line| line.starts_with("kill-session ")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_gate_refusal_never_starts_tmux() {
+        let (temp, binary, log) = fake_tmux(0, 0);
+        let seen = temp.path().join("gate-stdin.json");
+        let gate_script = temp.path().join("gate");
+        write_executable(
+            &gate_script,
+            format!(
+                "#!/bin/sh\ncat > {}\necho \"refused by fixture gate\" >&2\nexit 2\n",
+                shell_escape(seen.to_str().expect("gate log path is UTF-8")),
+            ),
+        );
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            test_config(),
+            "http://localhost:3000".into(),
+        )
+        .with_tmux_binary(binary)
+        .with_policy_gate(PolicyGate::from_argv(&[gate_script
+            .to_string_lossy()
+            .into_owned()]));
+
+        let result = tool
+            .execute(json!({"prompt": "hello"}))
+            .await
+            .expect("a refusal is a tool result");
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("policy gate refused the command: refused by fixture gate")
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&seen).expect("gate saw stdin"))
+                .expect("gate stdin is JSON");
+        assert_eq!(payload["tool_name"], "bash");
+        assert!(
+            payload["tool_input"]["command"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("claude")
+        );
+        assert!(
+            std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+            "a refused command must never reach tmux"
+        );
     }
 
     #[cfg(unix)]
