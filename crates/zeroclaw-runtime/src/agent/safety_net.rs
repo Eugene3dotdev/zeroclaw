@@ -3071,11 +3071,10 @@ async fn usage_event_coherent_tuple_vision_route() {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/messages"))
+            .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "vision analysis complete"}],
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                "stop_reason": "end_turn",
+                "choices": [{"message": {"role": "assistant", "content": "vision analysis complete"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
                 "model": "claude-3-opus"
             })))
             .mount(&server)
@@ -3092,7 +3091,7 @@ async fn usage_event_coherent_tuple_vision_route() {
         let vision = cfg
             .providers
             .models
-            .ensure("anthropic", "vision")
+            .ensure("custom", "vision")
             .expect("ensure vision provider");
         if let Some(w) = vision_window {
             vision.context_window = Some(w as usize);
@@ -3135,17 +3134,17 @@ async fn usage_event_coherent_tuple_vision_route() {
             .build()
             .expect("agent builder should succeed");
         agent.multimodal_config = MultimodalConfig {
-            vision_model_provider: Some("anthropic.vision".into()),
+            vision_model_provider: Some("custom.vision".into()),
             vision_model: Some("claude-3-opus".into()),
             ..Default::default()
         };
 
         // Wire a real CostTracker + provider-keyed pricing map so cost_usd
         // is computed (mirrors ws.rs::process_chat_message). The pricing map
-        // keys the SERVING provider (anthropic.vision) only, so a coherent
+        // keys the SERVING provider (custom.vision) only, so a coherent
         // tuple yields Some(expected_cost) and a misattributed tuple yields 0.
         let (_tracker, cost_ctx) =
-            build_cost_context("anthropic.vision", "claude-3-opus", input_rate, output_rate);
+            build_cost_context("custom.vision", "claude-3-opus", input_rate, output_rate);
 
         // Vision routing triggers on an image marker in the prompt. Write a
         // temp image and rewrite the prompt; clean up after the turn so the
@@ -3197,7 +3196,7 @@ async fn usage_event_coherent_tuple_vision_route() {
             .expect("vision-routed Usage event must be emitted");
 
         assert_eq!(
-            usage.0, "anthropic.vision",
+            usage.0, "custom.vision",
             "Usage.provider_ref must be the vision provider"
         );
         assert_eq!(
@@ -3260,11 +3259,10 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/messages"))
+            .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "switched call served"}],
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                "stop_reason": "end_turn",
+                "choices": [{"message": {"role": "assistant", "content": "switched call served"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
                 "model": "claude-3-opus"
             })))
             .mount(&server)
@@ -3279,7 +3277,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let provider_b = cfg
             .providers
             .models
-            .ensure("anthropic", "provider-b")
+            .ensure("custom", "provider-b")
             .expect("ensure provider B (switched-to)");
         if let Some(w) = switch_window {
             provider_b.context_window = Some(w as usize);
@@ -3302,7 +3300,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         cfg.model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "matrix-switch".into(),
-                model_provider: "anthropic.provider-b".into(),
+                model_provider: "custom.provider-b".into(),
                 model: "claude-3-opus".into(),
                 api_key: None,
             });
@@ -3326,7 +3324,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let agent = build_aliased_agent(
             Box::new(provider),
             vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "anthropic.provider-b".into(),
+                target_provider: "custom.provider-b".into(),
                 target_model: "claude-3-opus".into(),
             })],
             "openai.primary",
@@ -3341,7 +3339,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         // Some(expected_cost) and a misattributed tuple with no pricing
         // entries yields Some(0.0) — the assertion catches both.
         let (_tracker, cost_ctx) = build_cost_context(
-            "anthropic.provider-b",
+            "custom.provider-b",
             "claude-3-opus",
             input_rate,
             output_rate,
@@ -3388,7 +3386,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 
         // ASSERTION 1: provider_ref reflects the SERVING provider
         assert_eq!(
-            usage.0, "anthropic.provider-b",
+            usage.0, "custom.provider-b",
             "Usage.provider_ref must be the switched-to provider",
         );
 
@@ -3446,11 +3444,10 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     // wiremock for switched-to provider B
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/messages"))
+        .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "content": [{"type": "text", "text": "switched call served"}],
-            "usage": {"input_tokens": input_tokens_b, "output_tokens": output_tokens_b},
-            "stop_reason": "end_turn",
+            "choices": [{"message": {"role": "assistant", "content": "switched call served"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": input_tokens_b, "completion_tokens": output_tokens_b},
             "model": "claude-3-opus"
         })))
         .mount(&server)
@@ -3466,7 +3463,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let provider_b = cfg
         .providers
         .models
-        .ensure("anthropic", "provider-b")
+        .ensure("custom", "provider-b")
         .expect("ensure provider B");
     provider_b.context_window = Some(200_000);
     provider_b.api_key = Some("test-key".into());
@@ -3485,7 +3482,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     cfg.model_routes
         .push(zeroclaw_config::schema::ModelRouteConfig {
             hint: "req-b2-switch".into(),
-            model_provider: "anthropic.provider-b".into(),
+            model_provider: "custom.provider-b".into(),
             model: "claude-3-opus".into(),
             api_key: None,
         });
@@ -3506,7 +3503,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let agent = build_aliased_agent(
         Box::new(provider),
         vec![Box::new(ModelSwitchTriggerTool {
-            target_provider: "anthropic.provider-b".into(),
+            target_provider: "custom.provider-b".into(),
             target_model: "claude-3-opus".into(),
         })],
         "openai.primary",
@@ -3534,7 +3531,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
             ]),
         ),
         (
-            "anthropic.provider-b".to_string(),
+            "custom.provider-b".to_string(),
             std::collections::HashMap::from([
                 ("claude-3-opus.input".to_string(), input_rate_b),
                 ("claude-3-opus.output".to_string(), output_rate_b),
@@ -3608,14 +3605,14 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     );
 
     // ASSERTION 2: sort order matches production (provider_ref, then model ascending).
-    assert_eq!(sorted_entries[0].0.0, "anthropic.provider-b");
+    assert_eq!(sorted_entries[0].0.0, "custom.provider-b");
     assert_eq!(sorted_entries[0].0.1, "claude-3-opus");
     assert_eq!(sorted_entries[1].0.0, "openai.primary");
     assert_eq!(sorted_entries[1].0.1, "gpt-4o-mini");
 
-    // Entry 0: Provider B (anthropic.provider-b — alphabetically first)
+    // Entry 0: Provider B (custom.provider-b — alphabetically first)
     let ((ref_b, model_b), (input_b, output_b, cached_b, cost_b)) = &sorted_entries[0];
-    assert_eq!(ref_b, "anthropic.provider-b");
+    assert_eq!(ref_b, "custom.provider-b");
     assert_eq!(model_b, "claude-3-opus");
     assert_eq!(*input_b, input_tokens_b);
     assert_eq!(*output_b, output_tokens_b);
@@ -3679,7 +3676,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
         })
         .expect("at least one Usage event");
     assert_eq!(
-        last_usage.0, "anthropic.provider-b",
+        last_usage.0, "custom.provider-b",
         "last_serving_provider_ref must be the switched-to provider"
     );
     assert_eq!(
@@ -3689,7 +3686,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
 
     // context_window resolved from Provider B's config
     let resolved_b = cfg
-        .model_provider_context_window_opt("anthropic.provider-b", "claude-3-opus")
+        .model_provider_context_window_opt("custom.provider-b", "claude-3-opus")
         .map(|v| v as u64);
     assert_eq!(resolved_b, Some(200_000));
 }

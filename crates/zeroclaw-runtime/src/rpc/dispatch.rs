@@ -22595,13 +22595,17 @@ mod tests {
         // Approval prompts reach the client through the ask-user channel
         // handles, which exist only when `ask_user` is selected.
         config.tools.optional.push("ask_user".into());
+        // Fork: the shared ACP fixture's agent uses `custom.test-provider`
+        // (direct OpenAI construction is policy-blocked); point that slot at
+        // the mock, with native tools so the responder's tool_calls parse.
         let provider = config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .unwrap();
         provider.uri = Some(server.uri());
         provider.wire_api = Some(WireApi::ChatCompletions);
+        provider.native_tools = Some(true);
         assert_eq!(
             config.risk_profiles["test-profile"].level,
             zeroclaw_config::autonomy::AutonomyLevel::Supervised
@@ -24523,7 +24527,7 @@ mod tests {
                 let provider = config
                     .providers
                     .models
-                    .ensure("openai", "test-provider")
+                    .ensure("custom", "test-provider")
                     .unwrap();
                 provider.uri = Some(server.uri());
                 provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
@@ -27008,8 +27012,8 @@ mod tests {
             let base = config
                 .providers
                 .models
-                .ensure("openai", "provider-b")
-                .expect("`openai` slot must exist");
+                .ensure("custom", "provider-b")
+                .expect("`custom` slot must exist");
             base.api_key = Some("test-key-b".into());
             base.model = Some("model-b".into());
             base.uri = Some("http://127.0.0.1:2".into());
@@ -27019,7 +27023,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: "openai.test-provider".into(),
+                model_provider: "custom.test-provider".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },
@@ -27045,7 +27049,7 @@ mod tests {
             let agent = agent.lock().await;
             assert_eq!(
                 agent.resolved_route_for_test("anything").provider_name,
-                "openai.test-provider",
+                "custom.test-provider",
                 "the initial resolver must resolve through provider A"
             );
         }
@@ -27053,7 +27057,7 @@ mod tests {
         // Switch the session to provider B.
         let cfg_params = json!({
             "session_id": "cfg-resolver-swap-001",
-            "overrides": { "model_provider": "openai.provider-b" }
+            "overrides": { "model_provider": "custom.provider-b" }
         });
         dispatcher
             .handle_session_configure_for_test(&cfg_params)
@@ -27069,7 +27073,7 @@ mod tests {
         let agent = agent.lock().await;
         assert_eq!(
             agent.resolved_route_for_test("anything").provider_name,
-            "openai.provider-b",
+            "custom.provider-b",
             "session/configure must install the new provider's route resolver, not keep the old one"
         );
     }
@@ -29146,7 +29150,7 @@ mod tests {
         let provider = config
             .providers
             .models
-            .ensure("openai", "rpc-test")
+            .ensure("custom", "rpc-test")
             .unwrap();
         provider.api_key = Some("unit-test-key".into());
         provider.uri = Some(server.uri());
@@ -29177,7 +29181,7 @@ mod tests {
             .insert("sop-rpc-test".into(), runtime);
 
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
-            model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.rpc-test"),
+            model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.rpc-test"),
             risk_profile: zeroclaw_config::providers::RiskProfileRef::new("sop-rpc-test"),
             runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("sop-rpc-test"),
             workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
@@ -31357,7 +31361,7 @@ mod tests {
         let provider_a = config
             .providers
             .models
-            .ensure("openai", "provider-a")
+            .ensure("custom", "provider-a")
             .expect("ensure provider A");
         provider_a.api_key = Some("test-key-a".into());
         provider_a.uri = Some("http://127.0.0.1:1".into());
@@ -31368,7 +31372,7 @@ mod tests {
         let provider_b = config
             .providers
             .models
-            .ensure("openai", "provider-b")
+            .ensure("custom", "provider-b")
             .expect("ensure provider B");
         provider_b.api_key = Some("test-key-b".into());
         provider_b.uri = Some("http://127.0.0.1:2".into());
@@ -31379,7 +31383,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: "openai.provider-a".into(), // Static binding = A
+                model_provider: "custom.provider-a".into(), // Static binding = A
                 runtime_profile: "test-profile".into(),
                 risk_profile: "default".into(),
                 ..Default::default()
@@ -31422,7 +31426,7 @@ mod tests {
             .handle_session_configure(&json!({
                 "session_id": session_id,
                 "overrides": {
-                    "model_provider": "openai.provider-b"
+                    "model_provider": "custom.provider-b"
                 }
             }))
             .await;
@@ -31435,7 +31439,7 @@ mod tests {
             .get_overrides(&session_id)
             .await
             .expect("session still exists");
-        assert_eq!(overrides.model_provider, Some("openai.provider-b".into()));
+        assert_eq!(overrides.model_provider, Some("custom.provider-b".into()));
 
         // Now emit a Usage event through the turn closure to test
         // that model_context_window is resolved from the live provider B
@@ -31447,7 +31451,7 @@ mod tests {
             .await
             .expect("agent exists");
         let (_, live_provider, live_model) = agent.lock().await.attribution_fields();
-        assert_eq!(live_provider, "openai.provider-b");
+        assert_eq!(live_provider, "custom.provider-b");
 
         // Resolve model_context_window from the live provider
         let cfg = dispatcher.ctx.config.read();
@@ -31514,7 +31518,7 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 runtime_profile: "coding".into(),
-                model_provider: "openai.default".into(),
+                model_provider: "custom.default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -31522,8 +31526,10 @@ mod tests {
         let mut providers = zeroclaw_config::providers::Providers::default();
         let entry = providers
             .models
-            .ensure("openai", "default")
+            .ensure("custom", "default")
             .expect("ensure entry");
+        // Fork: `custom` has no family default endpoint.
+        entry.uri = Some("http://127.0.0.1:1".to_string());
         entry.model = Some("model-a".to_string());
         entry.fallback_models = vec!["model-b".to_string()];
         entry.context_window = Some(200_000);
@@ -31537,17 +31543,17 @@ mod tests {
 
         // Shared resolution: primary matches, fallback does not.
         assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-a"),
+            cfg.model_provider_context_window_opt("custom.default", "model-a"),
             Some(200_000)
         );
         assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-b"),
+            cfg.model_provider_context_window_opt("custom.default", "model-b"),
             None,
             "fallback model must not borrow the primary's capacity"
         );
 
         // The serving call resolves limits for model-b, not the primary model.
-        let limits = cfg.resolved_context_limits_for_route("coder", "openai.default", "model-b");
+        let limits = cfg.resolved_context_limits_for_route("coder", "custom.default", "model-b");
         let mut event = TurnEvent::Usage {
             context_token_budget: None,
             model_context_window: None,
@@ -31555,7 +31561,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(500),
             cost_usd: Some(0.01),
-            provider_ref: "openai.default".to_string(),
+            provider_ref: "custom.default".to_string(),
             model: "model-b".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -37620,7 +37626,7 @@ mod tests {
         let provider = config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .unwrap();
         provider.uri = Some(server.uri());
         provider.wire_api = Some(WireApi::ChatCompletions);
@@ -37651,7 +37657,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "committed-model"
                 }))
                 .await
@@ -37704,10 +37710,13 @@ mod tests {
             .await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
+        // Fork: the shared ACP fixture's agent uses `custom.test-provider`
+        // (direct OpenAI construction is policy-blocked); point that slot at
+        // the mock.
         let provider = config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .unwrap();
         provider.wire_api = Some(WireApi::ChatCompletions);
         provider.uri = Some(server.uri());
@@ -41679,7 +41688,7 @@ mod tests {
         let task = zeroclaw_spawn::spawn!(async move {
             writer
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model", "value": "new-model"
+                    "prop": "providers.models.custom.test-provider.model", "value": "new-model"
                 }))
                 .await
         });
@@ -41864,15 +41873,15 @@ mod tests {
         let big = cfg
             .providers
             .models
-            .ensure("openai", "test-provider")
-            .expect("openai test-provider slot exists");
+            .ensure("custom", "test-provider")
+            .expect("custom test-provider slot exists");
         big.context_window = Some(200_000);
 
         let small = cfg
             .providers
             .models
-            .ensure("openai", "small-provider")
-            .expect("openai provider slot exists");
+            .ensure("custom", "small-provider")
+            .expect("custom provider slot exists");
         small.api_key = Some("test-key-small".into());
         small.uri = Some("http://127.0.0.1:1".into());
         small.model = Some("small-model".into());
@@ -41882,7 +41891,7 @@ mod tests {
         cfg.model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.test-provider".into(),
+                model_provider: "custom.test-provider".into(),
                 model: "old-model".into(),
                 api_key: None,
             });
@@ -41900,7 +41909,7 @@ mod tests {
             let agent = agent.lock().await;
             let route = agent.resolved_route_for_test("hint:reasoning");
             assert_eq!(
-                route.provider_name, "openai.test-provider",
+                route.provider_name, "custom.test-provider",
                 "baseline route resolves the hint through the large provider"
             );
             let limits = agent.context_limits_for_route(&route.provider_name, &route.model);
@@ -41914,7 +41923,7 @@ mod tests {
         let res = dispatcher
             .handle_config_set(&json!({
                 "prop": "model_routes.reasoning.model_provider",
-                "value": "openai.small-provider"
+                "value": "custom.small-provider"
             }))
             .await;
         assert!(
@@ -41943,7 +41952,7 @@ mod tests {
         let agent = agent.lock().await;
         let route = agent.resolved_route_for_test("hint:reasoning");
         assert_eq!(
-            route.provider_name, "openai.small-provider",
+            route.provider_name, "custom.small-provider",
             "the immediate next prompt after config/set must dispatch through the refreshed route"
         );
         let limits = agent.context_limits_for_route(&route.provider_name, &route.model);
@@ -42078,7 +42087,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
         // The mock always fails, and one request is enough to check the
@@ -42101,7 +42110,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "new-model"
                 }))
                 .await
@@ -42213,7 +42222,7 @@ mod tests {
         let pinned = config
             .providers
             .models
-            .ensure("openai", "pinned")
+            .ensure("custom", "pinned")
             .expect("pinned provider slot exists");
         pinned.api_key = Some("pinned-key".into());
         pinned.uri = Some("http://127.0.0.1:1".into());
@@ -42221,7 +42230,7 @@ mod tests {
         let edited = config
             .providers
             .models
-            .ensure("openai", "edited")
+            .ensure("custom", "edited")
             .expect("edited provider slot exists");
         edited.api_key = Some("edited-key".into());
         edited.uri = Some(server.uri());
@@ -42244,7 +42253,7 @@ mod tests {
         dispatcher
             .handle_session_configure(&json!({
                 "session_id": session_id,
-                "overrides": { "model_provider": "openai.pinned" }
+                "overrides": { "model_provider": "custom.pinned" }
             }))
             .await
             .expect("session/configure must pin the provider override");
@@ -42258,7 +42267,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.edited.model",
+                    "prop": "providers.models.custom.edited.model",
                     "value": "new-model"
                 }))
                 .await
@@ -42279,7 +42288,7 @@ mod tests {
             configure_dispatcher
                 .handle_session_configure(&json!({
                     "session_id": configure_sid,
-                    "overrides": { "model_provider": "openai.edited" }
+                    "overrides": { "model_provider": "custom.edited" }
                 }))
                 .await
         });
@@ -42359,14 +42368,14 @@ mod tests {
         let agent = agent.lock().await;
         let (_, provider_name, model_name) = agent.attribution_fields();
         assert_eq!(
-            provider_name, "openai.edited",
+            provider_name, "custom.edited",
             "the session must serve through the selected provider"
         );
         assert_eq!(
             model_name, "new-model",
             "the provider box and route resolver must come from the committed generation"
         );
-        let limits = agent.context_limits_for_route("openai.edited", "new-model");
+        let limits = agent.context_limits_for_route("custom.edited", "new-model");
         assert_eq!(
             limits.model_context_window, 200_000,
             "limits must resolve against the committed generation for the served route"
@@ -42761,7 +42770,7 @@ mod tests {
         let extra = config
             .providers
             .models
-            .ensure("openai", "extra-provider")
+            .ensure("custom", "extra-provider")
             .expect("extra provider slot exists");
         extra.api_key = Some("extra-key".into());
         extra.uri = Some("http://127.0.0.1:1".into());
@@ -42778,7 +42787,7 @@ mod tests {
         // Deleting the referenced provider must be refused.
         let err = dispatcher
             .handle_config_map_key_delete(&json!({
-                "path": "providers.models.openai",
+                "path": "providers.models.custom",
                 "key": "test-provider"
             }))
             .await
@@ -42799,7 +42808,7 @@ mod tests {
         // session unaffected.
         let res = dispatcher
             .handle_config_map_key_delete(&json!({
-                "path": "providers.models.openai",
+                "path": "providers.models.custom",
                 "key": "extra-provider"
             }))
             .await;
@@ -42821,7 +42830,7 @@ mod tests {
         let provider = config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("provider slot exists");
         provider.context_window = Some(200_000);
 
@@ -42838,7 +42847,7 @@ mod tests {
         // rule and is only reachable through the direct `ensure` constructor.
         let res = dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai",
+                "path": "providers.models.custom",
                 "from": "test-provider",
                 "to": "renamed_provider"
             }))
@@ -42855,11 +42864,11 @@ mod tests {
         let agent = agent.lock().await;
         let (_, provider_name, model_name) = agent.attribution_fields();
         assert_eq!(
-            provider_name, "openai.renamed_provider",
+            provider_name, "custom.renamed_provider",
             "session model_provider_name must update to the renamed alias"
         );
         assert_eq!(model_name, "old-model");
-        let limits = agent.context_limits_for_route("openai.renamed_provider", "old-model");
+        let limits = agent.context_limits_for_route("custom.renamed_provider", "old-model");
         assert_eq!(
             limits.model_context_window, 200_000,
             "context limits must come from the renamed alias, not the stale old name"
@@ -42880,7 +42889,7 @@ mod tests {
         let pinned = config
             .providers
             .models
-            .ensure("openai", "pinned_provider")
+            .ensure("custom", "pinned_provider")
             .expect("pinned provider slot exists");
         pinned.api_key = Some("pinned-key".into());
         pinned.uri = Some("http://127.0.0.1:1".into());
@@ -42895,7 +42904,7 @@ mod tests {
         dispatcher
             .handle_session_configure(&json!({
                 "session_id": session_id,
-                "overrides": { "model_provider": "openai.pinned_provider" }
+                "overrides": { "model_provider": "custom.pinned_provider" }
             }))
             .await
             .expect("session/configure must pin the provider override");
@@ -42907,14 +42916,14 @@ mod tests {
                 .await
                 .and_then(|o| o.model_provider)
                 .as_deref(),
-            Some("openai.pinned_provider"),
+            Some("custom.pinned_provider"),
             "baseline: the session owns an explicit provider override"
         );
 
         // Rename the alias the override points at.
         dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai",
+                "path": "providers.models.custom",
                 "from": "pinned_provider",
                 "to": "pinned_renamed"
             }))
@@ -42930,7 +42939,7 @@ mod tests {
                 .await
                 .and_then(|o| o.model_provider)
                 .as_deref(),
-            Some("openai.pinned_renamed"),
+            Some("custom.pinned_renamed"),
             "the stored override must be migrated to the renamed alias, not left \
              pointing at an alias that no longer exists"
         );
@@ -42945,13 +42954,13 @@ mod tests {
         let agent = agent.lock().await;
         let (_, provider_name, model_name) = agent.attribution_fields();
         assert_eq!(
-            provider_name, "openai.pinned_renamed",
+            provider_name, "custom.pinned_renamed",
             "the override-pinned session must be rebuilt onto the renamed alias"
         );
         assert_eq!(model_name, "pinned-model");
-        let route = agent.resolved_route_for_test("openai.pinned_renamed");
+        let route = agent.resolved_route_for_test("custom.pinned_renamed");
         assert_eq!(
-            route.provider_name, "openai.pinned_renamed",
+            route.provider_name, "custom.pinned_renamed",
             "the rebuilt resolver must resolve through the renamed alias"
         );
         assert_eq!(
@@ -42971,8 +42980,10 @@ mod tests {
         let routed = config
             .providers
             .models
-            .ensure("openai", "routed-provider")
+            .ensure("custom", "routed-provider")
             .expect("routed provider slot exists");
+        // Fork: `custom` has no family default endpoint.
+        routed.uri = Some("http://127.0.0.1:1".into());
         routed.api_key = Some("routed-key".into());
         routed.model = Some("routed-model".into());
         routed.context_window = Some(8_000);
@@ -42980,7 +42991,7 @@ mod tests {
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.routed-provider".into(),
+                model_provider: "custom.routed-provider".into(),
                 model: "routed-model".into(),
                 api_key: None,
             });
@@ -42988,7 +42999,7 @@ mod tests {
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         let res = dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.routed-provider.context_window",
+                "prop": "providers.models.custom.routed-provider.context_window",
                 "value": 16_000
             }))
             .await;
@@ -43004,7 +43015,7 @@ mod tests {
             .await
             .expect("session agent exists");
         let route = agent.lock().await.resolved_route_for_test("hint:reasoning");
-        assert_eq!(route.provider_name, "openai.routed-provider");
+        assert_eq!(route.provider_name, "custom.routed-provider");
         assert_eq!(route.model, "routed-model");
         let agent = dispatcher
             .ctx
@@ -43783,7 +43794,7 @@ mod tests {
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.test-provider".into(),
+                model_provider: "custom.test-provider".into(),
                 model: "old-model".into(),
                 api_key: None,
             });
@@ -43792,7 +43803,7 @@ mod tests {
         let before = dispatcher.ctx.auth.accepted_revision();
         dispatcher
             .handle_config_set_many(&json!({"sets": [
-                {"prop": "providers.models.openai.test-provider.context_window", "value": 32000},
+                {"prop": "providers.models.custom.test-provider.context_window", "value": 32000},
                 {"prop": "model_routes.reasoning.model", "value": "batched-model"}
             ]}))
             .await
@@ -47334,7 +47345,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
         let data_dir = config.data_dir.clone();
@@ -47687,7 +47698,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
         // The mock always fails, and one request per prompt is enough to
@@ -47802,7 +47813,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
         // The mock always fails, and this test only needs that failure.
@@ -48584,7 +48595,7 @@ mod tests {
             config
                 .providers
                 .models
-                .ensure("openai", "test-provider")
+                .ensure("custom", "test-provider")
                 .unwrap()
                 .uri = Some(server.uri());
             // The mock always fails, and one request is enough to check the
@@ -48610,7 +48621,7 @@ mod tests {
             let commit = zeroclaw_spawn::spawn!(async move {
                 commit_dispatcher
                     .handle_config_set(&json!({
-                        "prop": format!("providers.models.openai.test-provider.{field}"),
+                        "prop": format!("providers.models.custom.test-provider.{field}"),
                         "value": value,
                     }))
                     .await
@@ -48672,7 +48683,7 @@ mod tests {
                 let agent = sessions.get_agent(&sid).await.unwrap();
                 let agent = agent.lock().await;
                 let (_, provider_name, model_name) = agent.attribution_fields();
-                assert_eq!(provider_name, "openai.test-provider");
+                assert_eq!(provider_name, "custom.test-provider");
                 assert_eq!(model_name, expected_model);
                 assert_eq!(agent.temperature_for_test(), Some(expected_temperature));
                 let limits = agent.context_limits_for_route(&provider_name, &model_name);
@@ -48747,7 +48758,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "refreshed-model"
                 }))
                 .await
@@ -48765,7 +48776,7 @@ mod tests {
             config
                 .providers
                 .models
-                .ensure("openai", "test-provider")
+                .ensure("custom", "test-provider")
                 .expect("openai.test-provider slot exists")
                 .model = Some("old-model".into());
         });
@@ -48805,7 +48816,7 @@ mod tests {
             model_name, "old-model",
             "rehydrated successor model must not be overwritten by stale config/set refresh"
         );
-        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(provider_name, "custom.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
@@ -48843,7 +48854,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("test provider exists")
             .uri = Some(server.uri());
         // The mock always fails, and one request is enough to check the
@@ -48877,7 +48888,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "refreshed-model"
                 }))
                 .await
@@ -49230,8 +49241,8 @@ mod tests {
         let other = cfg
             .providers
             .models
-            .ensure("openai", "other-provider")
-            .expect("openai provider slot exists");
+            .ensure("custom", "other-provider")
+            .expect("custom provider slot exists");
         other.api_key = Some("test-key".into());
         other.uri = Some("http://127.0.0.1:1".into());
         other.model = Some("other-model".into());
@@ -49271,7 +49282,7 @@ mod tests {
             configure_task_dispatcher
                 .handle_session_configure(&json!({
                     "session_id": configure_session_id,
-                    "overrides": { "model_provider": "openai.test-provider" }
+                    "overrides": { "model_provider": "custom.test-provider" }
                 }))
                 .await
         });
@@ -49317,7 +49328,7 @@ mod tests {
                 .get_overrides(&session_id)
                 .await
                 .and_then(|overrides| overrides.model_provider),
-            Some("openai.test-provider".to_string())
+            Some("custom.test-provider".to_string())
         );
     }
     /// A listener force-aborts a connection task that outlives its drain
@@ -49933,7 +49944,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("openai", "test-provider")
+            .ensure("custom", "test-provider")
             .expect("the fixture provider exists")
             .uri = Some(server.uri());
         let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);

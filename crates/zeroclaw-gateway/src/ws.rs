@@ -3184,17 +3184,17 @@ data: [DONE]\n\n",
         config.memory.backend = "none".to_string();
         // A deliberately unreachable provider: no chat turn is ever issued
         // by this test, so agent construction must succeed without a live
-        // network round trip.
-        config.providers.models.anthropic.insert(
+        // network round trip. Fork: a `custom` alias, because the runtime
+        // provider policy refuses direct Anthropic construction at agent init.
+        config.providers.models.custom.insert(
             "fixture".to_string(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
+            zeroclaw_config::schema::CustomModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
                     api_key: Some("test-key".to_string()),
                     uri: Some("http://127.0.0.1:1".to_string()),
-                    model: Some("claude-test".to_string()),
+                    model: Some("fixture-test".to_string()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         config.risk_profiles.insert(
@@ -3211,7 +3211,7 @@ data: [DONE]\n\n",
         config.agents.insert(
             "web".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.fixture".into(),
+                model_provider: "custom.fixture".into(),
                 risk_profile: "fixture".into(),
                 runtime_profile: "fixture".into(),
                 workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
@@ -3344,62 +3344,63 @@ data: [DONE]\n\n",
     /// Text the parked provider fixture finishes with once released.
     const PARKED_TURN_RESPONSE: &str = "finished while nobody was watching";
 
-    /// Anthropic-shaped SSE prefix. The fixture sends this immediately so the
-    /// gateway turn is provably in flight, then parks until released.
-    const PARKED_STREAM_HEAD: &str = "event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
-event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+    /// OpenAI chat-completions SSE prefix. The fixture sends this immediately
+    /// so the gateway turn is provably in flight, then parks until released.
+    /// The fork serves it through a `custom` alias with native tools, because
+    /// the runtime provider policy refuses direct Anthropic construction.
+    const PARKED_STREAM_HEAD: &str = "data: {\"id\":\"cmpl_fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
 
     fn parked_stream_tail() -> String {
-        format!(
-            "event: content_block_delta\n\
-data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{PARKED_TURN_RESPONSE}\"}}}}\n\n\
-event: content_block_stop\n\
-data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
-event: message_delta\n\
-data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
-event: message_stop\n\
-data: {{\"type\":\"message_stop\"}}\n\n"
-        )
+        let text = serde_json::json!({
+            "id": "cmpl_fixture",
+            "object": "chat.completion.chunk",
+            "model": "fixture-test",
+            "choices": [{"index": 0, "delta": {"content": PARKED_TURN_RESPONSE}, "finish_reason": null}],
+        });
+        let stop = serde_json::json!({
+            "id": "cmpl_fixture",
+            "object": "chat.completion.chunk",
+            "model": "fixture-test",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        });
+        format!("data: {text}\n\ndata: {stop}\n\ndata: [DONE]\n\n")
     }
 
     type ScriptedTails = Arc<parking_lot::Mutex<std::collections::HashMap<usize, String>>>;
 
-    /// A reply that ends the head's empty text block and calls `tool` with
-    /// `input`.
+    /// A reply that ends the head's empty text and calls `tool` with `input`.
     fn tool_call_stream_tail(tool: &str, input: &serde_json::Value) -> String {
-        let start = serde_json::json!({
-            "type": "content_block_start",
-            "index": 1,
-            "content_block": {"type": "tool_use", "id": "toolu_fixture", "name": tool, "input": {}},
+        let call = serde_json::json!({
+            "id": "cmpl_fixture",
+            "object": "chat.completion.chunk",
+            "model": "fixture-test",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_fixture",
+                    "type": "function",
+                    "function": {"name": tool, "arguments": input.to_string()},
+                }]},
+                "finish_reason": null,
+            }],
         });
-        let delta = serde_json::json!({
-            "type": "content_block_delta",
-            "index": 1,
-            "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
+        let stop = serde_json::json!({
+            "id": "cmpl_fixture",
+            "object": "chat.completion.chunk",
+            "model": "fixture-test",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         });
-        format!(
-            "event: content_block_stop\n\
-data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
-event: content_block_start\n\
-data: {start}\n\n\
-event: content_block_delta\n\
-data: {delta}\n\n\
-event: content_block_stop\n\
-data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
-event: message_delta\n\
-data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
-event: message_stop\n\
-data: {{\"type\":\"message_stop\"}}\n\n"
-        )
+        format!("data: {call}\n\ndata: {stop}\n\ndata: [DONE]\n\n")
     }
 
     type WsClient = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    /// A real gateway whose `web` agent talks to a local Anthropic-shaped
+    /// A real gateway whose `web` agent talks to a local chat-completions
     /// fixture that parks every streaming completion until the test releases
     /// it, so a turn can be held in flight while the client goes away.
     struct ParkedTurnFixture {
@@ -3461,7 +3462,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             let scripted_tails = ScriptedTails::default();
             let mock_tails = Arc::clone(&scripted_tails);
             let mock_app = Router::new().route(
-                "/v1/messages",
+                "/chat/completions",
                 post(move |Json(request): Json<serde_json::Value>| {
                     let request_seen_tx = request_seen_tx.clone();
                     let mut released_rx = released_rx.clone();
@@ -3513,16 +3514,19 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             };
             config.memory.backend = "none".to_string();
             config.reliability.provider_retries = 0;
-            config.providers.models.anthropic.insert(
+            // Fork: a `custom` alias on the OpenAI chat wire with native tools,
+            // because the runtime provider policy refuses direct Anthropic
+            // construction (the agent would never send a request).
+            config.providers.models.custom.insert(
                 "fixture".to_string(),
-                zeroclaw_config::schema::AnthropicModelProviderConfig {
+                zeroclaw_config::schema::CustomModelProviderConfig {
                     base: zeroclaw_config::schema::ModelProviderConfig {
                         api_key: Some("test-key".to_string()),
                         uri: Some(format!("http://{mock_addr}")),
-                        model: Some("claude-test".to_string()),
+                        model: Some("fixture-test".to_string()),
+                        native_tools: Some(true),
                         ..Default::default()
                     },
-                    ..Default::default()
                 },
             );
             config.risk_profiles.insert(
@@ -3536,7 +3540,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             config.agents.insert(
                 "web".to_string(),
                 zeroclaw_config::schema::AliasedAgentConfig {
-                    model_provider: "anthropic.fixture".into(),
+                    model_provider: "custom.fixture".into(),
                     risk_profile: "fixture".into(),
                     runtime_profile: "fixture".into(),
                     workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
@@ -3815,13 +3819,16 @@ data: {\"type\":\"message_stop\"}\n\n",
             .expect("chat message");
     }
 
-    /// `(role, text)` per message of an Anthropic-shaped request body, with
-    /// block-array content flattened to its concatenated text.
+    /// `(role, text)` per conversation message of a chat-completions request
+    /// body, with block-array content flattened to its concatenated text. The
+    /// `system` message is skipped so the list matches the Anthropic-shaped
+    /// body this helper was written for, where the system prompt is separate.
     fn provider_messages(request: &serde_json::Value) -> Vec<(String, String)> {
         request["messages"]
             .as_array()
             .into_iter()
             .flatten()
+            .filter(|message| message["role"] != "system")
             .map(|message| {
                 let role = message["role"].as_str().unwrap_or_default().to_string();
                 let text = match &message["content"] {
@@ -5827,21 +5834,16 @@ data: {\"type\":\"message_stop\"}\n\n",
         ));
         assert_eq!(provider.as_ref().alias(), "agent");
 
-        // The un-switched agent default resolves through the same path and
-        // stays paired with its own model and temperature. The openai family
-        // builds its dedicated provider, so the attribution kind differs
-        // from the switched ollama entry — both must follow their own
-        // reference.
-        let (provider, model, temperature) =
-            ws_consolidation_model(&config, "openai.install", "install-wide-model")
-                .expect("the configured reference must resolve");
-        assert_eq!(model, "install-wide-model");
-        assert_eq!(temperature, Some(0.9));
-        assert!(matches!(
-            provider.as_ref().role(),
-            Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
-        ));
-        assert_eq!(provider.as_ref().alias(), "install");
+        // Fork: upstream asserts here that the un-switched `openai.install`
+        // default builds its dedicated OpenAI provider. The runtime provider
+        // policy refuses direct OpenAI construction, so consolidation must
+        // skip that reference rather than build it or fall back to the
+        // switched ollama entry. The pairing contract stays covered by the
+        // ollama assertions above.
+        assert!(
+            ws_consolidation_model(&config, "openai.install", "install-wide-model").is_none(),
+            "a policy-blocked reference must not build a consolidation provider"
+        );
 
         // A reference that no longer resolves — or one that is not a dotted
         // `<family>.<alias>` — skips consolidation instead of falling back

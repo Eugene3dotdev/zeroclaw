@@ -290,17 +290,13 @@ runtime_profile = "default"
 #[tokio::test]
 async fn interactive_agent_localizes_semantic_empty_terminal_failure() {
     let server = MockServer::start().await;
+    // Upstream's non-streaming whitespace-only completion, served through the
+    // fork's `custom` slot (direct OpenAI construction is policy-blocked).
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "data: {\"id\":\"cmpl_test\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
-data: {\"id\":\"cmpl_test\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
-data: [DONE]\n\n",
-                ),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "   "}}]
+        })))
         .mount(&server)
         .await;
 

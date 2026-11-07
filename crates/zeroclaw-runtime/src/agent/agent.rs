@@ -5966,24 +5966,27 @@ mod tests {
 
     #[test]
     fn build_session_model_provider_returns_full_canonical_ref() {
-        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
 
+        // Fork: a `custom` alias, because the runtime provider policy refuses
+        // direct OpenAI construction; the canonical-ref contract is the same.
         let mut config = Config::default();
-        config.providers.models.openai.insert(
+        config.providers.models.custom.insert(
             "fast".to_string(),
-            OpenAIModelProviderConfig {
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o-mini".to_string()),
                     api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:1".to_string()),
                     ..Default::default()
                 },
             },
         );
 
         let (_provider, provider_ref, model, _route_resolver) =
-            build_session_model_provider(&config, "openai.fast", None).unwrap();
+            build_session_model_provider(&config, "custom.fast", None).unwrap();
 
-        assert_eq!(provider_ref, "openai.fast");
+        assert_eq!(provider_ref, "custom.fast");
         assert_eq!(model, "gpt-4o-mini");
     }
 
@@ -13681,7 +13684,7 @@ mod tests {
     async fn acp_agent_session_tools_receive_the_owned_store_view() {
         use tempfile::TempDir;
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
             RiskProfileConfig,
         };
         use zeroclaw_infra::acp_session_store::AcpSessionStore;
@@ -13706,12 +13709,15 @@ mod tests {
         config
             .risk_profiles
             .insert("test-profile".to_string(), RiskProfileConfig::default());
-        config.providers.models.openai.insert(
+        // Fork: a `custom` alias, because the runtime provider policy refuses
+        // direct OpenAI construction; no chat is issued by this test.
+        config.providers.models.custom.insert(
             "default".to_string(),
-            OpenAIModelProviderConfig {
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o-mini".to_string()),
                     api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:1".to_string()),
                     ..Default::default()
                 },
             },
@@ -13719,7 +13725,7 @@ mod tests {
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
-                model_provider: "openai.default".into(),
+                model_provider: "custom.default".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },
@@ -13829,7 +13835,7 @@ mod tests {
         use crate::cost::CostTracker;
         use tempfile::TempDir;
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
             RiskProfileConfig,
         };
 
@@ -13845,12 +13851,15 @@ mod tests {
         config
             .risk_profiles
             .insert("test-profile".to_string(), RiskProfileConfig::default());
-        config.providers.models.openai.insert(
+        // Fork: `custom` aliases, because the runtime provider policy refuses
+        // direct OpenAI construction; pricing is per alias either way.
+        config.providers.models.custom.insert(
             "fast".to_string(),
-            OpenAIModelProviderConfig {
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o-mini".to_string()),
                     api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:1".to_string()),
                     pricing: HashMap::from([
                         ("gpt-4o-mini.input".to_string(), 0.15),
                         ("gpt-4o-mini.output".to_string(), 0.60),
@@ -13859,12 +13868,13 @@ mod tests {
                 },
             },
         );
-        config.providers.models.openai.insert(
+        config.providers.models.custom.insert(
             "smart".to_string(),
-            OpenAIModelProviderConfig {
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o".to_string()),
                     api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:1".to_string()),
                     pricing: HashMap::from([
                         ("gpt-4o.input".to_string(), 2.50),
                         ("gpt-4o.output".to_string(), 10.00),
@@ -13876,14 +13886,14 @@ mod tests {
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
-                model_provider: "openai.fast".into(),
+                model_provider: "custom.fast".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );
 
         let agent = Agent::from_config(&config, "test-agent").await.unwrap();
-        assert_eq!(agent.model_provider_name, "openai.fast");
+        assert_eq!(agent.model_provider_name, "custom.fast");
 
         let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
         let context = ToolLoopCostTrackingContext::new(
@@ -22832,14 +22842,17 @@ model_provider = "custom.only"
             ..zeroclaw_config::schema::Config::default()
         };
         {
+            // Fork: a `custom` alias with native tools, because the runtime
+            // provider policy refuses direct OpenAI construction.
             let entry = config
                 .providers
                 .models
-                .ensure("openai", "switched")
-                .expect("openai model_provider type slot");
+                .ensure("custom", "switched")
+                .expect("custom model_provider type slot");
             entry.api_key = Some("switched-key".to_string());
             entry.uri = Some(format!("http://{address}"));
             entry.model = Some("switched-model".to_string());
+            entry.native_tools = Some(true);
             // Chat Completions keeps the request shape (system message,
             // native `tools`) straightforward to inspect.
             entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
@@ -22876,7 +22889,7 @@ model_provider = "custom.only"
             }))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 vec![Box::new(ModelSwitchTriggerTool {
-                    target_provider: "openai.switched".to_string(),
+                    target_provider: "custom.switched".to_string(),
                     target_model: "switched-model".to_string(),
                 })],
             ))
@@ -23591,7 +23604,7 @@ mod capability_construction_tests {
     use zeroclaw_api::principal::PrincipalId;
     use zeroclaw_api::tool::{ToolOutput, ToolResult};
     use zeroclaw_config::schema::{
-        AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+        AliasedAgentConfig, CustomModelProviderConfig, ModelProviderConfig, RiskProfileConfig,
     };
 
     struct NamedTool {
@@ -24119,12 +24132,16 @@ mod capability_construction_tests {
             },
         );
         for (alias, model) in [("fast", "gpt-4o-mini"), ("smart", "gpt-4o")] {
-            config.providers.models.openai.insert(
+            // Fork: `custom` aliases, because the runtime provider policy
+            // refuses direct OpenAI construction. The endpoint is unroutable,
+            // as in every test here that must not reach a real provider.
+            config.providers.models.custom.insert(
                 alias.to_string(),
-                OpenAIModelProviderConfig {
+                CustomModelProviderConfig {
                     base: ModelProviderConfig {
                         model: Some(model.to_string()),
                         api_key: Some("test-key".to_string()),
+                        uri: Some("http://127.0.0.1:9".to_string()),
                         ..Default::default()
                     },
                 },
@@ -24133,7 +24150,7 @@ mod capability_construction_tests {
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
-                model_provider: "openai.fast".into(),
+                model_provider: "custom.fast".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },
@@ -24240,7 +24257,7 @@ mod capability_construction_tests {
                 principal: Some(principal.clone()),
             }]
         );
-        assert_eq!(agent.model_provider_name, "openai.fast");
+        assert_eq!(agent.model_provider_name, "custom.fast");
         assert!(
             memory
                 .agents
@@ -24254,13 +24271,13 @@ mod capability_construction_tests {
         // A model switch asks the same source through its switch entry, still
         // for the same principal.
         let switched =
-            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into());
+            agent.try_apply_model_switch("gpt-4o-mini", "custom.smart".into(), "gpt-4o".into());
         assert_eq!(switched.as_deref(), Some("gpt-4o"));
         assert_eq!(
             *providers.switches.lock(),
             vec![SeenProviderRequest {
                 agent_alias: "test-agent".into(),
-                provider_ref: Some("openai.smart".into()),
+                provider_ref: Some("custom.smart".into()),
                 model: Some("gpt-4o".into()),
                 principal: Some(principal),
             }]
@@ -24270,10 +24287,10 @@ mod capability_construction_tests {
             1,
             "a switch is not a session-start request"
         );
-        assert_eq!(agent.model_provider_name, "openai.smart");
+        assert_eq!(agent.model_provider_name, "custom.smart");
     }
 
-    /// `two_provider_config` with `openai.smart` as the `[multimodal]` vision
+    /// `two_provider_config` with `custom.smart` as the `[multimodal]` vision
     /// route. The route's configured endpoint is unreachable, so a vision
     /// provider built from config could only fail to connect; it can never
     /// produce the supplied source's refusal or reply.
@@ -24282,12 +24299,12 @@ mod capability_construction_tests {
         config
             .providers
             .models
-            .openai
+            .custom
             .get_mut("smart")
-            .expect("the fixture configures openai.smart")
+            .expect("the fixture configures custom.smart")
             .base
             .uri = Some("http://127.0.0.1:9/v1".to_string());
-        config.multimodal.vision_model_provider = Some("openai.smart".to_string());
+        config.multimodal.vision_model_provider = Some("custom.smart".to_string());
         config
     }
 
@@ -24332,7 +24349,7 @@ mod capability_construction_tests {
                 request,
                 &SeenProviderRequest {
                     agent_alias: "test-agent".into(),
-                    provider_ref: Some("openai.smart".into()),
+                    provider_ref: Some("custom.smart".into()),
                     model: Some("gpt-4o".into()),
                     principal: Some(principal.clone()),
                 }
@@ -24458,7 +24475,7 @@ mod capability_construction_tests {
     async fn a_spawned_subagent_inherits_the_parents_capabilities_and_principal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = two_provider_config(&tmp);
-        for entry in config.providers.models.openai.values_mut() {
+        for entry in config.providers.models.custom.values_mut() {
             entry.base.uri = Some("http://127.0.0.1:9".to_string());
         }
         let providers = Arc::new(RecordingProviders::default());
@@ -24537,7 +24554,7 @@ mod capability_construction_tests {
             .expect("the registry built a delegate");
 
         delegate
-            .build_target_provider("test-agent", "openai.smart", "openai", None)
+            .build_target_provider("test-agent", "custom.smart", "custom", None)
             .expect("the target resolves for the requesting principal");
         assert_eq!(
             *providers.served.lock(),
@@ -24585,7 +24602,7 @@ mod capability_construction_tests {
         // The operator retargets the switch profile; the RPC refresh
         // transaction republishes the generation.
         let (mut refreshed, previous_revision) = live_handle.snapshot_with_revision();
-        if let Some(smart) = refreshed.providers.models.openai.get_mut("smart") {
+        if let Some(smart) = refreshed.providers.models.custom.get_mut("smart") {
             smart.base.model = Some("gpt-4.1".to_string());
         }
         let refreshed_revision = live.next_revision().unwrap();
@@ -24594,7 +24611,7 @@ mod capability_construction_tests {
         assert_eq!(revision, refreshed_revision);
         assert_ne!(revision, previous_revision);
         assert_eq!(
-            published.providers.models.openai["smart"]
+            published.providers.models.custom["smart"]
                 .base
                 .model
                 .as_deref(),
@@ -24603,7 +24620,7 @@ mod capability_construction_tests {
         agent.sync_config_generation();
 
         let switched =
-            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4.1".into());
+            agent.try_apply_model_switch("gpt-4o-mini", "custom.smart".into(), "gpt-4.1".into());
         assert_eq!(switched.as_deref(), Some("gpt-4.1"));
         assert_eq!(
             *providers.switch_target_models.lock(),
@@ -24669,6 +24686,6 @@ mod capability_construction_tests {
             agent.supplied_capabilities.is_none(),
             "the adapter keeps the config-snapshot model-switch rebuild"
         );
-        assert_eq!(agent.model_provider_name, "openai.fast");
+        assert_eq!(agent.model_provider_name, "custom.fast");
     }
 }

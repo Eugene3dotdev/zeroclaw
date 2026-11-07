@@ -2124,14 +2124,26 @@ mod tests {
             let server = ::zeroclaw_spawn::spawn!(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            let provider = AnthropicModelProviderConfig::default()
-                .create_provider(
+            // Fork: the factory refuses direct Anthropic construction (runtime
+            // provider policy), so the refusal is asserted and the builder is
+            // driven the way upstream's factory drives it, keeping the
+            // cache_ttl wire coverage for the native builder.
+            assert!(
+                provider_err_text(AnthropicModelProviderConfig::default().create_provider(
                     "anthropic",
                     Some("test-key"),
                     Some(&format!("http://{addr}")),
                     opts,
-                )
-                .expect("native anthropic provider constructs");
+                ))
+                .contains("Claude Code CLI")
+            );
+            let mut builder = crate::anthropic::AnthropicModelProvider::builder("anthropic")
+                .credential(Some("test-key"))
+                .base_url(&format!("http://{addr}"));
+            if let Some(cache_ttl) = opts.cache_ttl {
+                builder = builder.cache_ttl(cache_ttl);
+            }
+            let provider = builder.build();
             let messages = vec![
                 ChatMessage::system("You are a helpful assistant."),
                 ChatMessage::user("gen a 2 sum in golang"),
