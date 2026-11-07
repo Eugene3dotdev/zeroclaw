@@ -1340,20 +1340,30 @@ impl ModelProvider for OpenAiResponsesModelProvider {
     /// uses, so a credentialed or header-authenticated alias returns its own
     /// live models instead of an unrelated public list.
     ///
-    /// Fork (TEO-1095): never sends without a key and never retries, because a
-    /// CLIProxyAPI-style gateway bans a client after repeated auth failures.
+    /// Fork (TEO-1095): never retries, and never sends a keyless request to a
+    /// remote host, because a CLIProxyAPI-style gateway bans a client after
+    /// repeated auth failures. Owner decision 2026-11-07: keyless listing is
+    /// allowed only when the base URL's host is loopback (`127.0.0.0/8`, `::1`
+    /// or exactly `localhost`), decided by parsing the URL rather than by
+    /// string prefix, so `localhost.evil.example` stays remote. Every other
+    /// host refuses a keyless listing before any request is made.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let credential = self.credential.as_deref().ok_or_else(|| {
-            anyhow::Error::msg(format!(
+        let credential = self
+            .credential
+            .as_deref()
+            .map(str::trim)
+            .filter(|credential| !credential.is_empty());
+        if credential.is_none() && !base_url_host_is_loopback(&self.responses_url) {
+            anyhow::bail!(
                 "{} model list needs an API key; none is configured",
                 self.alias
-            ))
-        })?;
+            );
+        }
         let url = self.models_url();
-        let request = self
-            .http_client()
-            .get(&url)
-            .header("Authorization", format!("Bearer {credential}"));
+        let mut request = self.http_client().get(&url);
+        if let Some(credential) = credential {
+            request = request.header("Authorization", format!("Bearer {credential}"));
+        }
         let response = request.send().await.map_err(|error| {
             anyhow::Error::msg(format!(
                 "OpenAI Responses model list request failed: {url}: {error}"
@@ -2028,9 +2038,87 @@ mod tool_round_policy_tests {
     }
 }
 
+/// Whether `base_url`'s host is a loopback address: any `127.0.0.0/8` IPv4
+/// address, `::1`, or exactly the domain `localhost`. The URL is parsed, so a
+/// host such as `localhost.evil.example` or `127.0.0.1.example` is not
+/// loopback, and an unparseable URL is never loopback.
+fn base_url_host_is_loopback(base_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyless_listing_loopback_host_is_parsed_not_prefix_matched() {
+        for loopback in [
+            "http://127.0.0.1:8317/v1",
+            "http://127.0.0.2/v1",
+            "http://[::1]:8317/v1",
+            "http://localhost:8317/v1",
+            "http://LOCALHOST/v1",
+        ] {
+            assert!(
+                base_url_host_is_loopback(loopback),
+                "{loopback} is loopback"
+            );
+        }
+        for remote in [
+            "https://localhost.evil.example/v1",
+            "https://127.0.0.1.example/v1",
+            "https://evil.example/localhost",
+            "https://user@evil.example/v1",
+            "https://cliproxyapi.eu3.dev/v1",
+            "http://10.0.0.1/v1",
+            "http://[::2]/v1",
+            "not a url",
+        ] {
+            assert!(
+                !base_url_host_is_loopback(remote),
+                "{remote} is not loopback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyless_listing_refuses_a_non_loopback_host_before_any_request() {
+        // The refusal must come from the pre-request key check: a network
+        // attempt against these unresolvable names would surface as a
+        // "request failed" error instead of "needs an API key".
+        for (remote, key) in [
+            ("https://teo-1095-gateway.invalid/v1", None),
+            ("https://localhost.evil.example/v1", None),
+            ("https://teo-1095-gateway.invalid/v1", Some("   ")),
+        ] {
+            let error = OpenAiResponsesModelProvider::builder("remote")
+                .api_url(remote)
+                .credential(key)
+                .build()
+                .list_models()
+                .await
+                .expect_err("a keyless listing on a remote host is refused");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("needs an API key"),
+                "{remote}: {rendered}"
+            );
+            assert!(!rendered.contains("request failed"), "{remote}: {rendered}");
+        }
+    }
 
     #[tokio::test]
     async fn responses_model_listing_parses_normal_body() {
@@ -3801,19 +3889,32 @@ mod tests {
         assert!(err.contains("401"), "{err}");
         assert!(!err.contains("teo-1095-revoked-key"), "{err}");
 
+        // Owner decision 2026-11-07: a loopback gateway may be listed without
+        // a key. The request carries no Authorization header, and this stub's
+        // rejection surfaces as a reported error rather than a retry.
         let err = gateway(None)
             .list_models()
             .await
-            .expect_err("listing without a key is a reported error");
+            .expect_err("the stub rejects a keyless listing");
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+
+        // A remote gateway still refuses a keyless listing before sending.
+        let err = OpenAiResponsesModelProvider::builder("cliproxyapi")
+            .api_url("https://cliproxyapi.eu3.dev/v1")
+            .build()
+            .list_models()
+            .await
+            .expect_err("a keyless remote listing is refused");
         assert!(err.to_string().contains("API key"), "{err}");
 
         assert_eq!(
             *seen.lock().unwrap(),
             [
                 Some(format!("Bearer {KEY}")),
-                Some("Bearer teo-1095-revoked-key".to_string())
+                Some("Bearer teo-1095-revoked-key".to_string()),
+                None,
             ],
-            "one request per listing, no retry, and none without a key"
+            "one request per listing, no retry, and keyless only on loopback"
         );
         server.abort();
     }
