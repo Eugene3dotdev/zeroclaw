@@ -41461,6 +41461,26 @@ mod tests {
         assert_eq!(entry.command, "/usr/local/bin/mcp-fs");
     }
 
+    /// Fork: how long a refresh/rehydration test waits on one pause point or
+    /// task before failing. Generous for loaded CI runners, bounded so a hang
+    /// fails one test instead of a whole lane.
+    const TEST_PAUSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Fork: await a test pause notification or task within
+    /// [`TEST_PAUSE_DEADLINE`]. A `config/set` that fails before it reaches
+    /// its pause point (an unknown property path, say) otherwise leaves the
+    /// test waiting on a notification that never comes.
+    async fn within_test_deadline<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        tokio::time::timeout(TEST_PAUSE_DEADLINE, future)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {TEST_PAUSE_DEADLINE:?} waiting for {what}; \
+                     did config/set fail before reaching its pause point?"
+                )
+            })
+    }
+
     fn make_model_refresh_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
@@ -42774,7 +42794,7 @@ mod tests {
     async fn provider_alias_delete_refuses_hard_refs_and_leaves_session_intact() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
-        // test-agent has a hard ref to openai.test-provider via model_provider.
+        // test-agent has a hard ref to custom.test-provider via model_provider.
         // Add an extra unreferenced provider to delete successfully.
         let extra = config
             .providers
@@ -42850,7 +42870,7 @@ mod tests {
             "old-model"
         );
 
-        // Rename openai.test-provider → openai.renamed_provider. The target
+        // Rename custom.test-provider → custom.renamed_provider. The target
         // alias must satisfy `validate_alias_key` (lowercase, digits, single
         // underscores); the pre-existing hyphenated source key predates that
         // rule and is only reachable through the direct `ensure` constructor.
@@ -48502,14 +48522,18 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "refreshed-model"
                 }))
                 .await
         });
 
         // Wait for the inline refresh to reach the gate.
-        entered.notified().await;
+        within_test_deadline(
+            "the inline refresh to reach the gated op",
+            entered.notified(),
+        )
+        .await;
 
         // Reap the old incarnation before rehydration; live sessions cannot
         // be overwritten by the recovery path.
@@ -48548,11 +48572,13 @@ mod tests {
 
         // The stale refresh sees removal; reconciliation still waits on its writer gate.
         release.notify_one();
-        done.notified().await;
+        within_test_deadline("the gated op to finish", done.notified()).await;
         sessions.clear_test_gated_op_pause();
 
         // The inline refresh has run its course, so config/set can now settle.
-        let res = config_set.await.expect("config/set task must complete");
+        let res = within_test_deadline("config/set to finish", config_set)
+            .await
+            .expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(5), restore)
@@ -48574,7 +48600,7 @@ mod tests {
             model_name, "refreshed-model",
             "rehydrated successor must use the committed model"
         );
-        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(provider_name, "custom.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
@@ -48774,7 +48800,11 @@ mod tests {
         });
 
         // Wait for the inline refresh to reach the gate.
-        entered.notified().await;
+        within_test_deadline(
+            "the inline refresh to reach the gated op",
+            entered.notified(),
+        )
+        .await;
 
         // Rewind the provider model so the rehydrated successor is built
         // from "old-model" while the paused refresh still targets
@@ -48786,7 +48816,7 @@ mod tests {
                 .providers
                 .models
                 .ensure("custom", "test-provider")
-                .expect("openai.test-provider slot exists")
+                .expect("custom.test-provider slot exists")
                 .model = Some("old-model".into());
         });
 
@@ -48806,11 +48836,13 @@ mod tests {
 
         // Release the gate — the stale refresh sees the generation mismatch.
         release.notify_one();
-        done.notified().await;
+        within_test_deadline("the gated op to finish", done.notified()).await;
         sessions.clear_test_gated_op_pause();
 
         // The inline refresh has run its course, so config/set can now settle.
-        let res = config_set.await.expect("config/set task must complete");
+        let res = within_test_deadline("config/set to finish", config_set)
+            .await
+            .expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
         // The rehydrated successor must retain its provider, model, and
@@ -48902,7 +48934,11 @@ mod tests {
                 }))
                 .await
         });
-        commit_pause.arrived.notified().await;
+        within_test_deadline(
+            "config/set to park at its commit pause",
+            commit_pause.arrived.notified(),
+        )
+        .await;
 
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
@@ -48920,7 +48956,9 @@ mod tests {
         // rehydration above then publishes the committed generation before
         // the prompt below can enter its turn.
         commit_pause.release.notify_one();
-        let res = config_set.await.expect("config/set task must complete");
+        let res = within_test_deadline("config/set to finish", config_set)
+            .await
+            .expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
         // The first prompt races the reconciliation task. Whichever wins, the
@@ -49004,7 +49042,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.temperature",
+                    "prop": "providers.models.custom.test-provider.temperature",
                     "value": 0.7
                 }))
                 .await
@@ -49017,7 +49055,11 @@ mod tests {
         // 0.2. Parking the commit also makes that premise deterministic — a
         // merely-notified commit could finish first on a loaded runner and the
         // test would silently stop exercising the reconciliation path.
-        commit_pause.arrived.notified().await;
+        within_test_deadline(
+            "config/set to park at its commit pause",
+            commit_pause.arrived.notified(),
+        )
+        .await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -49025,7 +49067,9 @@ mod tests {
         assert!(rehydrated.is_some(), "rehydration must install the session");
 
         commit_pause.release.notify_one();
-        let res = config_set.await.expect("config/set task must complete");
+        let res = within_test_deadline("config/set to finish", config_set)
+            .await
+            .expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
         // The reconcile task blocks on the writer gate, so it can only run once
@@ -49099,7 +49143,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "refreshed-model"
                 }))
                 .await
@@ -49109,7 +49153,11 @@ mod tests {
         // commit releases the gate. `try_lock_owned` therefore fails and the
         // Agent is built from the pre-commit config — deterministically,
         // because the parked commit cannot complete first on a loaded runner.
-        commit_pause.arrived.notified().await;
+        within_test_deadline(
+            "config/set to park at its commit pause",
+            commit_pause.arrived.notified(),
+        )
+        .await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -49120,7 +49168,9 @@ mod tests {
         );
 
         commit_pause.release.notify_one();
-        let res = config_set.await.expect("config/set task must complete");
+        let res = within_test_deadline("config/set to finish", config_set)
+            .await
+            .expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
         // The reconcile task blocks on the config writer gate, so it can only
@@ -49148,9 +49198,9 @@ mod tests {
             .expect("rehydrated session exists");
         let guard = agent.lock().await;
         let (_, provider_name, model_name) = guard.attribution_fields();
-        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(provider_name, "custom.test-provider");
         assert_eq!(model_name, "refreshed-model");
-        let limits = guard.context_limits_for_route("openai.test-provider", "refreshed-model");
+        let limits = guard.context_limits_for_route("custom.test-provider", "refreshed-model");
         assert!(
             limits.context_token_budget > 0,
             "the reconciled session must resolve limits from the committed \
