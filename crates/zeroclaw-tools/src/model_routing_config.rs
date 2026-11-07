@@ -3499,17 +3499,20 @@ mod tests {
         // actually dispatched and its body is observable.
         let mut saved = (*base).clone();
         {
-            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            let entry = saved.providers.models.ensure("custom", ALIAS).unwrap();
             entry.api_key = Some("sk-disk-key".to_string());
             entry.model = Some("gpt-disk".to_string());
             entry.uri = Some(format!("{}/v1", server.uri()));
+            // Fork: `custom` speaks the chat wire by default; upstream's
+            // `openai` slot defaulted to Responses, which the mock answers.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::Responses);
         }
 
-        let model_var = "ZEROCLAW_providers__models__openai__probe_env_model_case__model";
+        let model_var = "ZEROCLAW_providers__models__custom__probe_env_model_case__model";
         let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env");
 
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
-        let probe = tool.probe_model(&saved, &format!("openai.{ALIAS}")).await;
+        let probe = tool.probe_model(&saved, &format!("custom.{ALIAS}")).await;
 
         assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
 
@@ -3560,21 +3563,24 @@ mod tests {
 
         let mut saved = (*base).clone();
         {
-            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            let entry = saved.providers.models.ensure("custom", ALIAS).unwrap();
             entry.api_key = Some("sk-test-key".to_string());
             entry.model = None;
             entry.uri = Some(format!("{}/v1", server.uri()));
+            // Fork: `custom` speaks the chat wire by default; upstream's
+            // `openai` slot defaulted to Responses, which the mock answers.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::Responses);
         }
         saved.save().await.unwrap();
 
-        let model_var = "ZEROCLAW_providers__models__openai__probe_env_only_model_case__model";
+        let model_var = "ZEROCLAW_providers__models__custom__probe_env_only_model_case__model";
         let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-only");
 
         let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "model_provider": format!("openai.{ALIAS}"),
+                "model_provider": format!("custom.{ALIAS}"),
                 "temperature": 0.4
             }))
             .await
@@ -3595,7 +3601,7 @@ mod tests {
             .expect("the probe sends a JSON chat request");
         assert_eq!(body["model"].as_str(), Some("gpt-env-only"));
 
-        let persisted = read_saved_provider_entry(&tmp.path().join("config.toml"), "openai", ALIAS)
+        let persisted = read_saved_provider_entry(&tmp.path().join("config.toml"), "custom", ALIAS)
             .expect("set_default preserves the configured alias");
         assert_eq!(
             persisted.model, None,
@@ -3905,19 +3911,24 @@ mod tests {
             .await;
 
         let mut saved = (*base).clone();
-        saved.providers.models.ensure("openai", ALIAS).unwrap().uri =
-            Some(format!("{}/v1", server.uri()));
+        {
+            let entry = saved.providers.models.ensure("custom", ALIAS).unwrap();
+            entry.uri = Some(format!("{}/v1", server.uri()));
+            // Fork: `custom` speaks the chat wire by default; upstream's
+            // `openai` slot defaulted to Responses, which the mock answers.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::Responses);
+        }
         saved.save().await.unwrap();
         let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
         let _api_key = TestEnvVar::set(
             &_env_guard,
-            "ZEROCLAW_providers__models__openai__probe_current_env_key_case__api_key",
+            "ZEROCLAW_providers__models__custom__probe_current_env_key_case__api_key",
             "sk-test-current-env-key",
         );
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "model_provider": format!("openai.{ALIAS}"),
+                "model_provider": format!("custom.{ALIAS}"),
                 "model": "gpt-test"
             }))
             .await
@@ -3925,7 +3936,7 @@ mod tests {
 
         assert!(result.success, "{result:?}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        let persisted = read_saved_provider_entry(&cfg_path, "openai", ALIAS).unwrap();
+        let persisted = read_saved_provider_entry(&cfg_path, "custom", ALIAS).unwrap();
         assert_eq!(
             persisted.api_key, None,
             "environment credentials stay off disk"
@@ -3951,20 +3962,23 @@ mod tests {
 
         let mut saved = (*base).clone();
         {
-            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            let entry = saved.providers.models.ensure("custom", ALIAS).unwrap();
             entry.api_key = Some("sk-test-key".to_string());
             entry.model = Some("gpt-known".to_string());
             entry.uri = Some(format!("{}/v1", server.uri()));
+            // Fork: `custom` speaks the chat wire by default; upstream's
+            // `openai` slot defaulted to Responses, which the mock answers.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::Responses);
         }
         saved.save().await.unwrap();
-        let before = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+        let before = read_saved_provider_entry(&cfg_path, "custom", ALIAS)
             .expect("precondition: the alias exists before set_default updates it");
 
         let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "model_provider": format!("openai.{ALIAS}"),
+                "model_provider": format!("custom.{ALIAS}"),
                 "model": "gpt-missing"
             }))
             .await
@@ -4002,7 +4016,7 @@ mod tests {
             "an unsuccessful probe result must carry the error field"
         );
 
-        let after = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+        let after = read_saved_provider_entry(&cfg_path, "custom", ALIAS)
             .expect("a pre-existing alias must survive rollback");
         assert_eq!(
             after.model, before.model,

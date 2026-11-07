@@ -21180,7 +21180,7 @@ mod tests {
                 &mut rx,
                 1,
                 "config/set",
-                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model"}),
+                json!({"prop": "providers.models.custom.test-provider.model", "value": "oidc-model"}),
             )
             .await;
             assert!(response.get("error").is_none(), "{response}");
@@ -21197,7 +21197,7 @@ mod tests {
                 &mut rx,
                 3,
                 "config/set",
-                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model-2"}),
+                json!({"prop": "providers.models.custom.test-provider.model", "value": "oidc-model-2"}),
             )
             .await;
             assert!(again.get("error").is_none(), "{again}");
@@ -21235,7 +21235,7 @@ mod tests {
                 1,
                 "config/set",
                 json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "still-usable"
                 }),
             )
@@ -22598,6 +22598,9 @@ mod tests {
         // Fork: the shared ACP fixture's agent uses `custom.test-provider`
         // (direct OpenAI construction is policy-blocked); point that slot at
         // the mock, with native tools so the responder's tool_calls parse.
+        // `thinking_passthrough` pins the compat provider to non-streaming
+        // requests, like upstream's native OpenAI chat provider, because the
+        // responder answers with JSON bodies, not SSE.
         let provider = config
             .providers
             .models
@@ -22606,6 +22609,7 @@ mod tests {
         provider.uri = Some(server.uri());
         provider.wire_api = Some(WireApi::ChatCompletions);
         provider.native_tools = Some(true);
+        provider.thinking_passthrough = true;
         assert_eq!(
             config.risk_profiles["test-profile"].level,
             zeroclaw_config::autonomy::AutonomyLevel::Supervised
@@ -29156,6 +29160,11 @@ mod tests {
         provider.uri = Some(server.uri());
         provider.model = Some("rpc-test-model".into());
         provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        // Fork: `custom` defaults to prompt-guided tools and streaming; the
+        // scripted responder expects native tool calls in JSON bodies, as
+        // upstream's native OpenAI chat provider sent.
+        provider.native_tools = Some(true);
+        provider.thinking_passthrough = true;
 
         let risk = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -41709,7 +41718,7 @@ mod tests {
         assert_eq!(record["outcome"], "pending");
         assert_eq!(
             record["path"],
-            json!(["providers", "models", "openai", "test-provider", "model"])
+            json!(["providers", "models", "custom", "test-provider", "model"])
         );
         assert_eq!(
             record["revision"],
@@ -41779,7 +41788,7 @@ mod tests {
         // Its receipt must not be attributable to the earlier request.
         let newer = dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model", "value": "newer-model"
+                "prop": "providers.models.custom.test-provider.model", "value": "newer-model"
             }))
             .await
             .unwrap();
@@ -41794,7 +41803,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|record| {
-                record["path"] == json!(["providers", "models", "openai", "test-provider", "model"])
+                record["path"] == json!(["providers", "models", "custom", "test-provider", "model"])
             })
             .collect();
         assert!(!same_path_records.is_empty());
@@ -41979,7 +41988,7 @@ mod tests {
         dispatcher
             .handle_config_set(&json!({
                 "prop": "model_routes.reasoning.model_provider",
-                "value": "openai.test-provider"
+                "value": "custom.test-provider"
             }))
             .await
             .expect("setting the staged route provider must succeed");
@@ -42017,7 +42026,7 @@ mod tests {
             route.kind,
             zeroclaw_providers::router::RouteResolutionKind::MatchedHint
         ));
-        assert_eq!(route.provider_name, "openai.test-provider");
+        assert_eq!(route.provider_name, "custom.test-provider");
         assert_eq!(route.model, "old-model");
     }
 
@@ -48265,7 +48274,7 @@ mod tests {
                 .handle_session_configure(&json!({
                     "session_id": sid,
                     "overrides": {
-                        "model_provider": "openai.test-provider",
+                        "model_provider": "custom.test-provider",
                         "model": "intruder-model",
                         "temperature": 0.99,
                     }
@@ -48337,7 +48346,7 @@ mod tests {
         let guard = agent.lock().await;
         let (_, provider_name, model_name) = guard.attribution_fields();
         // Successor was built from the test config with
-        // model_provider = "openai.test-provider", model = "old-model".
+        // model_provider = "custom.test-provider", model = "old-model".
         // The stale configure tried to change these to "intruder-model";
         // if the generation gate held, the successor keeps its original
         // config values.
@@ -48345,7 +48354,7 @@ mod tests {
             model_name, "old-model",
             "successor model must not be overwritten by stale configure"
         );
-        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(provider_name, "custom.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
@@ -48382,7 +48391,7 @@ mod tests {
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
                 .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
+                    "prop": "providers.models.custom.test-provider.model",
                     "value": "refreshed-model"
                 }))
                 .await
@@ -48448,7 +48457,7 @@ mod tests {
             model_name, "old-model",
             "successor model must not be overwritten by stale config/set refresh"
         );
-        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(provider_name, "custom.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
@@ -49183,7 +49192,7 @@ mod tests {
                 .agents
                 .get_mut("test-agent")
                 .expect("test agent exists")
-                .model_provider = "openai.missing-provider".into();
+                .model_provider = "custom.missing-provider".into();
         });
 
         // Let the spawned reconciliation queue on the writer gate before it
@@ -49210,7 +49219,7 @@ mod tests {
                 .agents
                 .get_mut("test-agent")
                 .expect("test agent exists")
-                .model_provider = "openai.test-provider".into();
+                .model_provider = "custom.test-provider".into();
         });
         RpcDispatcher::refresh_live_sessions_for_agent(Arc::clone(&dispatcher.ctx), "test-agent")
             .await
@@ -49941,12 +49950,16 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = session_cwd_config(&tmp, 4242, None);
-        config
+        // Fork: the mock answers in the Responses shape that upstream's
+        // `openai` slot speaks by default; `custom` defaults to the chat wire,
+        // so pin it to Responses (same `OpenAiResponsesModelProvider`).
+        let provider = config
             .providers
             .models
             .ensure("custom", "test-provider")
-            .expect("the fixture provider exists")
-            .uri = Some(server.uri());
+            .expect("the fixture provider exists");
+        provider.uri = Some(server.uri());
+        provider.wire_api = Some(zeroclaw_config::schema::WireApi::Responses);
         let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
         let (mut operator, mut rx) = local_operator(&ctx).await;
 

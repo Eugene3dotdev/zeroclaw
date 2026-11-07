@@ -543,22 +543,20 @@ mod tests {
         let default_opts = zeroclaw_providers::ModelProviderRuntimeOptions::default();
 
         // Both factories should produce equivalent providers for a
-        // normal (non-alias-specific) provider like "openrouter".
+        // normal (non-alias-specific) provider like "ollama". Fork: upstream
+        // used "openrouter", whose construction the runtime policy refuses.
         let alias_aware = zeroclaw_providers::create_model_provider_for_alias(
             &config,
-            "openrouter",
+            "ollama",
             "default",
             None,
             &default_opts,
         )
         .expect("alias-aware construction must succeed");
 
-        let legacy = zeroclaw_providers::create_model_provider_with_options(
-            "openrouter",
-            None,
-            &default_opts,
-        )
-        .expect("legacy construction must succeed");
+        let legacy =
+            zeroclaw_providers::create_model_provider_with_options("ollama", None, &default_opts)
+                .expect("legacy construction must succeed");
 
         // Both should agree on capabilities for a normal provider.
         assert_eq!(

@@ -3692,22 +3692,28 @@ data: [DONE]\n\n",
         /// Answer the `index`-th provider request (1-based) with a text reply
         /// of about `bytes`, in 64 KiB pieces, instead of the parked one.
         fn script_long_reply(&self, index: usize, bytes: usize) {
+            // Fork: OpenAI chat-completion chunks, like the ported head and
+            // tails. Anthropic events here read as an empty stream to the
+            // `custom` provider, which then retried without streaming.
             let piece = "x".repeat(64 * 1024);
+            let chunk = serde_json::json!({
+                "id": "cmpl_fixture",
+                "object": "chat.completion.chunk",
+                "model": "fixture-test",
+                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": null}],
+            });
             let mut tail = String::new();
             for _ in 0..bytes.div_ceil(piece.len()) {
-                tail.push_str(&format!(
-                    "event: content_block_delta\n\
-data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{piece}\"}}}}\n\n"
-                ));
+                tail.push_str(&format!("data: {chunk}\n\n"));
             }
-            tail.push_str(
-                "event: content_block_stop\n\
-data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
-event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n\n",
-            );
+            let stop = serde_json::json!({
+                "id": "cmpl_fixture",
+                "object": "chat.completion.chunk",
+                "model": "fixture-test",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            });
+            tail.push_str(&format!("data: {stop}\n\ndata: [DONE]\n\n"));
             self.scripted_tails.lock().insert(index, tail);
         }
 

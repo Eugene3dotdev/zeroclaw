@@ -5997,7 +5997,7 @@ mod tests {
             );
 
         let error =
-            match tool.build_target_provider("helper", "openai.fast", "openai", Some("test-key")) {
+            match tool.build_target_provider("helper", "ollama.fast", "ollama", Some("test-key")) {
                 Ok(_) => panic!("a bound, configless delegate must not build a target"),
                 Err(error) => error,
             };
@@ -6011,10 +6011,13 @@ mod tests {
         );
 
         // An unbound configless delegate keeps the legacy factory.
+        // Fork: `ollama` (fixed local endpoint, nothing contacted at
+        // construction) because the runtime provider policy refuses direct
+        // OpenAI construction, and `custom` would need a `uri` here.
         let unbound = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()));
         assert!(
             unbound
-                .build_target_provider("helper", "openai.fast", "openai", Some("test-key"))
+                .build_target_provider("helper", "ollama.fast", "ollama", Some("test-key"))
                 .is_ok(),
             "an unbound delegate still builds its target from the factory"
         );

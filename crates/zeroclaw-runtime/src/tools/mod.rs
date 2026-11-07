@@ -8345,15 +8345,17 @@ permissions = ["http_client"]
         assert!(!result.success, "execute must fail without credentials");
         let error = result.error.expect("error must be present");
 
-        // The alias-aware factory routes openai.codex (requires_openai_auth=true)
-        // to OpenAiCodexModelProvider, whose credential resolution fails with
-        // an error mentioning "openai-codex".  The legacy factory would create
-        // a standard OpenAI provider whose error does NOT mention "openai-codex".
+        // Upstream: the alias-aware factory routes openai.codex
+        // (requires_openai_auth=true) to OpenAiCodexModelProvider, whose
+        // credential error mentions "openai-codex".
+        // Fork (inverted): the runtime provider policy refuses every direct
+        // OpenAI slot, naming the alias it resolved. The legacy factory builds
+        // with alias `default`, so a refusal naming `codex` still proves
+        // llm_task went through the alias-aware construction.
         assert!(
-            error.contains("openai-codex"),
-            "llm_task should construct the Codex provider for \
-             openai.codex (requires_openai_auth=true), producing an \
-             openai-codex credential error; got: {error}"
+            error.contains("Direct OpenAI provider runtime is disabled for alias `codex`"),
+            "llm_task should resolve the openai.codex alias and hit the fork's \
+             direct-provider refusal for it; got: {error}"
         );
     }
 

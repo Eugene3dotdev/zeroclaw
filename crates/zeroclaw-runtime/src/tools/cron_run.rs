@@ -515,7 +515,7 @@ mod tests {
     }
 
     fn agent_job_config(tmp: &TempDir, provider_url: &str) -> (Arc<Config>, cron::CronJob) {
-        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig, WireApi};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
 
         let mut config = Config {
             data_dir: tmp.path().join("data"),
@@ -526,20 +526,25 @@ mod tests {
         config.scheduler.enabled = true;
         config.reliability.scheduler_retries = 0;
         config.reliability.provider_retries = 0;
-        config.providers.models.openai.insert(
+        // Fork: a `custom` slot, because the runtime provider policy refuses
+        // direct OpenAI construction. `thinking_passthrough` pins the compat
+        // provider to non-streaming requests, matching the JSON mock the way
+        // upstream's native OpenAI chat provider did.
+        config.providers.models.custom.insert(
             TEST_AGENT.into(),
-            OpenAIModelProviderConfig {
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("test-model".into()),
                     uri: Some(provider_url.into()),
                     api_key: Some("fixture-key".into()),
                     wire_api: Some(WireApi::ChatCompletions),
+                    thinking_passthrough: true,
                     ..Default::default()
                 },
             },
         );
         config.agents.get_mut(TEST_AGENT).unwrap().model_provider =
-            format!("openai.{TEST_AGENT}").into();
+            format!("custom.{TEST_AGENT}").into();
         let job = cron::add_agent_job(
             &config,
             TEST_AGENT,
