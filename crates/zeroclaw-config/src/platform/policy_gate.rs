@@ -144,12 +144,18 @@ impl PolicyGate {
         let (reason_tx, reason_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            if let Some(stderr) = stderr {
-                let _ = stderr
-                    .take(MAX_REASON_BYTES as u64 + 1)
-                    .read_to_end(&mut buf);
-            }
+            let Some(mut stderr) = stderr else {
+                let _ = reason_tx.send(buf);
+                return;
+            };
+            // Keep the first MAX_REASON_BYTES as the reason and hand them over,
+            // then keep draining to EOF: a gate that writes more than the
+            // pipe buffer must never block on stderr and run into the timeout.
+            let _ = (&mut stderr)
+                .take(MAX_REASON_BYTES as u64)
+                .read_to_end(&mut buf);
             let _ = reason_tx.send(buf);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
         });
 
         let deadline = Instant::now() + self.timeout;
@@ -407,6 +413,37 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the wait must be bounded by the gate timeout"
+        );
+    }
+
+    #[test]
+    fn policy_gate_verbose_stderr_neither_blocks_nor_overflows_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // 256 KiB of stderr: far past the pipe buffer and the reason cap.
+        let flood = "head -c 262144 /dev/zero | tr '\\0' x >&2";
+        let allow = fixture(
+            dir.path(),
+            "loud-allow",
+            &format!("cat >/dev/null\n{flood}\nexit 0"),
+        );
+        let block = fixture(
+            dir.path(),
+            "loud-block",
+            &format!("cat >/dev/null\n{flood}\nexit 2"),
+        );
+        let started = Instant::now();
+        gate(&[&allow])
+            .with_timeout(Duration::from_secs(5))
+            .check("true")
+            .expect("a verbose allowing gate still allows");
+        let err = gate(&[&block])
+            .with_timeout(Duration::from_secs(5))
+            .check("true")
+            .unwrap_err();
+        assert_eq!(err.reason().len(), MAX_REASON_BYTES);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stderr volume must not push the gate into its timeout"
         );
     }
 
