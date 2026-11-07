@@ -7596,7 +7596,7 @@ Examples:
         /// One-time claim token issued by your ZeroRelay account.
         token: String,
 
-        /// Control-plane base URL, e.g. https://control.zerorelay.net.
+        /// Control-plane base URL, e.g. <https://control.zerorelay.net>.
         #[arg(long)]
         control: String,
     },
@@ -8710,7 +8710,7 @@ enum OidcCommands {
     /// Sign in interactively: shows a verification code (device grant) or
     /// opens your browser (--browser), then prints the access token on stdout
     Login {
-        /// Alias of the [oidc.<alias>] config entry to enroll against
+        /// Alias of the `[oidc.<alias>]` config entry to enroll against
         alias: String,
         /// Sign in with the system browser via Authorization Code + PKCE (RFC 8252
         /// loopback) instead of the device grant; the browser is opened automatically
@@ -8721,7 +8721,7 @@ enum OidcCommands {
     /// Obtain a service token via the client_credentials grant (requires the
     /// entry's client_secret); prints the access token on stdout
     Token {
-        /// Alias of the [oidc.<alias>] config entry to enroll against
+        /// Alias of the `[oidc.<alias>]` config entry to enroll against
         alias: String,
     },
 }
@@ -16300,7 +16300,7 @@ impl SopDriverSupervisor {
     /// Returns the drivers that were still running when this returned: aborted,
     /// but not yet stopped, because cancellation only lands at a task's next
     /// await point and one that reaches none cannot be forced. The next
-    /// generation adopts them (see [`SopMaintenance::carried`]) instead of
+    /// generation adopts them (see [`SopDriverSupervisor::carried`]) instead of
     /// detaching them. **A returned handle means a task from this generation is
     /// still executing under superseded config, for as long as it takes to
     /// yield** — the caller cannot assume a clean boundary, only a tracked one.
