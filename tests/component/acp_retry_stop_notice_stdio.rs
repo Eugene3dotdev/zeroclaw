@@ -61,14 +61,14 @@ provider_backoff_ms = 0
 
 [runtime_profiles.default]
 
-[providers.models.openai.mock]
+[providers.models.custom.mock]
 api_key = "test-key"
 uri = "{uri}"
 model = "test-model"
 wire_api = "responses"
 
 [agents.test-agent]
-model_provider = "openai.mock"
+model_provider = "custom.mock"
 risk_profile = "default"
 runtime_profile = "default"
 "#
