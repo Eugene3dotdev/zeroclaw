@@ -34,6 +34,9 @@ pub const POLICY_GATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the gate stderr carried back to the model as the refusal reason.
 const MAX_REASON_BYTES: usize = 8 * 1024;
 
+/// How long a refusal waits for the exited gate's stderr to drain.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A configured external policy gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyGate {
@@ -126,9 +129,11 @@ impl PolicyGate {
 
         // Feed stdin and drain stderr on their own threads so a gate that
         // ignores stdin or floods stderr cannot wedge the wait below.
+        // Neither thread is joined: a grandchild that inherits a pipe and
+        // keeps it open must not extend the bounded wait.
         let payload = Self::payload(command);
         let stdin = child.stdin.take();
-        let writer = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             if let Some(mut stdin) = stdin {
                 // A gate that exits without reading stdin closes the pipe;
                 // its exit status decides, not this write.
@@ -136,14 +141,15 @@ impl PolicyGate {
             }
         });
         let stderr = child.stderr.take();
-        let reader = std::thread::spawn(move || {
+        let (reason_tx, reason_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(stderr) = stderr {
                 let _ = stderr
                     .take(MAX_REASON_BYTES as u64 + 1)
                     .read_to_end(&mut buf);
             }
-            buf
+            let _ = reason_tx.send(buf);
         });
 
         let deadline = Instant::now() + self.timeout;
@@ -164,19 +170,20 @@ impl PolicyGate {
         let Some(status) = status else {
             let _ = child.kill();
             let _ = child.wait();
-            // The writer and reader threads are not joined: a grandchild
-            // holding the pipes open must not extend the bounded wait.
             return Err(PolicyGateRefusal::new(format!(
                 "policy gate {program:?} timed out after {}s",
                 self.timeout.as_secs_f32()
             )));
         };
-        let _ = writer.join();
-        let stderr = reader.join().unwrap_or_default();
 
         if status.success() {
             return Ok(());
         }
+        // The gate has exited, so its stderr is at EOF unless a grandchild
+        // still holds it; wait briefly for the reason, never unboundedly.
+        let stderr = reason_rx
+            .recv_timeout(STDERR_DRAIN_TIMEOUT)
+            .unwrap_or_default();
         let mut reason = String::from_utf8_lossy(&stderr[..stderr.len().min(MAX_REASON_BYTES)])
             .trim()
             .to_string();
@@ -395,6 +402,29 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the wait must be bounded by the gate timeout"
+        );
+    }
+
+    #[test]
+    fn policy_gate_grandchild_holding_pipes_does_not_extend_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let allow = fixture(
+            dir.path(),
+            "allow-bg",
+            "cat >/dev/null\n(sleep 30 &)\nexit 0",
+        );
+        let block = fixture(
+            dir.path(),
+            "block-bg",
+            "cat >/dev/null\n(sleep 30 &)\necho 'refused with a straggler' >&2\nexit 2",
+        );
+        let started = Instant::now();
+        gate(&[&allow]).check("true").expect("exit 0 allows");
+        let err = gate(&[&block]).check("true").unwrap_err();
+        assert_eq!(err.reason(), "refused with a straggler");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a straggling grandchild must not hold the gate open"
         );
     }
 
