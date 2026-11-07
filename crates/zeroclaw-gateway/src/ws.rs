@@ -3039,7 +3039,6 @@ data: [DONE]\n\n",
                     model: Some("fixture-test".to_string()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         config.risk_profiles.insert(

@@ -339,14 +339,16 @@ provider_backoff_ms = 0
 
 [runtime_profiles.default]
 
-[providers.models.openai.smoke]
+# Fork: the custom slot, because the EugOT runtime policy refuses direct
+# OpenAI construction; the fake provider speaks the same chat-completions wire.
+[providers.models.custom.smoke]
 api_key = "plugin-smoke"
 uri = "http://127.0.0.1:$provider_port"
 model = "plugin-smoke"
 wire_api = "chat_completions"
 
 [agents.default]
-model_provider = "openai.smoke"
+model_provider = "custom.smoke"
 risk_profile = "default"
 runtime_profile = "default"
 EOF
