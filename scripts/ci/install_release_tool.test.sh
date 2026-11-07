@@ -3,6 +3,7 @@ set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 installer="${root_dir}/scripts/ci/install_release_tool.sh"
+cross_platform_workflow="${root_dir}/.github/workflows/cross-platform-build-manual.yml"
 
 assert_manifest() {
   local tool="$1"
@@ -29,6 +30,33 @@ assert_manifest() {
   grep -Fxq "binaries=${expected_binaries}" <<<"$manifest"
   grep -Fxq "sha256=${expected_sha256}" <<<"$manifest"
   grep -Fxq "url=${expected_url}" <<<"$manifest"
+}
+
+assert_smoke_matrix_entry() {
+  local name="$1"
+  local os="$2"
+  local tool="$3"
+
+  awk -v expected_name="$name" -v expected_os="$os" -v expected_tool="$tool" '
+    $0 == "          - name: " expected_name { in_entry = 1; found_name = 1; next }
+    in_entry && $0 == "            os: " expected_os { found_os = 1; next }
+    in_entry && $0 == "            tool: " expected_tool { found_tool = 1; next }
+    in_entry && /^          - name:/ { exit }
+    END { exit !(found_name && found_os && found_tool) }
+  ' <<<"$smoke_job" || {
+    echo "release-tool-smoke is missing matrix entry: $name / $os / $tool" >&2
+    exit 1
+  }
+}
+
+extract_job() {
+  local job_name="$1"
+
+  awk -v expected_job="$job_name" '
+    $0 == "  " expected_job ":" { capture = 1 }
+    capture && /^  [[:alnum:]_-]+:/ && $1 != expected_job ":" { exit }
+    capture { print }
+  ' "$cross_platform_workflow"
 }
 
 assert_manifest \
@@ -86,5 +114,173 @@ if bash "$installer" unknown-tool --print-manifest >/dev/null 2>&1; then
   echo "expected an unknown release tool to fail closed" >&2
   exit 1
 fi
+
+smoke_job="$(extract_job release-tool-smoke)"
+
+release_tools_input="$({
+  awk '
+    /^      release_tools_only:/ { capture = 1 }
+    capture && /^permissions:/ { exit }
+    capture { print }
+  ' "$cross_platform_workflow"
+})"
+
+workflow_permissions="$({
+  awk '
+    /^permissions:/ { capture = 1 }
+    capture && /^env:/ { exit }
+    capture { print }
+  ' "$cross_platform_workflow"
+})"
+
+[[ "$workflow_permissions" == $'permissions:\n  contents: read' ]] || {
+  echo "cross-platform workflow permissions must remain exactly contents: read" >&2
+  exit 1
+}
+
+[[ -n "$smoke_job" ]] || {
+  echo "cross-platform workflow must define release-tool-smoke" >&2
+  exit 1
+}
+
+[[ "$release_tools_input" == $'      release_tools_only:\n        description: Skip release builds and run only the native release-tool smoke\n        required: false\n        type: boolean\n        default: false' ]] || {
+  echo "release-tools-only dispatch must remain an optional boolean defaulting to false" >&2
+  exit 1
+}
+
+for expected in \
+  'uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2' \
+  'uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable' \
+  'runs-on: ${{ matrix.os }}' \
+  'fail-fast: false' \
+  'test "$RUNNER_ARCH" = "X64"' \
+  'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"' \
+  'bash scripts/ci/install_release_tool.sh "${{ matrix.tool }}"' \
+  'cargo_home="${CARGO_HOME:-${HOME}/.cargo}"' \
+  'cargo_home="$(cygpath -u "$cargo_home")"' \
+  'test "$cross_path" = "$expected_cross_path"' \
+  'test "$cross_util_path" = "$expected_cross_util_path"' \
+  "if: matrix.tool == 'cross'" \
+  'command -v cross-util' \
+  'cross --version' \
+  "if: matrix.tool == 'tauri-cli'" \
+  'test "$tauri_path" = "$expected_tauri_path"' \
+  'cargo-tauri.exe --version' \
+  'cargo tauri --version'; do
+  grep -Fq "$expected" <<<"$smoke_job" || {
+    echo "release-tool-smoke is missing: $expected" >&2
+    exit 1
+  }
+done
+
+if grep -Eq '^    (if|needs):' <<<"$smoke_job"; then
+  echo "release-tool-smoke must remain independent and unconditional" >&2
+  exit 1
+fi
+
+assert_smoke_matrix_entry "Linux cross" "ubuntu-22.04" "cross"
+assert_smoke_matrix_entry "Windows Tauri CLI" "windows-latest" "tauri-cli"
+
+if [[ "$(grep -c '^          - name:' <<<"$smoke_job")" -ne 2 ]]; then
+  echo "release-tool-smoke must keep exactly two native matrix legs" >&2
+  exit 1
+fi
+
+if [[ "$(grep -c '^      - uses:' <<<"$smoke_job")" -ne 2 ]]; then
+  echo "release-tool-smoke must use only checkout and the Rust toolchain action" >&2
+  exit 1
+fi
+
+for forbidden in \
+  'permissions:' \
+  'environment:' \
+  '${{ secrets.' \
+  'upload-artifact' \
+  'download-artifact' \
+  'gh release' \
+  'docker' \
+  'publish'; do
+  if grep -Fqi "$forbidden" <<<"$smoke_job"; then
+    echo "release-tool-smoke contains forbidden write or publishing surface: $forbidden" >&2
+    exit 1
+  fi
+done
+
+for job_name in web build; do
+  job="$(extract_job "$job_name")"
+  [[ -n "$job" ]] || {
+    echo "cross-platform workflow must define $job_name" >&2
+    exit 1
+  }
+  grep -Fxq "    if: \${{ inputs.qualification_profile == 'normal' && !inputs.release_tools_only }}" <<<"$job" || {
+    echo "normal product job $job_name must reject tools-only and qualification dispatches" >&2
+    exit 1
+  }
+done
+
+qualification_input="$({
+  awk '
+    /^      qualification_profile:/ { capture = 1 }
+    capture && /^      release_tools_only:/ { exit }
+    capture { print }
+  ' "$cross_platform_workflow"
+})"
+[[ "$qualification_input" == $'      qualification_profile:\n        description: Normal matrix or nonpublishing Stable GNU Ubuntu22 qualification\n        required: true\n        type: choice\n        default: normal\n        options:\n          - normal\n          - stable-gnu-ubuntu22' ]] || {
+  echo "qualification profile must default to normal and expose only the finite GNU qualifier" >&2
+  exit 1
+}
+
+manual_guard="$({
+  awk '
+    /^      - name: Validate manual qualification inputs$/ { capture = 1; next }
+    capture && /^      - / { exit }
+    capture && /^        run: \|$/ { body = 1; next }
+    body { sub(/^          /, ""); print }
+  ' <<<"$smoke_job"
+})"
+[[ -n "$manual_guard" ]] || {
+  echo "manual qualification validation must precede release tool installation" >&2
+  exit 1
+}
+for binding in \
+  'QUALIFICATION_PROFILE: ${{ inputs.qualification_profile }}' \
+  'DISTRIBUTION: ${{ inputs.distribution }}' \
+  'RELEASE_TOOLS_ONLY: ${{ inputs.release_tools_only }}'; do
+  grep -Fq "$binding" <<<"$smoke_job" || {
+    echo "manual validation must bind actual dispatch input: $binding" >&2
+    exit 1
+  }
+done
+[[ "$smoke_job" == *'Validate manual qualification inputs'*'uses: dtolnay/rust-toolchain'* ]] || {
+  echo "manual input validation must run before toolchain setup" >&2
+  exit 1
+}
+
+assert_manual_admission() {
+  local expected="$1" profile="$2" distribution="$3" tools="$4" status=0
+  QUALIFICATION_PROFILE="$profile" DISTRIBUTION="$distribution" RELEASE_TOOLS_ONLY="$tools" \
+    bash --noprofile --norc -e -o pipefail -c "$manual_guard" >/dev/null 2>&1 || status="$?"
+  [[ "$status" -eq "$expected" ]] || {
+    echo "manual admission $profile/$distribution/$tools returned $status, expected $expected" >&2
+    exit 1
+  }
+}
+for distribution in dist dist-broad; do
+  for tools in false true; do
+    assert_manual_admission 0 normal "$distribution" "$tools"
+  done
+done
+assert_manual_admission 0 stable-gnu-ubuntu22 dist false
+for profile in '' unknown ' normal'; do
+  assert_manual_admission 2 "$profile" dist false
+done
+for distribution in '' unknown 'dist '; do
+  assert_manual_admission 2 normal "$distribution" false
+done
+for tools in '' False 1; do
+  assert_manual_admission 2 normal dist "$tools"
+done
+assert_manual_admission 2 stable-gnu-ubuntu22 dist-broad false
+assert_manual_admission 2 stable-gnu-ubuntu22 dist true
 
 echo "release tool manifest tests passed"

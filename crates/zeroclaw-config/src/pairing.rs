@@ -1,19 +1,299 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use zeroclaw_macros::Configurable;
 
-/// Maximum failed pairing attempts before lockout.
-const MAX_PAIR_ATTEMPTS: u32 = 5;
-/// Lockout duration after too many failed pairing attempts.
-const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
+/// Failed pairing attempts one client gets before lockout, unless the guard's
+/// live limits say otherwise. Channel pairing guards always use it, and it is
+/// the default of `[gateway.pairing_dashboard] max_failed_attempts`.
+pub(crate) const MAX_PAIR_ATTEMPTS: u32 = 5;
+/// Lockout after too many failed pairing attempts, unless the guard's live
+/// limits say otherwise. Channel pairing guards always use it, and it is the
+/// default of `[gateway.pairing_dashboard] lockout_secs`.
+pub(crate) const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
+/// Smallest `[gateway.pairing_dashboard] code_ttl_secs` validation accepts.
+pub const PAIRING_CODE_TTL_MIN_SECS: u64 = 30;
+/// Largest `[gateway.pairing_dashboard] code_ttl_secs`, and its default: ten
+/// minutes. A saved value above it is lowered to it on load, and the guard
+/// caps every lifetime it is given at it as well (see [`PAIRING_CODE_TTL`]).
+pub const PAIRING_CODE_TTL_MAX_SECS: u64 = 10 * 60;
+/// The range `[gateway.pairing_dashboard] max_failed_attempts` must fall in.
+pub const PAIR_ATTEMPTS_RANGE: std::ops::RangeInclusive<u32> = 1..=100;
+/// The range `[gateway.pairing_dashboard] lockout_secs` must fall in: one
+/// second to one day.
+pub const PAIR_LOCKOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=86_400;
 /// Maximum number of tracked client entries to bound memory usage.
 const MAX_TRACKED_CLIENTS: usize = 10_000;
-/// Retention period for failed-attempt entries with no activity.
+/// Retention period for failed-attempt entries with no activity. An entry
+/// whose lockout is still running is kept past it (see
+/// `prune_failed_attempts`).
 const FAILED_ATTEMPT_RETENTION_SECS: u64 = 900; // 15 min
 /// Minimum interval between full sweeps of the failed-attempt map.
 const FAILED_ATTEMPT_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
+
+/// Smallest pairing-code length any configuration may select.
+///
+/// Six is the previously shipped length, so no configuration can produce a
+/// code weaker (in length) than what the gateway used to generate.
+pub const PAIRING_CODE_MIN_LENGTH: usize = 6;
+
+/// Largest pairing-code length any configuration may select. Bounds the
+/// terminal banner, the `X-Pairing-Code` header, and dashboard input.
+pub const PAIRING_CODE_MAX_LENGTH: usize = 128;
+
+/// Default pairing-code length. See [`PairingCodePolicy`] for the rationale.
+pub const PAIRING_CODE_DEFAULT_LENGTH: usize = 32;
+
+const NUMERIC_ALPHABET: &[u8] = b"0123456789";
+const ALPHANUMERIC_ALPHABET: &[u8] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+/// Crockford Base32: the digits plus the uppercase letters, minus `I`, `L`,
+/// `O`, and `U`. Removing those kills the `0`/`O` and `1`/`I`/`l` confusions
+/// that make a code painful to read aloud or retype.
+const UNAMBIGUOUS_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Character family a pairing code is drawn from.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PairingCodeCharset {
+    /// `0-9`. Compatibility mode for demos and retyping-heavy flows.
+    /// Paired with `length = 6` this reproduces the previously shipped code exactly.
+    Numeric,
+    /// `0-9A-Za-z`, case-sensitive (62 symbols). The default: densest
+    /// entropy per character for a code that is copied and pasted.
+    #[default]
+    Alphanumeric,
+    /// Crockford Base32 (32 symbols): no `I`, `L`, `O`, or `U`. Slightly
+    /// longer for the same entropy, but safe to read aloud or retype.
+    Unambiguous,
+}
+
+impl PairingCodeCharset {
+    /// The symbols a code of this family is drawn from.
+    pub fn alphabet(self) -> &'static [u8] {
+        match self {
+            Self::Numeric => NUMERIC_ALPHABET,
+            Self::Alphanumeric => ALPHANUMERIC_ALPHABET,
+            Self::Unambiguous => UNAMBIGUOUS_ALPHABET,
+        }
+    }
+
+    /// Entropy contributed by a single character of this family.
+    pub fn bits_per_char(self) -> f64 {
+        (self.alphabet().len() as f64).log2()
+    }
+
+    /// The name this family is written as in `config.toml`.
+    ///
+    /// Must stay in step with the `serde(rename_all = "snake_case")` above;
+    /// `charset_config_names_match_serde` pins that.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::Numeric => "numeric",
+            Self::Alphanumeric => "alphanumeric",
+            Self::Unambiguous => "unambiguous",
+        }
+    }
+
+    /// Every supported family, for exhaustive tests and docs.
+    pub fn all() -> [Self; 3] {
+        [Self::Numeric, Self::Alphanumeric, Self::Unambiguous]
+    }
+}
+
+/// Why a [`PairingCodePolicy`] is not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PairingCodePolicyError {
+    /// Configured length is below [`PAIRING_CODE_MIN_LENGTH`].
+    #[error(
+        "pairing code length {length} is below the minimum of {PAIRING_CODE_MIN_LENGTH}; \
+         a shorter code would be weaker than the gateway default"
+    )]
+    TooShort {
+        /// The rejected length.
+        length: usize,
+    },
+    /// Configured length is above [`PAIRING_CODE_MAX_LENGTH`].
+    #[error("pairing code length {length} exceeds the maximum of {PAIRING_CODE_MAX_LENGTH}")]
+    TooLong {
+        /// The rejected length.
+        length: usize,
+    },
+}
+
+/// The one pairing-code generation policy.
+///
+/// Every code the gateway issues — the startup code, `zeroclaw gateway
+/// get-paircode --new`, `POST /api/pairing/initiate`, and the rotate-device
+/// flow — comes from this policy via [`PairingGuard`]. There is no second
+/// pairing-code setting anywhere in the schema.
+///
+/// # Default
+///
+/// 32 case-sensitive alphanumeric characters ≈ **190.6 bits** of entropy,
+/// against ≈19.9 bits for the six-digit numeric code shipped before the shared policy.
+/// Pairing codes are pasted far more often than they are retyped, and a
+/// pairing code is the gateway's front door: getting it wrong is an
+/// authentication bypass, while getting it long is a paste.
+///
+/// Operators who transfer the code by hand have two supported alternatives,
+/// both still far stronger than the old default:
+///
+/// ```toml
+/// # Read-aloud friendly: 24 Crockford-Base32 chars ≈ 120 bits.
+/// [gateway.pairing_code]
+/// length = 24
+/// charset = "unambiguous"
+///
+/// # Exact legacy behaviour. Only for local, short-lived pairing.
+/// [gateway.pairing_code]
+/// length = 6
+/// charset = "numeric"
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.pairing_code"]
+pub struct PairingCodePolicy {
+    /// Number of characters in a generated pairing code
+    /// (`6..=128`, default: 32).
+    #[serde(default = "default_pairing_code_length")]
+    #[credential_class = "public_value"]
+    pub length: usize,
+    /// Character family: `numeric`, `alphanumeric` (default), or
+    /// `unambiguous`.
+    #[serde(default)]
+    #[credential_class = "public_value"]
+    pub charset: PairingCodeCharset,
+}
+
+fn default_pairing_code_length() -> usize {
+    PAIRING_CODE_DEFAULT_LENGTH
+}
+
+impl Default for PairingCodePolicy {
+    fn default() -> Self {
+        Self {
+            length: default_pairing_code_length(),
+            charset: PairingCodeCharset::default(),
+        }
+    }
+}
+
+impl PairingCodePolicy {
+    /// Build a validated policy.
+    pub fn new(length: usize, charset: PairingCodeCharset) -> Result<Self, PairingCodePolicyError> {
+        let policy = Self { length, charset };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// The exact legacy policy: six numeric digits.
+    ///
+    /// Kept as a named constructor so the compatibility shape is testable
+    /// and greppable rather than a magic pair of literals.
+    pub const fn numeric_compat() -> Self {
+        Self {
+            length: 6,
+            charset: PairingCodeCharset::Numeric,
+        }
+    }
+
+    /// Reject lengths outside `PAIRING_CODE_MIN_LENGTH..=PAIRING_CODE_MAX_LENGTH`.
+    pub fn validate(&self) -> Result<(), PairingCodePolicyError> {
+        if self.length < PAIRING_CODE_MIN_LENGTH {
+            return Err(PairingCodePolicyError::TooShort {
+                length: self.length,
+            });
+        }
+        if self.length > PAIRING_CODE_MAX_LENGTH {
+            return Err(PairingCodePolicyError::TooLong {
+                length: self.length,
+            });
+        }
+        Ok(())
+    }
+
+    /// The length generation will actually use, paired with the configured
+    /// length it replaced when the two differ.
+    ///
+    /// Split out from [`Self::generate`] so the clamp decision is a plain
+    /// value a test can assert on directly, independent of the WARN that
+    /// [`Self::generate`] emits when it fires.
+    pub fn resolve_length(&self) -> (usize, Option<usize>) {
+        let effective = self
+            .length
+            .clamp(PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH);
+        let clamped_from = (effective != self.length).then_some(self.length);
+        (effective, clamped_from)
+    }
+
+    /// The length actually used for generation.
+    ///
+    /// `Config::validate` rejects an out-of-range length, and the gateway
+    /// `PATCH /api/config` path refuses such a write outright, so reaching
+    /// the clamp means the policy was built by some other route. Generation
+    /// must still never panic or emit a zero-length code.
+    pub fn effective_length(&self) -> usize {
+        self.resolve_length().0
+    }
+
+    /// Shannon entropy of a code generated under this policy, in bits.
+    ///
+    /// Reported so a security-posture surface can state the active strength
+    /// rather than restating the raw length and charset.
+    pub fn entropy_bits(&self) -> f64 {
+        self.effective_length() as f64 * self.charset.bits_per_char()
+    }
+
+    /// Generate one pairing code using cryptographically secure randomness.
+    ///
+    /// Each character is drawn by rejection sampling so every symbol in the
+    /// alphabet is equally likely — a plain `%` would bias the low symbols
+    /// for any alphabet size that does not divide `u32::MAX + 1`.
+    pub fn generate(&self) -> String {
+        let alphabet = self.charset.alphabet();
+        let n = alphabet.len() as u32;
+        // Largest multiple of `n` that fits in u32; draws at or above it are
+        // rejected to keep the modulo unbiased.
+        let reject_threshold = (u32::MAX / n) * n;
+
+        let (length, clamped_from) = self.resolve_length();
+        if let Some(configured) = clamped_from {
+            // Never silently downgrade or inflate a pairing code: the
+            // operator asked for one strength and is getting another.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_length": configured,
+                        "effective_length": length,
+                        "min": PAIRING_CODE_MIN_LENGTH,
+                        "max": PAIRING_CODE_MAX_LENGTH,
+                    })),
+                "[gateway.pairing_code] length is out of range; generating at the clamped \
+                 length instead — fix `gateway.pairing_code.length` in config.toml"
+            );
+        }
+        let mut code = String::with_capacity(length);
+        for _ in 0..length {
+            loop {
+                let raw: u32 = rand::random();
+                if raw < reject_threshold {
+                    code.push(alphabet[(raw % n) as usize] as char);
+                    break;
+                }
+            }
+        }
+        code
+    }
+}
 
 /// Per-client failed attempt state with optional absolute lockout deadline.
 #[derive(Debug, Clone, Copy)]
@@ -32,21 +312,304 @@ pub enum GeneratePairingCodeError {
     PairingDisabled,
 }
 
+/// The longest a pairing code stays redeemable, and the default lifetime.
+///
+/// The code is the SOLE bearer credential for the certificate-issuance
+/// endpoint, and it is displayed on a console and written to logs, so its
+/// value has to stop being useful shortly after the operator has used it.
+/// One-time use alone left a copied code redeemable indefinitely and gave an
+/// online guesser unlimited wall-clock against a six-digit space. The gateway
+/// may shorten the lifetime (`[gateway.pairing_dashboard] code_ttl_secs`) but
+/// never lengthen it: [`PairingLimits::within_bounds`] caps it here.
+pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(PAIRING_CODE_TTL_MAX_SECS);
+
+/// A guard's code lifetime and brute-force limits at one moment.
+///
+/// A [`PairingGuard`] resolves them on every use rather than keeping a copy
+/// (see [`PairingGuard::with_live_limits`]). The default is what channel
+/// pairing uses and what `[gateway.pairing_dashboard]` defaults to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingLimits {
+    /// How long a code stays redeemable after it is minted. Capped at
+    /// [`PAIRING_CODE_TTL`] wherever it is applied.
+    pub code_ttl: Duration,
+    /// Wrong codes one client may try before it is locked out.
+    pub max_failed_attempts: u32,
+    /// How long that lockout lasts. It is fixed when the lockout starts.
+    pub lockout: Duration,
+}
+
+impl Default for PairingLimits {
+    fn default() -> Self {
+        Self {
+            code_ttl: PAIRING_CODE_TTL,
+            max_failed_attempts: MAX_PAIR_ATTEMPTS,
+            lockout: Duration::from_secs(PAIR_LOCKOUT_SECS),
+        }
+    }
+}
+
+impl PairingLimits {
+    /// The limits `[gateway.pairing_dashboard]` sets.
+    pub fn from_dashboard(dashboard: &crate::schema::PairingDashboardConfig) -> Self {
+        Self {
+            code_ttl: Duration::from_secs(dashboard.code_ttl_secs),
+            max_failed_attempts: dashboard.max_failed_attempts,
+            lockout: Duration::from_secs(dashboard.lockout_secs),
+        }
+    }
+
+    /// A resolver for [`PairingGuard::with_live_limits`] that reads
+    /// `[gateway.pairing_dashboard]` from the published config each time it
+    /// is called, so an edit applies to the next code check or failed attempt
+    /// without a restart. The read is one short read guard; the guard calls
+    /// it before taking any of its own locks.
+    pub fn live(
+        config: crate::live::LiveConfigHandle,
+    ) -> impl Fn() -> Self + Send + Sync + 'static {
+        move || Self::from_dashboard(&config.read().gateway.pairing_dashboard)
+    }
+
+    /// These limits as a guard applies them, whatever the resolver returned.
+    ///
+    /// A guard can be handed a value validation refuses: startup keeps such a
+    /// config with a warning, and `config set` does not run the range check.
+    /// Each limit is therefore held to what validation accepts, wherever that
+    /// keeps the gate closed:
+    /// - a code never outlives [`PAIRING_CODE_TTL`]. A shorter lifetime, even
+    ///   zero, only makes codes expire sooner, so it is kept;
+    /// - the attempt limit stays in [`PAIR_ATTEMPTS_RANGE`], so neither zero
+    ///   nor a huge value turns it off;
+    /// - the lockout stays in [`PAIR_LOCKOUT_SECS_RANGE`], so a zero still
+    ///   locks a client out and a huge value cannot overflow its deadline.
+    pub fn within_bounds(self) -> Self {
+        Self {
+            code_ttl: self.code_ttl.min(PAIRING_CODE_TTL),
+            max_failed_attempts: self
+                .max_failed_attempts
+                .clamp(*PAIR_ATTEMPTS_RANGE.start(), *PAIR_ATTEMPTS_RANGE.end()),
+            lockout: self.lockout.clamp(
+                Duration::from_secs(*PAIR_LOCKOUT_SECS_RANGE.start()),
+                Duration::from_secs(*PAIR_LOCKOUT_SECS_RANGE.end()),
+            ),
+        }
+    }
+}
+
+/// The resolver a [`PairingGuard`] reads its [`PairingLimits`] from.
+#[derive(Clone)]
+struct LimitsResolver(Arc<dyn Fn() -> PairingLimits + Send + Sync>);
+
+impl Default for LimitsResolver {
+    fn default() -> Self {
+        Self(Arc::new(PairingLimits::default))
+    }
+}
+
+impl std::fmt::Debug for LimitsResolver {
+    // Never calls the resolver: it may read live config, and `Debug` can run
+    // anywhere, including under a config lock.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LimitsResolver")
+    }
+}
+
+/// The active pairing code and when it was minted. `Instant` is monotonic, so
+/// the lifetime cannot be extended by moving the system clock.
+#[derive(Debug, Clone)]
+struct PendingCode {
+    code: String,
+    minted_at: Instant,
+}
+
+impl PendingCode {
+    fn new(code: String) -> Self {
+        Self {
+            code,
+            minted_at: Instant::now(),
+        }
+    }
+
+    /// Restore a previously reserved code WITHOUT refreshing its lifetime: a
+    /// failed issuance must not extend the window.
+    fn restored(code: String, minted_at: Instant) -> Self {
+        Self { code, minted_at }
+    }
+
+    fn is_expired_at(&self, now: Instant, ttl: Duration) -> bool {
+        now.duration_since(self.minted_at) >= ttl
+    }
+}
+
+/// Read the live code, clearing it first if its lifetime `ttl` has elapsed.
+/// Every path that consults the slot goes through this so an expired code is
+/// dropped rather than merely reported as absent.
+fn take_live(slot: &mut Option<PendingCode>, ttl: Duration) -> Option<PendingCode> {
+    let now = Instant::now();
+    if slot.as_ref().is_some_and(|p| p.is_expired_at(now, ttl)) {
+        *slot = None;
+    }
+    slot.clone()
+}
+
+/// The paired-token set held by [`PairingGuard::hold_paired_tokens`].
+pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashSet<String>>);
+
+impl HeldPairedTokens<'_> {
+    /// Whether `token_hash` is paired, as of this hold.
+    pub fn contains_hash(&self, token_hash: &str) -> bool {
+        self.0.contains(token_hash)
+    }
+}
+
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
     /// Whether pairing is required at all.
     require_pairing: bool,
     /// One-time pairing code (generated on startup, consumed on first pair).
-    pairing_code: Arc<Mutex<Option<String>>>,
+    pairing_code: Arc<Mutex<Option<PendingCode>>>,
+    /// One-time certificate-enrollment code, kept apart from `pairing_code`
+    /// so it authorizes a certificate and never a bearer: it may reach parties
+    /// that must not pair (the relay-terminated frontdoor, a shared link).
+    /// It shares this guard's policy, lifetime and lockout accounting.
+    enrollment_code: Arc<Mutex<Option<PendingCode>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
-    paired_tokens: Arc<Mutex<HashSet<String>>>,
+    /// A reader-writer lock so that a caller holding it across an effect
+    /// (see [`PairingGuard::hold_paired_tokens`]) delays only pairing and
+    /// revocation, not other liveness checks.
+    paired_tokens: Arc<RwLock<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
+    /// The admin token this gateway run accepts on the pairing-code admin
+    /// routes. This is the authority; the token file is only how local
+    /// clients learn it. `None` until a rotation fully succeeds, so a failed
+    /// rotation refuses every caller rather than honouring an older file.
+    admin_token: Arc<Mutex<Option<String>>>,
+    /// Where code lifetime and brute-force limits come from. Resolved on
+    /// every use, never cached: [`PairingLimits::default`] unless
+    /// [`Self::with_live_limits`] installed another source.
+    limits: LimitsResolver,
+}
+
+/// A successfully matched pairing code whose final token is not yet committed.
+///
+/// Dropping an uncommitted reservation restores the one-time code so validation
+/// or durable-write failures do not burn the operator's displayed code.
+#[derive(Debug)]
+pub struct PairingReservation {
+    guard: PairingGuard,
+    /// The slot the code was reserved from, and is restored to on drop.
+    slot: CodeSlot,
+    code: String,
+    /// Preserved so restoring the code on a failed issuance does not reset its
+    /// lifetime.
+    minted_at: Instant,
+    token: String,
+    committed: bool,
+}
+
+impl PairingReservation {
+    /// SHA-256 hash of the token that will be committed on success.
+    pub fn token_hash(&self) -> String {
+        hash_token(&self.token)
+    }
+
+    /// Commit the reservation, consuming the one-time code and storing the token.
+    pub fn commit(mut self) -> String {
+        let token = self.token.clone();
+        self.guard.paired_tokens.write().insert(hash_token(&token));
+        self.committed = true;
+        token
+    }
+}
+
+impl Drop for PairingReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let ttl = self.guard.code_ttl();
+        let restored = PendingCode::restored(self.code.clone(), self.minted_at);
+        // A code whose lifetime ran out while it was reserved is cleared here,
+        // as on every other path, rather than put back for a later read to
+        // clear.
+        if restored.is_expired_at(Instant::now(), ttl) {
+            return;
+        }
+        let mut slot = self.guard.code_slot(self.slot).lock();
+        if slot.is_none() {
+            *slot = Some(restored);
+        }
+    }
+}
+
+/// Which pending-code slot of a [`PairingGuard`] a code lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeSlot {
+    /// Gateway pairing code: pairs a bearer at `/pair`, and may also enroll.
+    Pairing,
+    /// Certificate-enrollment code: enrolls only.
+    Enrollment,
+}
+
+/// What redeeming a code is for, which decides the slots it may match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedemptionScope {
+    /// Establishes a bearer principal (`/pair`, channel pairing): only a
+    /// gateway pairing code qualifies.
+    Principal,
+    /// Authorizes one certificate issuance: an enrollment code, or a gateway
+    /// pairing code (already a principal credential, so enrolling with it
+    /// grants nothing new).
+    Enrollment,
+}
+
+impl RedemptionScope {
+    fn slots(self) -> &'static [CodeSlot] {
+        match self {
+            Self::Principal => &[CodeSlot::Pairing],
+            Self::Enrollment => &[CodeSlot::Enrollment, CodeSlot::Pairing],
+        }
+    }
+}
+
+/// A reserved code for one certificate enrollment.
+///
+/// Unlike [`PairingReservation`] it cannot be committed: enrollment proves
+/// possession of the code but pairs no bearer token, so nothing is added to
+/// (or later persisted from) the paired-token set. Dropping it without
+/// [`Self::consume`] restores the code, exactly as for a pairing reservation.
+#[derive(Debug)]
+pub struct EnrollmentReservation(PairingReservation);
+
+impl EnrollmentReservation {
+    /// An opaque, unguessable id for this issuance, for audit correlation.
+    /// It is not a credential and nothing authenticates against it.
+    pub fn issuance_id(&self) -> String {
+        self.0.token_hash()
+    }
+
+    /// Consume the one-time code. No token is paired.
+    pub fn consume(mut self) {
+        self.0.committed = true;
+    }
 }
 
 impl PairingGuard {
-    pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
+    /// Build a guard, minting the startup code under `code_policy`.
+    ///
+    /// The policy is **not** retained. `PairingGuard` outlives any number of
+    /// config writes, and root `AGENTS.md` forbids snapshotting live policy
+    /// into a long-lived handle — a code minted after an operator strengthens
+    /// `[gateway.pairing_code]` must use the new policy without a restart.
+    /// Every later mint therefore takes the policy the caller resolved from
+    /// live config at that moment.
+    pub fn new(
+        require_pairing: bool,
+        existing_tokens: &[String],
+        code_policy: PairingCodePolicy,
+    ) -> Self {
         let tokens: HashSet<String> = existing_tokens
             .iter()
             .map(|t| {
@@ -58,21 +621,122 @@ impl PairingGuard {
             })
             .collect();
         let code = if require_pairing && tokens.is_empty() {
-            Some(generate_code())
+            Some(PendingCode::new(code_policy.generate()))
         } else {
             None
         };
         Self {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
-            paired_tokens: Arc::new(Mutex::new(tokens)),
+            enrollment_code: Arc::new(Mutex::new(None)),
+            paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
+            admin_token: Arc::new(Mutex::new(None)),
+            limits: LimitsResolver::default(),
         }
+    }
+
+    /// Take code lifetime and brute-force limits from `resolve`, called on
+    /// every code check and every failed attempt instead of the fixed
+    /// [`PairingLimits::default`]. The gateway's guard passes
+    /// [`PairingLimits::live`] so `[gateway.pairing_dashboard]` applies without
+    /// a restart; channel pairing guards keep the defaults.
+    ///
+    /// The guard calls `resolve` before taking any lock of its own, so a
+    /// resolver may take a short read lock on live config. Callers must not
+    /// hold a write lock on that config across a call into this guard.
+    #[must_use]
+    pub fn with_live_limits(
+        mut self,
+        resolve: impl Fn() -> PairingLimits + Send + Sync + 'static,
+    ) -> Self {
+        self.limits = LimitsResolver(Arc::new(resolve));
+        self
+    }
+
+    /// The limits in force right now, held to their bounds (see
+    /// [`PairingLimits::within_bounds`]). Every use of a limit reads it here.
+    fn limits(&self) -> PairingLimits {
+        (self.limits.0)().within_bounds()
+    }
+
+    /// The code lifetime in force right now, capped at [`PAIRING_CODE_TTL`].
+    fn code_ttl(&self) -> Duration {
+        self.limits().code_ttl
+    }
+
+    /// Start a new admin-token generation: forget the current token, mint a
+    /// fresh one, write it owner-only into `data_dir`, and accept it only
+    /// once the file is in place. On any failure the guard accepts no admin
+    /// token at all, and whatever file an earlier run left behind never
+    /// matches, so the pairing-code admin routes fail closed.
+    pub fn rotate_admin_token(&self, data_dir: &std::path::Path) -> std::io::Result<String> {
+        let mut current = self.admin_token.lock();
+        *current = None;
+        let token = write_gateway_admin_token(data_dir)?;
+        *current = Some(token.clone());
+        Ok(token)
+    }
+
+    /// True only when `presented` equals this run's admin token, compared in
+    /// constant time. With no successful rotation, nothing matches.
+    pub fn admin_token_matches(&self, presented: &str) -> bool {
+        let presented = presented.trim();
+        !presented.is_empty()
+            && self
+                .admin_token
+                .lock()
+                .as_deref()
+                .is_some_and(|token| constant_time_eq(presented, token))
     }
 
     /// The one-time pairing code (generated only on first startup when no tokens exist).
     pub fn pairing_code(&self) -> Option<String> {
-        self.pairing_code.lock().clone()
+        let ttl = self.code_ttl();
+        take_live(&mut self.pairing_code.lock(), ttl).map(|p| p.code)
+    }
+
+    /// Test-only: rewind the active code's mint time so expiry is exercisable
+    /// deterministically, with no wall-clock waits.
+    #[cfg(test)]
+    fn age_pairing_code(&self, by: Duration) {
+        let mut slot = self.pairing_code.lock();
+        if let Some(pending) = slot.as_mut() {
+            pending.minted_at = pending
+                .minted_at
+                .checked_sub(by)
+                .expect("test rewind must stay within Instant range");
+        }
+    }
+
+    /// Test-only: rewind the enrollment code's mint time, as
+    /// [`Self::age_pairing_code`] does for the gateway code.
+    #[cfg(test)]
+    fn age_enrollment_code(&self, by: Duration) {
+        let mut slot = self.enrollment_code.lock();
+        if let Some(pending) = slot.as_mut() {
+            pending.minted_at = pending
+                .minted_at
+                .checked_sub(by)
+                .expect("test rewind must stay within Instant range");
+        }
+    }
+
+    /// Test-only: move every failed-attempt record, and the last sweep,
+    /// `by` into the past, as if that much time had gone by since.
+    #[cfg(test)]
+    fn age_failed_attempts(&self, by: Duration) {
+        let rewind = |at: Instant| {
+            at.checked_sub(by)
+                .expect("test rewind must stay within Instant range")
+        };
+        let mut guard = self.failed_attempts.lock();
+        let (map, last_sweep) = &mut *guard;
+        for state in map.values_mut() {
+            state.last_attempt = rewind(state.last_attempt);
+            state.lockout_until = state.lockout_until.map(rewind);
+        }
+        *last_sweep = rewind(*last_sweep);
     }
 
     /// Whether pairing is required at all.
@@ -80,8 +744,15 @@ impl PairingGuard {
         self.require_pairing
     }
 
-    fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
+    fn reserve_pair_blocking(
+        &self,
+        code: &str,
+        client_id: &str,
+        scope: RedemptionScope,
+    ) -> Result<Option<PairingReservation>, u64> {
         let client_id = normalize_client_key(client_id);
+        // Resolved once per attempt, before any lock is taken.
+        let limits = self.limits();
         let now = Instant::now();
 
         // Periodic sweep + lockout check
@@ -108,25 +779,11 @@ impl PairingGuard {
             }
         }
 
-        {
-            let mut pairing_code = self.pairing_code.lock();
-            if let Some(ref expected) = *pairing_code
-                && constant_time_eq(code.trim(), expected.trim())
-            {
-                // Reset failed attempts for this client on success
-                {
-                    let mut guard = self.failed_attempts.lock();
-                    guard.0.remove(&client_id);
-                }
-                let token = generate_token();
-                let mut tokens = self.paired_tokens.lock();
-                tokens.insert(hash_token(&token));
-
-                // Consume the pairing code so it cannot be reused
-                *pairing_code = None;
-
-                return Ok(Some(token));
-            }
+        if let Some(reservation) = self.try_reserve_code(code, scope, limits.code_ttl) {
+            // Reset failed attempts for this client on success
+            let mut guard = self.failed_attempts.lock();
+            guard.0.remove(&client_id);
+            return Ok(Some(reservation));
         }
 
         // Increment failed attempts for this client
@@ -158,12 +815,124 @@ impl PairingGuard {
             entry.last_attempt = now;
             entry.count += 1;
 
-            if entry.count >= MAX_PAIR_ATTEMPTS {
-                entry.lockout_until = Some(now + std::time::Duration::from_secs(PAIR_LOCKOUT_SECS));
+            if entry.count >= limits.max_failed_attempts {
+                entry.lockout_until = Some(now + limits.lockout);
             }
         }
 
         Ok(None)
+    }
+
+    fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
+        Ok(self
+            .reserve_pair_blocking(code, client_id, RedemptionScope::Principal)?
+            .map(PairingReservation::commit))
+    }
+
+    /// Reserve the given code without committing it. The returned reservation
+    /// restores the code on drop unless `commit()` is called.
+    /// Constant-time code check + reservation, with NO lockout bookkeeping.
+    /// The shared core of the keyed and unkeyed paths.
+    fn try_reserve_code(
+        &self,
+        code: &str,
+        scope: RedemptionScope,
+        ttl: Duration,
+    ) -> Option<PairingReservation> {
+        // Slots are locked one at a time, never nested, so no lock order
+        // exists to get wrong.
+        for &slot in scope.slots() {
+            let mut pending_code = self.code_slot(slot).lock();
+            // An expired code is cleared here, not merely ignored, so it
+            // cannot be redeemed later and does not linger in memory.
+            let Some(pending) = take_live(&mut pending_code, ttl) else {
+                continue;
+            };
+            if constant_time_eq(code.trim(), pending.code.trim()) {
+                let reservation = PairingReservation {
+                    guard: self.clone(),
+                    slot,
+                    code: pending.code.clone(),
+                    minted_at: pending.minted_at,
+                    token: generate_token(),
+                    committed: false,
+                };
+                // Reserve the code so concurrent requests cannot both issue,
+                // but restore it on drop if issuance fails before commit.
+                *pending_code = None;
+                return Some(reservation);
+            }
+        }
+        None
+    }
+
+    fn code_slot(&self, slot: CodeSlot) -> &Mutex<Option<PendingCode>> {
+        match slot {
+            CodeSlot::Pairing => &self.pairing_code,
+            CodeSlot::Enrollment => &self.enrollment_code,
+        }
+    }
+
+    /// Reserve a live code for certificate enrollment, with per-client lockout.
+    ///
+    /// Matches the enrollment code or the gateway pairing code. The enrollment
+    /// code exists even when gateway pairing is disabled, because enrollment
+    /// always requires a code. The returned reservation can only be consumed,
+    /// never committed: issuing a certificate establishes no bearer principal.
+    pub async fn reserve_enrollment(
+        &self,
+        code: &str,
+        client_id: &str,
+    ) -> Result<Option<EnrollmentReservation>, u64> {
+        let this = self.clone();
+        let code = code.to_string();
+        let client_id = client_id.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            this.reserve_pair_blocking(&code, &client_id, RedemptionScope::Enrollment)
+        });
+
+        Ok(handle
+            .await
+            .expect("failed to spawn blocking task this should not happen")?
+            .map(EnrollmentReservation))
+    }
+
+    /// [`Self::reserve_enrollment`] WITHOUT per-client lockout accounting, for
+    /// callers whose peers all share one network identity and which apply
+    /// their own class-wide rate policy instead. The relay enrollment bridge is
+    /// the canonical case: every relay-routed client reaches the daemon from
+    /// loopback, so keying lockout on the peer address would let five wrong
+    /// codes from ONE hostile client lock out EVERY relay-routed enrollee
+    /// (shared-fate lockout). Never expose this to a caller that has a real
+    /// per-client identity - use [`Self::reserve_enrollment`] there.
+    pub async fn reserve_enrollment_unkeyed(&self, code: &str) -> Option<EnrollmentReservation> {
+        let this = self.clone();
+        let code = code.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            let ttl = this.code_ttl();
+            this.try_reserve_code(&code, RedemptionScope::Enrollment, ttl)
+        });
+        handle
+            .await
+            .expect("failed to spawn blocking task this should not happen")
+            .map(EnrollmentReservation)
+    }
+
+    pub async fn reserve_pair(
+        &self,
+        code: &str,
+        client_id: &str,
+    ) -> Result<Option<PairingReservation>, u64> {
+        let this = self.clone();
+        let code = code.to_string();
+        let client_id = client_id.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            this.reserve_pair_blocking(&code, &client_id, RedemptionScope::Principal)
+        });
+
+        handle
+            .await
+            .expect("failed to spawn blocking task this should not happen")
     }
 
     /// Attempt to pair with the given code. Returns a bearer token on success.
@@ -187,36 +956,77 @@ impl PairingGuard {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.contains(&hashed)
+    }
+
+    /// Strict membership check for inbound authentication: whether `token`
+    /// hashes to a currently-paired token, regardless of `require_pairing`.
+    /// The gateway's `is_authenticated` convenience fails OPEN when pairing
+    /// is disabled, which is only correct on surfaces that already treat
+    /// the transport as trusted — an auth provider must use this instead,
+    /// so an empty token set denies everything.
+    pub fn token_is_paired(&self, token: &str) -> bool {
+        let hashed = hash_token(token);
+        self.paired_tokens.read().contains(&hashed)
+    }
+
+    /// Strict membership check by pre-computed SHA-256 hash (see
+    /// [`Self::token_is_paired`]). Lets an established connection re-check
+    /// liveness of its pairing without retaining the bearer itself.
+    pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
+        self.paired_tokens.read().contains(token_hash)
+    }
+
+    /// Hold the paired-token set still: no token can be paired or revoked
+    /// until the returned guard is dropped, while other readers proceed.
+    ///
+    /// For a caller that must keep a liveness decision true through the
+    /// effect it guards. Keep the hold short, and do not call this guard's
+    /// other methods while holding it: a pairing or revocation queued behind
+    /// the hold makes a second read on the same thread wait forever.
+    pub fn hold_paired_tokens(&self) -> HeldPairedTokens<'_> {
+        HeldPairedTokens(self.paired_tokens.read())
+    }
+
+    /// Whether a pairing or revocation has claimed the paired-token set and
+    /// is waiting behind a reader that still holds it (see
+    /// [`Self::hold_paired_tokens`]). False once no reader holds it, whether
+    /// the writer is then running, finished, or never came. A diagnostic for
+    /// tests that must observe a writer queued behind a hold; it keeps no
+    /// lock.
+    #[doc(hidden)]
+    pub fn token_write_queued_behind_a_hold(&self) -> bool {
+        self.paired_tokens.is_locked_exclusive()
+            && self.paired_tokens.try_read_recursive().is_some()
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         !tokens.is_empty()
     }
 
     /// Get all paired token hashes (for persisting to config).
     pub fn tokens(&self) -> Vec<String> {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.iter().cloned().collect()
     }
 
     pub fn revoke_token(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(&hashed)
     }
 
     /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
     pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(token_hash)
     }
 
     pub fn revoke_all_tokens(&self) -> usize {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         let count = tokens.len();
         tokens.clear();
         count
@@ -225,26 +1035,66 @@ impl PairingGuard {
     /// Generate a new pairing code that pairs an additional client.
     /// Does not revoke existing tokens. To rotate a compromised token,
     /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.
-    pub fn generate_new_pairing_code(&self) -> Option<String> {
+    ///
+    /// `code_policy` is passed per call, resolved by the caller from live
+    /// config at this moment — the guard holds no policy of its own, so an
+    /// operator who strengthens `[gateway.pairing_code]` sees the next code
+    /// follow the new policy without a restart.
+    pub fn generate_new_pairing_code(&self, code_policy: PairingCodePolicy) -> Option<String> {
         if !self.require_pairing {
             return None;
         }
-        let new_code = generate_code();
-        *self.pairing_code.lock() = Some(new_code.clone());
+        let new_code = code_policy.generate();
+        *self.pairing_code.lock() = Some(PendingCode::new(new_code.clone()));
         Some(new_code)
     }
 
-    pub fn generate_pairing_code_if_vacant(&self) -> Result<String, GeneratePairingCodeError> {
+    /// Issue a code only if no code is currently pending.
+    ///
+    /// `code_policy` is resolved per call for the same reason as
+    /// [`Self::generate_new_pairing_code`].
+    pub fn generate_pairing_code_if_vacant(
+        &self,
+        code_policy: PairingCodePolicy,
+    ) -> Result<String, GeneratePairingCodeError> {
         if !self.require_pairing {
             return Err(GeneratePairingCodeError::PairingDisabled);
         }
+        let ttl = self.code_ttl();
         let mut slot = self.pairing_code.lock();
-        if slot.is_some() {
+        // An expired code leaves the slot vacant: otherwise a lapsed code would
+        // block minting a replacement until the process restarted.
+        if take_live(&mut slot, ttl).is_some() {
             return Err(GeneratePairingCodeError::Pending);
         }
-        let new_code = generate_code();
-        *slot = Some(new_code.clone());
+        let new_code = code_policy.generate();
+        *slot = Some(PendingCode::new(new_code.clone()));
         Ok(new_code)
+    }
+
+    /// The live enrollment code, or a freshly minted one when none is live.
+    ///
+    /// This is the code the daemon advertises for certificate enrollment at
+    /// startup. It never reuses or replaces the gateway pairing code, and it
+    /// is minted even when gateway pairing is disabled, because enrollment
+    /// always requires a code. It cannot pair a bearer at `/pair`.
+    pub fn enrollment_code(&self, code_policy: PairingCodePolicy) -> String {
+        let ttl = self.code_ttl();
+        let mut slot = self.enrollment_code.lock();
+        if let Some(pending) = take_live(&mut slot, ttl) {
+            return pending.code;
+        }
+        let new_code = code_policy.generate();
+        *slot = Some(PendingCode::new(new_code.clone()));
+        new_code
+    }
+
+    /// Replace the enrollment code with a fresh one. The gateway pairing code
+    /// is left untouched.
+    pub fn mint_enrollment_code(&self, code_policy: PairingCodePolicy) -> String {
+        let new_code = code_policy.generate();
+        *self.enrollment_code.lock() = Some(PendingCode::new(new_code.clone()));
+        new_code
     }
 
     /// Get the token hash for a given plaintext token (for device registry lookup).
@@ -273,27 +1123,14 @@ fn normalize_client_key(key: &str) -> String {
     }
 }
 
-/// Remove failed-attempt entries whose `last_attempt` is older than the retention window.
+/// Remove failed-attempt entries whose `last_attempt` is older than the
+/// retention window, unless their lockout is still running. A configured
+/// lockout can outlast the window, and dropping the entry would end it early.
 fn prune_failed_attempts(map: &mut HashMap<String, FailedAttemptState>, now: Instant) {
     map.retain(|_, state| {
-        now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
+        state.lockout_until.is_some_and(|until| now < until)
+            || now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
     });
-}
-
-/// Generate a 6-digit numeric pairing code using cryptographically secure randomness.
-fn generate_code() -> String {
-    const UPPER_BOUND: u32 = 1_000_000;
-    const REJECT_THRESHOLD: u32 = (u32::MAX / UPPER_BOUND) * UPPER_BOUND;
-
-    loop {
-        let uuid = uuid::Uuid::new_v4();
-        let bytes = uuid.as_bytes();
-        let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-
-        if raw < REJECT_THRESHOLD {
-            return format!("{:06}", raw % UPPER_BOUND);
-        }
-    }
 }
 
 fn generate_token() -> String {
@@ -334,6 +1171,62 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     (len_diff == 0) & (byte_diff == 0)
 }
 
+/// Request header that carries the gateway admin secret on the pairing-code
+/// admin routes (`/admin/paircode`, `/admin/paircode/new`).
+pub const GATEWAY_ADMIN_TOKEN_HEADER: &str = "x-zeroclaw-admin-token";
+
+const GATEWAY_ADMIN_TOKEN_FILE: &str = "gateway-admin.token";
+
+/// Where a gateway whose data directory is `data_dir` keeps its admin secret.
+///
+/// The secret is what proves a caller is local. A loopback TCP peer is not
+/// proof: a reverse proxy or tunnel on the same host relays remote callers
+/// from loopback too, with or without forwarding headers. Reading this
+/// owner-only file requires running as the gateway's user on its host.
+pub fn gateway_admin_token_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(GATEWAY_ADMIN_TOKEN_FILE)
+}
+
+/// Mint a fresh admin secret and write it owner-only (mode `0o600` on Unix),
+/// replacing any previous file. Only [`PairingGuard::rotate_admin_token`]
+/// calls this: the guard, not the file, decides what is accepted.
+fn write_gateway_admin_token(data_dir: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Write;
+
+    let token = generate_token();
+    std::fs::create_dir_all(data_dir)?;
+    let path = gateway_admin_token_path(data_dir);
+    let staging = path.with_extension("token.tmp");
+    // A leftover staging file from a crash would make `create_new` fail.
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staging)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&staging, &path)?;
+    Ok(token)
+}
+
+/// Read the current admin secret, or `None` when no gateway has written one
+/// or the caller cannot read it.
+pub fn read_gateway_admin_token(data_dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(gateway_admin_token_path(data_dir)).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
 /// Check if a host string represents a non-localhost bind address.
 pub fn is_public_bind(host: &str) -> bool {
     !matches!(
@@ -347,31 +1240,68 @@ mod tests {
     use super::*;
     use tokio::test;
 
+    /// Serializes the tests that either emit or assert-the-absence-of the
+    /// clamp WARN. The log broadcast is process-global, so two overlapping
+    /// capture windows would let one test see the other's warning.
+    static CLAMP_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+    fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+        crate::capture_log_events()
+    }
+
+    fn drain_captured_events(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            events.push(value);
+        }
+        events
+    }
+
+    fn drain_captured(rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>) -> String {
+        drain_captured_events(rx)
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A guard under the shipped default policy. Behaviour tests that are
+    /// not about code shape use this so the default stays exercised.
+    fn new_guard(require_pairing: bool, existing_tokens: &[String]) -> PairingGuard {
+        PairingGuard::new(
+            require_pairing,
+            existing_tokens,
+            PairingCodePolicy::default(),
+        )
+    }
+
     // ── PairingGuard ─────────────────────────────────────────
 
     #[test]
     async fn new_guard_generates_code_when_no_tokens() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         assert!(guard.pairing_code().is_some());
         assert!(!guard.is_paired());
     }
 
     #[test]
     async fn new_guard_no_code_when_tokens_exist() {
-        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+        let guard = new_guard(true, &["zc_existing".into()]);
         assert!(guard.pairing_code().is_none());
         assert!(guard.is_paired());
     }
 
     #[test]
     async fn new_guard_no_code_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = new_guard(false, &[]);
         assert!(guard.pairing_code().is_none());
     }
 
     #[test]
     async fn try_pair_correct_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "test_client").await.unwrap();
         assert!(token.is_some());
@@ -380,8 +1310,47 @@ mod tests {
     }
 
     #[test]
+    async fn reservation_restores_code_until_committed() {
+        let guard = new_guard(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        {
+            let reservation = guard
+                .reserve_pair(&code, "test_client")
+                .await
+                .unwrap()
+                .expect("code should reserve");
+            assert_eq!(reservation.token_hash().len(), 64);
+            assert!(
+                guard.pairing_code().is_none(),
+                "reserved code must not be concurrently reusable"
+            );
+        }
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "dropping an uncommitted reservation restores the one-time code"
+        );
+        assert!(!guard.is_paired());
+    }
+
+    #[test]
+    async fn committed_reservation_consumes_code_and_stores_token() {
+        let guard = new_guard(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard
+            .reserve_pair(&code, "test_client")
+            .await
+            .unwrap()
+            .expect("code should reserve")
+            .commit();
+        assert!(token.starts_with("zc_"));
+        assert!(guard.pairing_code().is_none());
+        assert!(guard.is_authenticated(&token));
+    }
+
+    #[test]
     async fn try_pair_wrong_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let result = guard.try_pair("000000", "test_client").await.unwrap();
         // Might succeed if code happens to be 000000, but extremely unlikely
         // Just check it returns Ok(None) normally
@@ -390,14 +1359,14 @@ mod tests {
 
     #[test]
     async fn try_pair_empty_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         assert!(guard.try_pair("", "test_client").await.unwrap().is_none());
     }
 
     #[test]
     async fn is_authenticated_with_valid_token() {
         // Pass plaintext token — PairingGuard hashes it on load
-        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        let guard = new_guard(true, &["zc_valid".into()]);
         assert!(guard.is_authenticated("zc_valid"));
     }
 
@@ -405,26 +1374,50 @@ mod tests {
     async fn is_authenticated_with_prehashed_token() {
         // Pass an already-hashed token (64 hex chars)
         let hashed = hash_token("zc_valid");
-        let guard = PairingGuard::new(true, &[hashed]);
+        let guard = new_guard(true, &[hashed]);
         assert!(guard.is_authenticated("zc_valid"));
     }
 
     #[test]
     async fn is_authenticated_with_invalid_token() {
-        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        let guard = new_guard(true, &["zc_valid".into()]);
         assert!(!guard.is_authenticated("zc_invalid"));
     }
 
     #[test]
     async fn is_authenticated_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = new_guard(false, &[]);
         assert!(guard.is_authenticated("anything"));
         assert!(guard.is_authenticated(""));
     }
 
     #[test]
+    async fn strict_token_check_ignores_require_pairing() {
+        let guard = PairingGuard::new(false, &["zc_tok".to_string()], PairingCodePolicy::default());
+        assert!(
+            guard.is_authenticated("anything"),
+            "gateway convenience fails open when pairing is disabled"
+        );
+        assert!(guard.token_is_paired("zc_tok"));
+        assert!(!guard.token_is_paired("anything"));
+        let hash = PairingGuard::token_hash("zc_tok");
+        assert!(guard.token_hash_is_paired(&hash));
+
+        assert!(guard.revoke_token("zc_tok"));
+        assert!(!guard.token_is_paired("zc_tok"), "revocation is live");
+        assert!(!guard.token_hash_is_paired(&hash));
+    }
+
+    #[test]
+    async fn empty_guard_strict_check_denies_everything() {
+        let guard = PairingGuard::new(false, &[], PairingCodePolicy::default());
+        assert!(!guard.token_is_paired("anything"));
+        assert!(!guard.token_hash_is_paired(&PairingGuard::token_hash("anything")));
+    }
+
+    #[test]
     async fn tokens_returns_hashes() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let guard = new_guard(true, &["zc_a".into(), "zc_b".into()]);
         let tokens = guard.tokens();
         assert_eq!(tokens.len(), 2);
         // Tokens should be stored as 64-char hex hashes, not plaintext
@@ -437,7 +1430,7 @@ mod tests {
 
     #[test]
     async fn pair_then_authenticate() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -507,26 +1500,445 @@ mod tests {
         assert!(!constant_time_eq("a", ""));
     }
 
-    // ── generate helpers ─────────────────────────────────────
+    // ── Pairing-code policy: default shape ───────────────────
 
+    /// Acceptance criterion: the default is chosen deliberately and is
+    /// materially stronger than the six-digit numeric code master shipped.
     #[test]
-    async fn generate_code_is_6_digits() {
-        let code = generate_code();
-        assert_eq!(code.len(), 6);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
+    async fn default_policy_is_32_char_case_sensitive_alphanumeric() {
+        let policy = PairingCodePolicy::default();
+        assert_eq!(policy.length, 32, "default length");
+        assert_eq!(
+            policy.charset,
+            PairingCodeCharset::Alphanumeric,
+            "default charset"
+        );
+        assert_eq!(
+            policy.charset.alphabet().len(),
+            62,
+            "case-sensitive 0-9A-Za-z"
+        );
+        assert!(
+            policy.entropy_bits() > 190.0,
+            "default must clear 190 bits, got {}",
+            policy.entropy_bits()
+        );
+    }
+
+    /// The old-vs-new discriminator: a default code is no longer something
+    /// the legacy generator could ever have produced.
+    #[test]
+    async fn default_generated_code_is_not_a_six_digit_numeric_code() {
+        let policy = PairingCodePolicy::default();
+        // One sample settles the length; the charset claim needs a few
+        // draws because an all-digit 32-char code is possible in principle
+        // (p ≈ (10/62)^32 ≈ 10^-25) but not across 8 independent samples.
+        let mut saw_non_digit = false;
+        for _ in 0..8 {
+            let code = policy.generate();
+            assert_eq!(code.len(), 32, "default code length");
+            assert!(
+                code.len() > 6,
+                "default code must be longer than the old six-digit code"
+            );
+            if code.chars().any(|c| !c.is_ascii_digit()) {
+                saw_non_digit = true;
+            }
+        }
+        assert!(
+            saw_non_digit,
+            "default codes must draw from letters as well as digits"
+        );
+    }
+
+    /// The default alphabet really is case-sensitive: both cases and digits
+    /// all appear across a sample. Guards against silently upper-casing the
+    /// alphabet and quartering the keyspace.
+    #[test]
+    async fn default_charset_uses_digits_and_both_letter_cases() {
+        let policy = PairingCodePolicy::default();
+        let sample: String = (0..16).map(|_| policy.generate()).collect();
+        assert!(sample.chars().any(|c| c.is_ascii_digit()), "digits");
+        assert!(sample.chars().any(|c| c.is_ascii_uppercase()), "uppercase");
+        assert!(sample.chars().any(|c| c.is_ascii_lowercase()), "lowercase");
+    }
+
+    // ── Pairing-code policy: configured shapes ───────────────
+
+    /// Numeric compatibility mode reproduces the previously shipped code exactly.
+    #[test]
+    async fn numeric_compat_policy_reproduces_six_digit_numeric_code() {
+        let policy = PairingCodePolicy::numeric_compat();
+        assert_eq!(policy.length, 6);
+        assert_eq!(policy.charset, PairingCodeCharset::Numeric);
+        for _ in 0..16 {
+            let code = policy.generate();
+            assert_eq!(code.len(), 6, "compat code length");
+            assert!(
+                code.chars().all(|c| c.is_ascii_digit()),
+                "compat code must be all digits, got {code}"
+            );
+        }
     }
 
     #[test]
-    async fn generate_code_is_not_deterministic() {
-        // Two codes should differ with overwhelming probability. We try
-        // multiple pairs so a single 1-in-10^6 collision doesn't cause
-        // a flaky CI failure. All 10 pairs colliding is ~1-in-10^60.
+    async fn custom_length_and_charset_are_honoured() {
+        let policy = PairingCodePolicy::new(20, PairingCodeCharset::Unambiguous)
+            .expect("20 is inside the supported range");
+        let code = policy.generate();
+        assert_eq!(code.len(), 20);
+        assert!(
+            code.bytes().all(|b| UNAMBIGUOUS_ALPHABET.contains(&b)),
+            "code {code} must stay inside the unambiguous alphabet"
+        );
+    }
+
+    /// The unambiguous family exists to be read aloud, so the confusable
+    /// glyphs must be absent by construction, not by luck.
+    #[test]
+    async fn unambiguous_charset_excludes_confusable_glyphs() {
+        let alphabet = PairingCodeCharset::Unambiguous.alphabet();
+        assert_eq!(alphabet.len(), 32, "Crockford Base32 is 32 symbols");
+        for confusable in *b"ILOUlo" {
+            assert!(
+                !alphabet.contains(&confusable),
+                "{} must not appear in the unambiguous alphabet",
+                confusable as char
+            );
+        }
+    }
+
+    #[test]
+    async fn entropy_bits_tracks_length_and_charset() {
+        let numeric = PairingCodePolicy::numeric_compat();
+        // The legacy code: log2(10^6) ≈ 19.93 bits.
+        assert!(
+            (numeric.entropy_bits() - 19.93).abs() < 0.01,
+            "six numeric digits ≈ 19.93 bits, got {}",
+            numeric.entropy_bits()
+        );
+        let unambiguous = PairingCodePolicy::new(24, PairingCodeCharset::Unambiguous).unwrap();
+        assert!(
+            (unambiguous.entropy_bits() - 120.0).abs() < 0.01,
+            "24 Crockford chars = 120 bits, got {}",
+            unambiguous.entropy_bits()
+        );
+        assert!(
+            PairingCodePolicy::default().entropy_bits() > numeric.entropy_bits(),
+            "the default must beat the code it replaces"
+        );
+    }
+
+    // ── Pairing-code policy: invalid settings ────────────────
+
+    #[test]
+    async fn policy_rejects_length_below_minimum() {
+        let err = PairingCodePolicy::new(5, PairingCodeCharset::Numeric)
+            .expect_err("5 is below the floor");
+        assert_eq!(err, PairingCodePolicyError::TooShort { length: 5 });
+        // The floor is the old shipped length: no config may be weaker.
+        assert_eq!(PAIRING_CODE_MIN_LENGTH, 6);
+        assert!(
+            PairingCodePolicy::new(PAIRING_CODE_MIN_LENGTH, PairingCodeCharset::Numeric).is_ok()
+        );
+    }
+
+    #[test]
+    async fn policy_rejects_length_above_maximum() {
+        let too_long = PAIRING_CODE_MAX_LENGTH + 1;
+        let err = PairingCodePolicy::new(too_long, PairingCodeCharset::Alphanumeric)
+            .expect_err("above the ceiling");
+        assert_eq!(err, PairingCodePolicyError::TooLong { length: too_long });
+        assert!(
+            PairingCodePolicy::new(PAIRING_CODE_MAX_LENGTH, PairingCodeCharset::Alphanumeric)
+                .is_ok(),
+            "the documented ceiling itself must be accepted"
+        );
+    }
+
+    /// An out-of-range policy built by other means must still produce a
+    /// usable code rather than panicking or returning an empty string.
+    #[test]
+    async fn generate_clamps_an_out_of_range_length() {
+        let _serial = CLAMP_LOG_LOCK.lock();
+        let degenerate = PairingCodePolicy {
+            length: 0,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(degenerate.generate().len(), PAIRING_CODE_MIN_LENGTH);
+        let oversized = PairingCodePolicy {
+            length: usize::MAX,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(oversized.generate().len(), PAIRING_CODE_MAX_LENGTH);
+    }
+
+    #[test]
+    async fn charset_round_trips_through_toml_and_rejects_unknown_families() {
+        for (text, expected) in [
+            ("numeric", PairingCodeCharset::Numeric),
+            ("alphanumeric", PairingCodeCharset::Alphanumeric),
+            ("unambiguous", PairingCodeCharset::Unambiguous),
+        ] {
+            let parsed: PairingCodePolicy =
+                toml::from_str(&format!("length = 8\ncharset = \"{text}\"\n"))
+                    .expect("documented charset name parses");
+            assert_eq!(parsed.charset, expected, "charset {text}");
+        }
+        assert!(
+            toml::from_str::<PairingCodePolicy>("length = 8\ncharset = \"hex\"\n").is_err(),
+            "an unknown charset family must be rejected, not silently defaulted"
+        );
+    }
+
+    #[test]
+    async fn policy_omitting_fields_falls_back_to_the_shared_default() {
+        let parsed: PairingCodePolicy = toml::from_str("").expect("empty section parses");
+        assert_eq!(parsed, PairingCodePolicy::default());
+    }
+
+    // ── generate helpers ─────────────────────────────────────
+
+    #[test]
+    async fn generated_codes_are_not_deterministic() {
+        // Two codes should differ with overwhelming probability. Tried over
+        // several pairs so one unlucky draw cannot flake CI. Uses the
+        // narrowest supported keyspace (6 numeric digits) — if that is
+        // non-deterministic, every wider policy is too.
+        let policy = PairingCodePolicy::numeric_compat();
         for _ in 0..10 {
-            if generate_code() != generate_code() {
+            if policy.generate() != policy.generate() {
                 return; // Pass: found a non-matching pair.
             }
         }
         panic!("Generated 10 pairs of codes and all were collisions — CSPRNG failure");
+    }
+
+    /// Rejection sampling must not skew the alphabet. Over a large sample of
+    /// the smallest alphabet, every symbol should appear and no symbol
+    /// should dominate.
+    #[test]
+    async fn generation_covers_the_whole_alphabet_without_gross_bias() {
+        let policy = PairingCodePolicy::new(64, PairingCodeCharset::Numeric).unwrap();
+        let sample: String = (0..100).map(|_| policy.generate()).collect();
+        let total = sample.len() as f64;
+        for symbol in NUMERIC_ALPHABET {
+            let hits = sample.bytes().filter(|b| b == symbol).count() as f64;
+            let share = hits / total;
+            assert!(
+                (0.06..0.14).contains(&share),
+                "symbol {} took {share:.3} of a uniform-0.1 sample — biased draw",
+                *symbol as char
+            );
+        }
+    }
+
+    // ── Out-of-range lengths are clamped loudly, never silently ──
+
+    /// Review MAJOR-2: the clamp decision itself, as a plain value.
+    #[test]
+    async fn resolve_length_reports_what_it_clamped() {
+        let in_range = PairingCodePolicy::default();
+        assert_eq!(
+            in_range.resolve_length(),
+            (32, None),
+            "an in-range length reports no clamp"
+        );
+
+        let too_short = PairingCodePolicy {
+            length: 2,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(
+            too_short.resolve_length(),
+            (PAIRING_CODE_MIN_LENGTH, Some(2)),
+            "a short length is clamped up and reports the configured value"
+        );
+
+        let too_long = PairingCodePolicy {
+            length: 5_000,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(
+            too_long.resolve_length(),
+            (PAIRING_CODE_MAX_LENGTH, Some(5_000)),
+            "a long length is clamped down and reports the configured value"
+        );
+    }
+
+    /// Review MAJOR-2: clamping must be loud. Pins the actual emitted WARN,
+    /// including both the configured and effective lengths, so an operator
+    /// reading logs can see they are not getting the code they asked for.
+    #[test]
+    async fn generating_at_a_clamped_length_warns_with_both_values() {
+        let _serial = CLAMP_LOG_LOCK.lock();
+        let mut rx = capture_log_events();
+        let degenerate = PairingCodePolicy {
+            length: 2,
+            charset: PairingCodeCharset::Numeric,
+        };
+        let code = degenerate.generate();
+        assert_eq!(code.len(), PAIRING_CODE_MIN_LENGTH);
+
+        // Pick out *our* event structurally: a substring match over the whole
+        // capture window would also match another test's WARN, and would not
+        // pin the severity to this event.
+        let events = drain_captured_events(&mut rx);
+        let warning = events
+            .iter()
+            .find(|e| {
+                e.get("body")
+                    .or_else(|| e.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|m| m.contains("gateway.pairing_code"))
+            })
+            .unwrap_or_else(|| {
+                panic!("no clamp warning naming gateway.pairing_code in {events:#?}")
+            });
+
+        assert_eq!(
+            warning.get("severity_text").and_then(|v| v.as_str()),
+            Some("WARN"),
+            "the clamp notice must be a WARN, not a quieter level: {warning:#?}"
+        );
+        let body = warning
+            .get("body")
+            .or_else(|| warning.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("out of range"),
+            "warning must say the length is out of range; got: {body}"
+        );
+
+        let rendered = serde_json::to_string(warning).unwrap_or_default();
+        assert!(
+            rendered.contains("\"configured_length\":2"),
+            "warning must report the configured length; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"effective_length\":6"),
+            "warning must report the effective length; got: {rendered}"
+        );
+    }
+
+    /// The happy path must stay quiet — a warning on every mint would train
+    /// operators to ignore it.
+    #[test]
+    async fn generating_at_a_valid_length_emits_no_clamp_warning() {
+        let _serial = CLAMP_LOG_LOCK.lock();
+        let mut rx = capture_log_events();
+        let _ = PairingCodePolicy::default().generate();
+        let logs = drain_captured(&mut rx);
+        assert!(
+            !logs.contains("configured_length"),
+            "an in-range policy must not emit a clamp warning; got: {logs}"
+        );
+    }
+
+    /// `config_name` feeds the migration writer, so it must agree with what
+    /// serde accepts, in both directions.
+    #[test]
+    async fn charset_config_names_match_serde() {
+        for charset in PairingCodeCharset::all() {
+            let name = charset.config_name();
+            let parsed: PairingCodePolicy =
+                toml::from_str(&format!("length = 8\ncharset = \"{name}\"\n"))
+                    .unwrap_or_else(|e| panic!("serde must accept config_name {name:?}: {e}"));
+            assert_eq!(parsed.charset, charset, "round-trip for {name}");
+
+            let serialized = toml::to_string(&PairingCodePolicy { length: 8, charset })
+                .expect("policy serializes");
+            assert!(
+                serialized.contains(&format!("charset = \"{name}\"")),
+                "serde must emit config_name {name:?}; got: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    async fn admin_token_rotation_publishes_the_token_and_matches_only_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let guard = new_guard(true, &[]);
+
+        assert!(
+            !guard.admin_token_matches("anything"),
+            "before any rotation the guard accepts no admin token"
+        );
+        assert_eq!(read_gateway_admin_token(&data_dir), None);
+
+        let token = guard
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
+        assert_eq!(
+            read_gateway_admin_token(&data_dir).as_deref(),
+            Some(token.as_str()),
+            "local clients learn the token from the file"
+        );
+        assert!(guard.admin_token_matches(&token));
+        assert!(!guard.admin_token_matches(""));
+        assert!(!guard.admin_token_matches("zc_wrong"));
+    }
+
+    #[test]
+    async fn admin_token_from_an_earlier_rotation_stops_matching() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let guard = new_guard(true, &[]);
+        let first = guard.rotate_admin_token(tmp.path()).unwrap();
+        let second = guard.rotate_admin_token(tmp.path()).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!guard.admin_token_matches(&first));
+        assert!(guard.admin_token_matches(&second));
+    }
+
+    #[test]
+    async fn failed_admin_token_rotation_fails_closed_despite_an_older_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        // An earlier run left a valid-looking token file behind.
+        let previous_run = new_guard(true, &[]);
+        let stale = previous_run.rotate_admin_token(&data_dir).unwrap();
+
+        // This run cannot write: its data dir path is a regular file.
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        let guard = new_guard(true, &[]);
+        let last_good = guard.rotate_admin_token(&data_dir).unwrap();
+        assert!(guard.rotate_admin_token(&unwritable).is_err());
+
+        assert!(
+            !guard.admin_token_matches(&stale),
+            "a file from an earlier run must never be honoured"
+        );
+        assert_eq!(
+            read_gateway_admin_token(&data_dir).as_deref(),
+            Some(last_good.as_str()),
+            "the last good token is still on disk"
+        );
+        assert!(
+            !guard.admin_token_matches(&last_good),
+            "after a failed rotation even the last good token on disk is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn gateway_admin_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        new_guard(true, &[]).rotate_admin_token(tmp.path()).unwrap();
+        let mode = std::fs::metadata(gateway_admin_token_path(tmp.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the admin secret must be owner-only, got {mode:o}"
+        );
     }
 
     #[test]
@@ -549,7 +1961,7 @@ mod tests {
 
     #[test]
     async fn brute_force_lockout_after_max_attempts() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let client = "attacker_client";
         // Exhaust all attempts with wrong codes
         for i in 0..MAX_PAIR_ATTEMPTS {
@@ -572,7 +1984,7 @@ mod tests {
 
     #[test]
     async fn correct_code_resets_failed_attempts() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let client = "test_client";
         // Fail a few times
@@ -586,7 +1998,7 @@ mod tests {
 
     #[test]
     async fn lockout_returns_remaining_seconds() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let client = "test_client";
         for _ in 0..MAX_PAIR_ATTEMPTS {
             let _ = guard.try_pair("wrong", client).await;
@@ -601,7 +2013,7 @@ mod tests {
 
     #[test]
     async fn successful_pair_resets_only_requesting_client_state() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let client_a = "client_a";
         let client_b = "client_b";
@@ -635,7 +2047,7 @@ mod tests {
 
     #[test]
     async fn failed_attempt_state_is_bounded_by_max_clients() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
 
         // Fill the map to MAX_TRACKED_CLIENTS with stale entries
         {
@@ -675,7 +2087,7 @@ mod tests {
 
     #[test]
     async fn failed_attempt_sweep_prunes_expired_clients() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
 
         // Seed a stale entry and set last_sweep to long ago so sweep triggers
         {
@@ -717,7 +2129,7 @@ mod tests {
 
     #[test]
     async fn lockout_is_per_client() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let attacker = "attacker_ip";
         let legitimate = "legitimate_ip";
 
@@ -740,7 +2152,7 @@ mod tests {
 
     #[test]
     async fn revoked_token_no_longer_authenticates() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -752,7 +2164,7 @@ mod tests {
 
     #[test]
     async fn revoked_token_is_dropped_from_persistence_view() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
         let expected_hash = hash_token(&token);
@@ -764,7 +2176,7 @@ mod tests {
 
     #[test]
     async fn revoke_token_hash_matches_revoke_token() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let guard = new_guard(true, &["zc_a".into(), "zc_b".into()]);
         let hash_a = hash_token("zc_a");
         assert!(guard.revoke_token_hash(&hash_a));
         assert!(!guard.is_authenticated("zc_a"));
@@ -773,14 +2185,14 @@ mod tests {
 
     #[test]
     async fn revoke_unknown_token_is_noop() {
-        let guard = PairingGuard::new(true, &["zc_a".into()]);
+        let guard = new_guard(true, &["zc_a".into()]);
         assert!(!guard.revoke_token("zc_never_paired"));
         assert!(guard.is_authenticated("zc_a"));
     }
 
     #[test]
     async fn revoke_is_scoped_to_target_token() {
-        let guard = PairingGuard::new(true, &["zc_keep".into(), "zc_drop".into()]);
+        let guard = new_guard(true, &["zc_keep".into(), "zc_drop".into()]);
         assert!(guard.revoke_token("zc_drop"));
         assert!(guard.is_authenticated("zc_keep"));
         assert!(!guard.is_authenticated("zc_drop"));
@@ -788,7 +2200,7 @@ mod tests {
 
     #[test]
     async fn revoke_all_tokens_invalidates_every_token() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
+        let guard = new_guard(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
         assert_eq!(guard.revoke_all_tokens(), 3);
         assert!(!guard.is_authenticated("zc_a"));
         assert!(!guard.is_authenticated("zc_b"));
@@ -799,7 +2211,7 @@ mod tests {
 
     #[test]
     async fn revoke_all_tokens_on_empty_set_returns_zero() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         assert_eq!(guard.revoke_all_tokens(), 0);
     }
 
@@ -807,18 +2219,22 @@ mod tests {
 
     #[test]
     async fn generate_pairing_code_if_vacant_succeeds_when_slot_empty() {
-        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+        let guard = new_guard(true, &["zc_existing".into()]);
         // `new()` does not issue a code once paired; slot is empty here.
         assert!(guard.pairing_code().is_none());
-        let code = guard.generate_pairing_code_if_vacant().unwrap();
+        let code = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .unwrap();
         assert_eq!(guard.pairing_code().as_deref(), Some(code.as_str()));
     }
 
     #[test]
     async fn generate_pairing_code_if_vacant_refuses_when_slot_occupied() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let pre_existing = guard.pairing_code().expect("startup code");
-        let err = guard.generate_pairing_code_if_vacant().unwrap_err();
+        let err = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::Pending);
         assert_eq!(
             guard.pairing_code().as_deref(),
@@ -829,8 +2245,745 @@ mod tests {
 
     #[test]
     async fn generate_pairing_code_if_vacant_refuses_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
-        let err = guard.generate_pairing_code_if_vacant().unwrap_err();
+        let guard = new_guard(false, &[]);
+        let err = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::PairingDisabled);
+    }
+
+    // ── Certificate enrollment on the shared authority ───────
+    //
+    // Enrollment and gateway pairing share one guard (policy, TTL, lockout)
+    // but not one code: an enrollment code issues a certificate and nothing
+    // else, so a party that observed it (the relay-terminated frontdoor, a
+    // leaked link) cannot turn it into a bearer at `/pair`. A gateway code,
+    // already a principal credential, may also enroll.
+
+    #[test]
+    async fn an_enrollment_code_enrolls_without_pairing_a_token() {
+        let guard = new_guard(true, &[]);
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        let reservation = guard
+            .reserve_enrollment(&code, "198.51.100.7")
+            .await
+            .unwrap()
+            .expect("the live enrollment code must reserve");
+        assert_eq!(reservation.issuance_id().len(), 64);
+        reservation.consume();
+        assert!(
+            guard.reserve_enrollment_unkeyed(&code).await.is_none(),
+            "the code is one-time"
+        );
+        assert!(
+            !guard.is_paired(),
+            "enrollment must not pair a bearer token nobody holds"
+        );
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn an_enrollment_code_is_refused_at_pair_and_survives_the_attempt() {
+        let guard = new_guard(true, &[]);
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        assert_eq!(guard.try_pair(&code, "198.51.100.7").await.unwrap(), None);
+        assert!(
+            guard
+                .reserve_pair(&code, "198.51.100.8")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        guard
+            .reserve_enrollment(&code, "198.51.100.9")
+            .await
+            .unwrap()
+            .expect("a refused /pair attempt must not burn the enrollment code")
+            .consume();
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn a_gateway_code_enrolls_and_is_consumed_without_pairing() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let code = guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing is required");
+        guard
+            .reserve_enrollment(&code, "198.51.100.7")
+            .await
+            .unwrap()
+            .expect("an unbound gateway code may enroll")
+            .consume();
+        assert!(guard.pairing_code().is_none(), "the gateway code is spent");
+        assert_eq!(guard.tokens().len(), 1, "no token was paired");
+    }
+
+    #[test]
+    async fn dropped_enrollment_reservations_restore_the_code_to_its_own_slot() {
+        let guard = new_guard(true, &[]);
+        let gateway = guard.pairing_code().expect("startup code");
+        let enrollment = guard.enrollment_code(PairingCodePolicy::default());
+
+        drop(guard.reserve_enrollment_unkeyed(&enrollment).await.unwrap());
+        drop(guard.reserve_enrollment_unkeyed(&gateway).await.unwrap());
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(gateway.as_str()),
+            "the gateway code is restored to the gateway slot"
+        );
+        assert_eq!(
+            guard.enrollment_code(PairingCodePolicy::default()),
+            enrollment,
+            "the enrollment code is restored to the enrollment slot"
+        );
+        assert_eq!(
+            guard.try_pair(&enrollment, "198.51.100.7").await.unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    async fn enrollment_requires_a_code_even_when_gateway_pairing_is_disabled() {
+        let guard = new_guard(false, &[]);
+        assert!(guard.pairing_code().is_none());
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        assert_eq!(guard.try_pair(&code, "198.51.100.7").await.unwrap(), None);
+        guard
+            .reserve_enrollment(&code, "198.51.100.9")
+            .await
+            .unwrap()
+            .expect("enrollment always admits a live code")
+            .consume();
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn enrollment_code_reuses_the_live_enrollment_code_only() {
+        let guard = new_guard(true, &[]);
+        let gateway = guard.pairing_code().expect("startup code");
+        let first = guard.enrollment_code(PairingCodePolicy::default());
+        assert_ne!(
+            first, gateway,
+            "the gateway code is not advertised for enrollment"
+        );
+        assert_eq!(guard.enrollment_code(PairingCodePolicy::default()), first);
+        assert_eq!(guard.pairing_code().as_deref(), Some(gateway.as_str()));
+    }
+
+    #[test]
+    async fn mint_enrollment_code_replaces_only_the_enrollment_code() {
+        let guard = new_guard(true, &[]);
+        let gateway = guard.pairing_code().expect("startup code");
+        let first = guard.mint_enrollment_code(PairingCodePolicy::default());
+        let second = guard.mint_enrollment_code(PairingCodePolicy::default());
+        assert_ne!(first, second);
+        assert!(guard.reserve_enrollment_unkeyed(&first).await.is_none());
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(gateway.as_str()),
+            "minting an enrollment code must not cancel a pending gateway code"
+        );
+        guard
+            .reserve_enrollment_unkeyed(&second)
+            .await
+            .expect("the newest enrollment code is live")
+            .consume();
+    }
+
+    #[test]
+    async fn generating_a_gateway_code_does_not_cancel_the_enrollment_code() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let enrollment = guard.mint_enrollment_code(PairingCodePolicy::default());
+        guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing is required");
+        guard
+            .reserve_enrollment_unkeyed(&enrollment)
+            .await
+            .expect("the enrollment code survives a gateway mint")
+            .consume();
+    }
+
+    #[test]
+    async fn an_expired_enrollment_code_is_refused_and_cleared() {
+        let guard = new_guard(true, &[]);
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        guard.age_enrollment_code(PAIRING_CODE_TTL);
+        assert!(guard.reserve_enrollment_unkeyed(&code).await.is_none());
+        assert_ne!(
+            guard.enrollment_code(PairingCodePolicy::default()),
+            code,
+            "an expired code is cleared, so a fresh one is minted"
+        );
+    }
+
+    // ── One shared policy across every issuing path ──────────
+
+    fn assert_matches_policy(code: &str, policy: PairingCodePolicy) {
+        assert_eq!(
+            code.len(),
+            policy.length,
+            "code {code} has the wrong length"
+        );
+        let alphabet = policy.charset.alphabet();
+        assert!(
+            code.bytes().all(|b| alphabet.contains(&b)),
+            "code {code} strayed outside the configured alphabet"
+        );
+    }
+
+    /// Startup pairing, on-demand regeneration, and the atomic
+    /// dashboard/API issue path must all draw from the same policy. A
+    /// non-default shape is used so a hardcoded generator cannot pass.
+    #[test]
+    async fn every_issuing_path_uses_the_configured_policy() {
+        let policy = PairingCodePolicy::new(20, PairingCodeCharset::Unambiguous).unwrap();
+
+        // 1. Startup code (`PairingGuard::new` with no existing tokens).
+        let guard = PairingGuard::new(true, &[], policy);
+        let startup = guard.pairing_code().expect("startup code is issued");
+        assert_matches_policy(&startup, policy);
+
+        // 2. On-demand regeneration (`gateway get-paircode --new`,
+        //    `POST /api/pairing/initiate`).
+        let regenerated = guard
+            .generate_new_pairing_code(policy)
+            .expect("regeneration is allowed when pairing is required");
+        assert_matches_policy(&regenerated, policy);
+        assert_ne!(startup, regenerated, "regeneration must issue a fresh code");
+
+        // 3. Atomic issue-if-vacant (rotate-device flow).
+        let paired = PairingGuard::new(true, &["zc_existing".into()], policy);
+        let vacant = paired
+            .generate_pairing_code_if_vacant(policy)
+            .expect("slot is empty once paired");
+        assert_matches_policy(&vacant, policy);
+    }
+
+    /// Review follow-up: the guard must not snapshot the policy.
+    /// A guard built under the weak compatibility policy, then asked to mint
+    /// under a strengthened one, issues the strengthened shape — no
+    /// reconstruction, no restart. This is the unit-level half of the
+    /// regression; the gateway half swaps live config.
+    #[test]
+    async fn a_long_lived_guard_mints_under_the_policy_passed_at_issuance() {
+        let weak = PairingCodePolicy::numeric_compat();
+        let strong = PairingCodePolicy::new(24, PairingCodeCharset::Unambiguous).unwrap();
+
+        // Born weak.
+        let guard = PairingGuard::new(true, &[], weak);
+        assert_matches_policy(&guard.pairing_code().expect("startup code"), weak);
+
+        // Operator strengthens the policy. Same guard instance throughout.
+        let regenerated = guard
+            .generate_new_pairing_code(strong)
+            .expect("regeneration allowed");
+        assert_matches_policy(&regenerated, strong);
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(regenerated.as_str()),
+            "the strengthened code is the one now pending"
+        );
+
+        // And the vacant path agrees once the slot clears.
+        let token = guard
+            .try_pair(&regenerated, "client")
+            .await
+            .expect("not locked out")
+            .expect("strengthened code pairs");
+        assert!(guard.is_authenticated(&token));
+        let vacant = guard
+            .generate_pairing_code_if_vacant(strong)
+            .expect("slot cleared by the successful pair");
+        assert_matches_policy(&vacant, strong);
+    }
+
+    /// A guard configured for numeric compatibility keeps issuing exactly
+    /// the legacy shape, so the old flow is preserved, not merely
+    /// tolerated.
+    #[test]
+    async fn numeric_compat_guard_still_issues_six_digit_codes() {
+        let policy = PairingCodePolicy::numeric_compat();
+        let guard = PairingGuard::new(true, &[], policy);
+        let code = guard.pairing_code().expect("startup code");
+        assert_matches_policy(&code, policy);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    /// Acceptance criterion: a successful pair using the configured
+    /// code shape. Exercised for every charset family so none of them
+    /// breaks the constant-time comparison or the trim on submit.
+    #[test]
+    async fn pairing_succeeds_with_every_configured_code_shape() {
+        for policy in [
+            PairingCodePolicy::default(),
+            PairingCodePolicy::numeric_compat(),
+            PairingCodePolicy::new(20, PairingCodeCharset::Unambiguous).unwrap(),
+            PairingCodePolicy::new(PAIRING_CODE_MAX_LENGTH, PairingCodeCharset::Alphanumeric)
+                .unwrap(),
+        ] {
+            let guard = PairingGuard::new(true, &[], policy);
+            let code = guard.pairing_code().expect("startup code");
+            assert_matches_policy(&code, policy);
+
+            let token = guard
+                .try_pair(&code, "client")
+                .await
+                .expect("not locked out")
+                .unwrap_or_else(|| panic!("code of shape {policy:?} should pair"));
+            assert!(guard.is_authenticated(&token));
+            // One-time consumption survives the longer code.
+            assert!(guard.pairing_code().is_none(), "code must be consumed");
+            assert!(
+                guard.try_pair(&code, "client").await.expect("ok").is_none(),
+                "a consumed code must not pair a second time"
+            );
+        }
+    }
+
+    /// A code from one policy must not pair a guard running another. Cheap
+    /// regression net against a generator that ignores its policy.
+    #[test]
+    async fn a_code_from_a_different_policy_does_not_pair() {
+        let weak = PairingGuard::new(true, &[], PairingCodePolicy::numeric_compat());
+        let strong = PairingGuard::new(true, &[], PairingCodePolicy::default());
+        let weak_code = weak.pairing_code().expect("startup code");
+        assert!(
+            strong
+                .try_pair(&weak_code, "client")
+                .await
+                .expect("not locked out")
+                .is_none(),
+            "a six-digit code must not open a 32-char guard"
+        );
+        assert!(!strong.is_paired());
+    }
+
+    /// A pairing code is the sole bearer credential for certificate issuance
+    /// and is shown on a console and written to logs. One-time use alone left a
+    /// copied code redeemable indefinitely, so it must also expire - and the
+    /// expired value must be CLEARED, not merely reported absent.
+    #[test]
+    async fn expired_code_is_rejected_and_cleared() {
+        let guard = new_guard(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        guard.age_pairing_code(PAIRING_CODE_TTL);
+
+        assert!(
+            guard
+                .reserve_pair(&code, "test_client")
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired code must not reserve"
+        );
+        assert!(
+            guard.pairing_code().is_none(),
+            "an expired code must be cleared from the slot, not left in memory"
+        );
+    }
+
+    /// Restoring a code after a failed issuance must not extend its lifetime:
+    /// otherwise a guesser could keep a code alive by failing repeatedly.
+    #[test]
+    async fn a_failed_issuance_does_not_extend_the_lifetime() {
+        let guard = new_guard(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+
+        // Take the code to within a second of expiry BEFORE the failed
+        // attempt, so a restore that reset the clock would be visible.
+        guard.age_pairing_code(PAIRING_CODE_TTL - Duration::from_secs(1));
+
+        // Reserve and drop uncommitted: the code is restored for a retry.
+        {
+            let _reservation = guard
+                .reserve_pair(&code, "test_client")
+                .await
+                .unwrap()
+                .expect("code should reserve");
+        }
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "a failed issuance must restore the code"
+        );
+
+        // Two more seconds carries the ORIGINAL schedule past expiry. Had the
+        // restore reset the clock, a full TTL would still remain here.
+        guard.age_pairing_code(Duration::from_secs(2));
+        assert!(
+            guard
+                .reserve_pair(&code, "test_client")
+                .await
+                .unwrap()
+                .is_none(),
+            "a restored code must still expire on its original schedule"
+        );
+    }
+
+    /// After expiry the slot counts as vacant, so an operator can mint a fresh
+    /// code without restarting the process - and that replacement redeems.
+    #[test]
+    async fn a_fresh_replacement_works_after_expiry() {
+        let guard = new_guard(true, &[]);
+        let stale = guard.pairing_code().unwrap().to_string();
+        guard.age_pairing_code(PAIRING_CODE_TTL);
+
+        let fresh = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .expect("an expired code must leave the slot vacant");
+        assert_ne!(fresh, stale, "the replacement must be a new code");
+
+        assert!(
+            guard
+                .reserve_pair(&stale, "test_client")
+                .await
+                .unwrap()
+                .is_none(),
+            "the expired code must not redeem after replacement"
+        );
+        assert!(
+            guard
+                .reserve_pair(&fresh, "test_client")
+                .await
+                .unwrap()
+                .is_some(),
+            "the fresh replacement must redeem"
+        );
+    }
+
+    /// The one-active-code model is unchanged: minting replaces an unexpired
+    /// code rather than erroring, and the superseded value stops working.
+    #[test]
+    async fn minting_still_replaces_an_unexpired_code() {
+        let guard = new_guard(true, &[]);
+        let first = guard.pairing_code().unwrap().to_string();
+        let second = guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("mint must replace unconditionally");
+        assert_ne!(first, second);
+        assert!(
+            guard
+                .reserve_pair(&first, "test_client")
+                .await
+                .unwrap()
+                .is_none(),
+            "the superseded code must not redeem"
+        );
+        assert!(
+            guard
+                .reserve_pair(&second, "test_client")
+                .await
+                .unwrap()
+                .is_some(),
+            "the replacement code must redeem"
+        );
+    }
+
+    // ── Live limits (`[gateway.pairing_dashboard]`) ──────────────
+
+    /// Limits a test can change while a guard is running, the way an edit to
+    /// live config changes what [`PairingLimits::live`] returns.
+    fn adjustable_limits(limits: PairingLimits) -> Arc<Mutex<PairingLimits>> {
+        Arc::new(Mutex::new(limits))
+    }
+
+    fn guard_with(limits: &Arc<Mutex<PairingLimits>>) -> PairingGuard {
+        let limits = Arc::clone(limits);
+        new_guard(true, &[]).with_live_limits(move || *limits.lock())
+    }
+
+    async fn fail(guard: &PairingGuard, client: &str, times: u32) {
+        for i in 0..times {
+            assert!(
+                guard.try_pair("wrong", client).await.is_ok(),
+                "attempt {i} must not be locked out yet"
+            );
+        }
+    }
+
+    /// Channel pairing (Telegram, LINE, WeChat) builds plain guards and must
+    /// keep today's limits: ten-minute codes, five attempts, five minutes.
+    #[test]
+    async fn a_guard_without_live_limits_keeps_the_fixed_defaults() {
+        assert_eq!(
+            PairingLimits::default(),
+            PairingLimits {
+                code_ttl: Duration::from_secs(600),
+                max_failed_attempts: 5,
+                lockout: Duration::from_secs(300),
+            }
+        );
+        let guard = new_guard(true, &[]);
+        guard.age_pairing_code(Duration::from_secs(599));
+        assert!(
+            guard.pairing_code().is_some(),
+            "599 s is inside ten minutes"
+        );
+        guard.age_pairing_code(Duration::from_secs(1));
+        assert!(guard.pairing_code().is_none(), "600 s is past it");
+
+        fail(&guard, "client", 5).await;
+        let remaining = guard.try_pair("wrong", "client").await.unwrap_err();
+        assert!((299..=300).contains(&remaining), "got {remaining}");
+    }
+
+    /// The attempt limit and the lockout come from the resolver on each
+    /// attempt, so a change applies to the next attempt without a restart.
+    #[test]
+    async fn the_attempt_limit_and_lockout_follow_the_live_limits() {
+        let limits = adjustable_limits(PairingLimits {
+            max_failed_attempts: 2,
+            lockout: Duration::from_secs(1_000),
+            ..PairingLimits::default()
+        });
+        let guard = guard_with(&limits);
+
+        fail(&guard, "first", 2).await;
+        let remaining = guard.try_pair("wrong", "first").await.unwrap_err();
+        assert!(
+            (999..=1_000).contains(&remaining),
+            "a 1000 s lockout after two attempts; got {remaining}"
+        );
+
+        limits.lock().max_failed_attempts = 4;
+        limits.lock().lockout = Duration::from_secs(60);
+        fail(&guard, "second", 4).await;
+        let remaining = guard.try_pair("wrong", "second").await.unwrap_err();
+        assert!(
+            (59..=60).contains(&remaining),
+            "the edited limits apply to the next attempt; got {remaining}"
+        );
+    }
+
+    /// The live lifetime governs every slot and every path that reads one:
+    /// the code shown, redemption, enrollment, and minting into a vacant slot.
+    #[test]
+    async fn the_code_lifetime_follows_the_live_limits_on_every_path() {
+        let limits = adjustable_limits(PairingLimits {
+            code_ttl: Duration::from_secs(60),
+            ..PairingLimits::default()
+        });
+
+        let guard = guard_with(&limits);
+        let code = guard.pairing_code().expect("startup code");
+        guard.age_pairing_code(Duration::from_secs(59));
+        assert_eq!(guard.pairing_code().as_deref(), Some(code.as_str()));
+        guard.age_pairing_code(Duration::from_secs(1));
+        assert!(guard.pairing_code().is_none(), "60 s ends a 60 s lifetime");
+        assert!(guard.try_pair(&code, "client").await.unwrap().is_none());
+        assert!(
+            guard
+                .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+                .is_ok(),
+            "the expired code leaves the slot vacant"
+        );
+
+        let guard = guard_with(&limits);
+        let code = guard.pairing_code().expect("startup code");
+        guard.age_pairing_code(Duration::from_secs(60));
+        assert!(
+            guard
+                .reserve_enrollment(&code, "client")
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired pairing code must not enroll"
+        );
+
+        let guard = guard_with(&limits);
+        let enrollment = guard.enrollment_code(PairingCodePolicy::default());
+        guard.age_enrollment_code(Duration::from_secs(60));
+        assert!(
+            guard
+                .reserve_enrollment_unkeyed(&enrollment)
+                .await
+                .is_none(),
+            "an expired enrollment code must not enroll"
+        );
+        assert_ne!(
+            guard.enrollment_code(PairingCodePolicy::default()),
+            enrollment,
+            "an expired enrollment code is replaced, not handed out again"
+        );
+
+        // Lengthening the lifetime back is an edit like any other.
+        limits.lock().code_ttl = Duration::from_secs(600);
+        let guard = guard_with(&limits);
+        guard.age_pairing_code(Duration::from_secs(60));
+        assert!(guard.pairing_code().is_some());
+    }
+
+    /// Ten minutes is the most any code gets, whatever the limits say: a
+    /// stored 3600 is lowered on load, and the guard caps it again here.
+    #[test]
+    async fn no_code_outlives_ten_minutes() {
+        let limits = adjustable_limits(PairingLimits {
+            code_ttl: Duration::from_secs(3_600),
+            ..PairingLimits::default()
+        });
+        let guard = guard_with(&limits);
+        let code = guard.pairing_code().expect("startup code");
+        guard.age_pairing_code(PAIRING_CODE_TTL);
+        assert!(guard.pairing_code().is_none());
+        assert!(guard.try_pair(&code, "client").await.unwrap().is_none());
+        assert_eq!(
+            PairingLimits {
+                code_ttl: Duration::from_secs(3_600),
+                ..PairingLimits::default()
+            }
+            .within_bounds()
+            .code_ttl,
+            PAIRING_CODE_TTL
+        );
+    }
+
+    /// A configured lockout can outlast the 15-minute retention window. The
+    /// periodic sweep must not drop a client whose lockout is still running,
+    /// which would end the lockout early.
+    #[test]
+    async fn a_lockout_longer_than_the_retention_window_runs_its_course() {
+        let limits = adjustable_limits(PairingLimits {
+            lockout: Duration::from_secs(3_600),
+            ..PairingLimits::default()
+        });
+        let guard = guard_with(&limits);
+        fail(&guard, "client", 5).await;
+        assert!(guard.try_pair("wrong", "client").await.is_err());
+
+        // 16 minutes later: past the retention window and the sweep interval.
+        guard.age_failed_attempts(Duration::from_secs(960));
+        let remaining = guard
+            .try_pair("wrong", "client")
+            .await
+            .expect_err("the lockout still has 44 minutes to run");
+        assert!((2_639..=2_640).contains(&remaining), "got {remaining}");
+
+        // Once it has run out, the record goes like any other.
+        guard.age_failed_attempts(Duration::from_secs(3_600));
+        assert!(guard.try_pair("wrong", "other").await.is_ok());
+        assert!(
+            !guard.failed_attempts.lock().0.contains_key("client"),
+            "an ended lockout is swept"
+        );
+    }
+
+    /// A reservation dropped after its code expired does not put the code
+    /// back: expired codes are cleared on this path as on every other.
+    #[test]
+    async fn an_expired_reservation_is_not_restored() {
+        let limits = adjustable_limits(PairingLimits::default());
+        let guard = guard_with(&limits);
+        let code = guard.pairing_code().expect("startup code");
+        let reservation = guard
+            .reserve_pair(&code, "client")
+            .await
+            .unwrap()
+            .expect("a live code reserves");
+        limits.lock().code_ttl = Duration::ZERO;
+        drop(reservation);
+        assert!(
+            guard.pairing_code.lock().is_none(),
+            "the expired code must not return to the slot"
+        );
+    }
+
+    /// The gateway's resolver reads `[gateway.pairing_dashboard]` from the
+    /// published config each time, so publishing an edit changes the limits
+    /// the next attempt sees.
+    #[test]
+    async fn the_gateway_resolver_follows_published_config() {
+        let mut config = crate::schema::Config::default();
+        config.gateway.pairing_dashboard.max_failed_attempts = 2;
+        config.gateway.pairing_dashboard.lockout_secs = 1_000;
+        config.gateway.pairing_dashboard.code_ttl_secs = 60;
+        let live = crate::live::LiveConfig::new(config.clone());
+        let guard = new_guard(true, &[]).with_live_limits(PairingLimits::live(live.handle()));
+
+        fail(&guard, "first", 2).await;
+        assert!(guard.try_pair("wrong", "first").await.unwrap_err() >= 999);
+        guard.age_pairing_code(Duration::from_secs(60));
+        assert!(guard.pairing_code().is_none(), "a 60 s lifetime");
+
+        config.gateway.pairing_dashboard.max_failed_attempts = 4;
+        let revision = live.next_revision().unwrap();
+        live.publish(revision, config).unwrap();
+        fail(&guard, "second", 4).await;
+        assert!(guard.try_pair("wrong", "second").await.is_err());
+    }
+
+    /// A guard on the gateway's resolver over `[gateway.pairing_dashboard]`
+    /// as `edit` leaves it, out-of-range values included. Startup keeps a
+    /// config that fails validation (it warns, so `/config` stays reachable),
+    /// and `config set` does not run the range check, so the resolver can
+    /// hand the guard a value validation refuses.
+    fn guard_from_dashboard(
+        edit: impl FnOnce(&mut crate::schema::PairingDashboardConfig),
+    ) -> PairingGuard {
+        let mut config = crate::schema::Config::default();
+        edit(&mut config.gateway.pairing_dashboard);
+        let live = crate::live::LiveConfig::new(config);
+        new_guard(true, &[]).with_live_limits(PairingLimits::live(live.handle()))
+    }
+
+    /// A zero lockout must still lock a client out after the attempt limit,
+    /// on `/pair` and on direct enrollment alike, rather than end the moment
+    /// it starts and let the next guess through.
+    #[test]
+    async fn a_zero_lockout_still_locks_the_client_out() {
+        let guard = guard_from_dashboard(|dashboard| dashboard.lockout_secs = 0);
+
+        fail(&guard, "pair-client", 5).await;
+        assert_eq!(
+            guard.try_pair("wrong", "pair-client").await,
+            Err(1),
+            "the sixth wrong code meets the shortest lockout validation accepts"
+        );
+
+        for i in 0..5 {
+            assert!(
+                guard
+                    .reserve_enrollment("wrong", "enroll-client")
+                    .await
+                    .is_ok(),
+                "enrollment attempt {i} must not be locked out yet"
+            );
+        }
+        assert_eq!(
+            guard
+                .reserve_enrollment("wrong", "enroll-client")
+                .await
+                .err(),
+            Some(1),
+            "the sixth wrong enrollment code is locked out too"
+        );
+    }
+
+    /// A lockout longer than validation allows runs for one day: its deadline
+    /// is computed without overflowing, and the client stays locked out.
+    #[test]
+    async fn an_oversized_lockout_stops_at_one_day() {
+        let guard = guard_from_dashboard(|dashboard| dashboard.lockout_secs = u64::MAX);
+
+        fail(&guard, "client", 5).await;
+        let remaining = guard.try_pair("wrong", "client").await.unwrap_err();
+        assert!((86_399..=86_400).contains(&remaining), "got {remaining}");
+    }
+
+    /// The attempt limit stays within what validation accepts: a zero still
+    /// allows one attempt, and a huge value still locks out after a hundred.
+    #[test]
+    async fn the_attempt_limit_stays_between_one_and_one_hundred() {
+        let guard = guard_from_dashboard(|dashboard| dashboard.max_failed_attempts = 0);
+        fail(&guard, "client", 1).await;
+        let remaining = guard.try_pair("wrong", "client").await.unwrap_err();
+        assert!((299..=300).contains(&remaining), "got {remaining}");
+
+        let guard = guard_from_dashboard(|dashboard| dashboard.max_failed_attempts = u32::MAX);
+        fail(&guard, "client", 100).await;
+        let remaining = guard.try_pair("wrong", "client").await.unwrap_err();
+        assert!((299..=300).contains(&remaining), "got {remaining}");
     }
 }

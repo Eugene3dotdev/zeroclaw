@@ -46,11 +46,10 @@ pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
 /// Deserialize bytes to f32 vector (little-endian)
 pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-            f32::from_le_bytes(arr)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -319,6 +318,12 @@ mod tests {
         let a = vec![0.0, 0.0];
         let b = vec![0.0, 0.0];
         assert!(cosine_similarity(&a, &b).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cosine_mismatched_lengths_are_symmetric() {
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
     }
 
     // ── Edge cases: vec↔bytes serialization ──────────────────────

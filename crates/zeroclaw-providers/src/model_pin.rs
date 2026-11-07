@@ -1,5 +1,7 @@
 use super::ModelProvider;
-use super::dispatch::ProviderDispatch;
+use super::dispatch::{
+    ProviderDispatch, mark_current_dispatch_composite, stream_as_dispatch_composite,
+};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -75,8 +77,17 @@ impl ModelPinnedProvider {
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, _model: &str) -> bool {
+        self.inner
+            .supports_exact_request_replay(request, &self.pinned_model)
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
+    }
+
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.inner.supports_single_tool_rounds(&self.pinned_model)
     }
 
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
@@ -85,6 +96,10 @@ impl ModelProvider for ModelPinnedProvider {
 
     fn capabilities_for_model(&self, _model: &str) -> super::traits::ProviderCapabilities {
         self.inner.capabilities_for_model(&self.pinned_model)
+    }
+
+    fn vision_limited_by(&self, _model: &str) -> Option<String> {
+        self.inner.vision_limited_by(&self.pinned_model)
     }
 
     fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
@@ -147,6 +162,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_system(system_prompt, message, &self.pinned_model, temperature)
             .await
@@ -158,6 +174,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_history(messages, &self.pinned_model, temperature)
             .await
@@ -169,8 +186,25 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            _model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, &self.pinned_model, temperature)
+            .chat_with_tool_round_policy(request, &self.pinned_model, temperature, policy)
             .await
     }
 
@@ -181,6 +215,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_tools(messages, tools, &self.pinned_model, temperature)
             .await
@@ -194,14 +229,14 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        // stream_chat_with_system is not on ProviderDispatch's protected
-        // surface — the dispatcher only wraps stream_chat. Pass through.
-        self.inner.stream_chat_with_system(
-            system_prompt,
-            message,
-            &self.pinned_model,
-            temperature,
-            options,
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system(
+                system_prompt,
+                message,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
         )
     }
 
@@ -212,9 +247,14 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        // Same passthrough rationale as stream_chat_with_system.
-        self.inner
-            .stream_chat_with_history(messages, &self.pinned_model, temperature, options)
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history(
+                messages,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat(
@@ -224,11 +264,31 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        ProviderDispatch::from_ref(&*self.inner).stream_chat(
+        self.stream_chat_with_tool_round_policy(
             request,
-            &self.pinned_model,
+            _model,
             temperature,
             options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_tool_round_policy(
+                request,
+                &self.pinned_model,
+                temperature,
+                options,
+                policy,
+            ),
         )
     }
 }
@@ -265,11 +325,19 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityProvider {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            model == "pinned-model" && request.tools.is_none()
+        }
+
         fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: model == "pinned-model",
                 ..ProviderCapabilities::default()
             }
+        }
+
+        fn vision_limited_by(&self, model: &str) -> Option<String> {
+            (model == "pinned-model").then(|| "fallback.alias".to_string())
         }
 
         fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
@@ -303,6 +371,110 @@ mod tests {
         assert!(
             provider.has_mixed_native_tool_support_for_model("ignored-request-model"),
             "mixed-chain detection must be queried with the pinned model"
+        );
+        assert_eq!(
+            provider
+                .vision_limited_by("ignored-request-model")
+                .as_deref(),
+            Some("fallback.alias"),
+            "vision attribution must be queried with the pinned model"
+        );
+    }
+
+    struct AccountedLeaf;
+
+    #[test]
+    fn exact_replay_uses_pinned_model_and_preserves_request_restrictions() {
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        for (pin, expected) in [("pinned-model", true), ("other-model", false)] {
+            let provider = ModelPinnedProvider::builder("pinned")
+                .pinned_model(pin)
+                .inner(Box::new(ModelAwareCapabilityProvider))
+                .build();
+            assert_eq!(
+                provider.supports_exact_request_replay(request, "ignored-model"),
+                expected
+            );
+            assert!(!provider.supports_exact_request_replay(
+                ChatRequest {
+                    tools: Some(&[]),
+                    ..request
+                },
+                "pinned-model"
+            ));
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for AccountedLeaf {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "configured.inner"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AccountedLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accounting_through_model_pin_keeps_inner_identity_and_pinned_model() {
+        let pinned = ModelPinnedProvider::builder("pin-wrapper")
+            .pinned_model("served-model")
+            .inner(Box::new(AccountedLeaf))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&pinned)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-model",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.inner", "served-model")
         );
     }
 }

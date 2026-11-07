@@ -15,7 +15,22 @@ import type {
   TuiEntry,
 } from "../types/api";
 import type { components } from "./api-generated";
-import { clearToken, getToken, setToken } from "./auth";
+import {
+  AUTH_EVENTS,
+  authHeaders,
+  clearToken,
+  getAuthMode,
+  getOidcSession,
+  getToken,
+  setToken,
+  type AuthMode,
+} from "./auth";
+import {
+  failureReason,
+  fetchThroughRestart,
+  refreshOidcSession,
+  routeSessionRefusal,
+} from "./authSession";
 import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +41,28 @@ export class UnauthorizedError extends Error {
   constructor() {
     super("Unauthorized");
     this.name = "UnauthorizedError";
+  }
+}
+
+/**
+ * A 401 `session_expired` for a signed-in dashboard session. The page stays
+ * and the re-auth prompt opens; nothing is signed out.
+ */
+export class SessionExpiredError extends UnauthorizedError {
+  constructor() {
+    super();
+    this.name = "SessionExpiredError";
+  }
+}
+
+/**
+ * A 403 `operator_required`: the signed-in account can't use this endpoint.
+ * Pages show "Not available for your account".
+ */
+export class OperatorRequiredError extends Error {
+  constructor() {
+    super("Not available for your account");
+    this.name = "OperatorRequiredError";
   }
 }
 
@@ -52,12 +89,32 @@ export class ApiError extends Error {
 }
 
 /**
+ * A non-2xx response whose body is not a structured `ApiError` envelope, such
+ * as the session endpoints' `{"error": "..."}` bodies. Carries the HTTP status
+ * so a caller can branch on it (`404` = already gone) without regex-matching
+ * the message. The message keeps the historical `API <status>: <body>` text,
+ * so callers that only read `err.message` see no change.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    body: string,
+  ) {
+    super(`API ${status}: ${body}`);
+    this.name = "HttpError";
+  }
+}
+
+/**
  * Stable config-API error codes, sourced from the generated OpenAPI schema
  * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
  * a backend rename or a typo fails `tsc` here instead of silently regressing
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
+export type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {
   configChangedExternally: "config_changed_externally",
 } as const satisfies Record<string, ConfigApiCode>;
@@ -80,10 +137,67 @@ interface RawResult {
 // genuinely-overlapping requests, never caches stale data.
 const inFlightGets = new Map<string, Promise<RawResult>>();
 
+/**
+ * Drop any in-flight coalesced GET for `path` so the next caller performs a
+ * fresh request. Callers already awaiting the shared request still receive
+ * its payload; the point is that a read started after a mutation can never
+ * attach to a request that began before it and report pre-mutation state as
+ * the newest result. Mutating endpoints call this for the listings they
+ * affect.
+ */
+function invalidateInFlightGet(path: string): void {
+  const suffix = ` ${apiOrigin}${basePath}${path}`;
+  for (const key of [...inFlightGets.keys()]) {
+    if (key.endsWith(suffix)) inFlightGets.delete(key);
+  }
+}
+
+/**
+ * Route a 401. Pairing clears the token and signs out, as always. A signed-in
+ * session asks for re-authentication when it expired (keeping the page);
+ * otherwise the session is read again before anything signs out (see
+ * `routeSessionRefusal`). Returns only when this tab still holds a session of
+ * the same account, so the refusal was for one it has since replaced.
+ */
+async function routeUnauthorized(mode: AuthMode, body: string): Promise<void> {
+  if (mode === "oidc") {
+    const outcome = await routeSessionRefusal(body);
+    if (outcome === "resumed") return;
+    throw outcome === "reauth" ? new SessionExpiredError() : new UnauthorizedError();
+  }
+  clearToken();
+  window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+  throw new UnauthorizedError();
+}
+
+/**
+ * A CSRF refusal in OIDC mode means the session was replaced, e.g. by a
+ * sign-in in another tab. Re-read it; true when a retry may use the new one.
+ */
+async function recoverFromCsrfRefusal(): Promise<boolean> {
+  const outcome = await refreshOidcSession();
+  if (outcome === "expired") {
+    window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
+  } else if (outcome === "signed-out") {
+    window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+  }
+  return outcome === "resumed";
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
+  return apiFetchOnce<T>(path, options, false);
+}
+
+/** `retried`: this is the one retry a request gets, after a CSRF refusal or a stale 401. */
+async function apiFetchOnce<T>(
+  path: string,
+  options: RequestInit,
+  retried: boolean,
+): Promise<T> {
+  const mode = getAuthMode();
   const token = getToken();
   const url = `${apiOrigin}${basePath}${path}`;
   const method = (options.method ?? "GET").toUpperCase();
@@ -92,16 +206,16 @@ export async function apiFetch<T = unknown>(
   // AbortSignal — the cached entry closes over the FIRST caller's options, so a
   // later caller would silently get the wrong response and have its signal
   // ignored. Plain header-less, signal-less GETs still share one request.
+  // The key carries the credential: the pairing token, or the signed-in
+  // account (the page can't read its cookie), so one account never receives
+  // a response fetched for another.
   const coalesceKey =
     method === "GET" && !options.body && !options.headers && !options.signal
-      ? `${token ?? ""} ${url}`
+      ? `${mode === "oidc" ? `oidc:${getOidcSession()?.principal_id ?? ""}` : (token ?? "")} ${url}`
       : null;
 
   const doFetch = async (): Promise<RawResult> => {
-    const headers = new Headers(options.headers);
-    if (token) {
-      headers.set("Authorization", `Bearer ${token}`);
-    }
+    const headers = authHeaders(method, options.headers);
     if (
       options.body &&
       typeof options.body === "string" &&
@@ -109,7 +223,7 @@ export async function apiFetch<T = unknown>(
     ) {
       headers.set("Content-Type", "application/json");
     }
-    const response = await fetch(url, { ...options, headers });
+    const response = await fetchThroughRestart(url, { ...options, headers });
     const text =
       response.status === 204 ? "" : await response.text().catch(() => "");
     return {
@@ -126,7 +240,11 @@ export async function apiFetch<T = unknown>(
     if (existing) {
       result = await existing;
     } else {
-      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      // Remove only our own entry on settle: invalidateInFlightGet may have
+      // replaced it with a newer request that must keep coalescing.
+      const pending: Promise<RawResult> = doFetch().finally(() => {
+        if (inFlightGets.get(coalesceKey) === pending) inFlightGets.delete(coalesceKey);
+      });
       inFlightGets.set(coalesceKey, pending);
       result = await pending;
     }
@@ -135,14 +253,29 @@ export async function apiFetch<T = unknown>(
   }
 
   if (result.status === 401) {
-    clearToken();
-    window.dispatchEvent(new Event("zeroclaw-unauthorized"));
+    await routeUnauthorized(mode, result.text);
+    // Still signed in as the same account: the refusal was for a session this
+    // tab no longer holds. A read is sent once more on the current session;
+    // anything else fails as an action, without signing out.
+    if (method === "GET" && !retried) {
+      return apiFetchOnce<T>(path, options, true);
+    }
     throw new UnauthorizedError();
   }
 
+  if (result.status === 403 && mode === "oidc") {
+    const reason = failureReason(result.text);
+    if (reason === "operator_required") {
+      throw new OperatorRequiredError();
+    }
+    if (reason === "csrf" && !retried && (await recoverFromCsrfRefusal())) {
+      return apiFetchOnce<T>(path, options, true);
+    }
+  }
+
   if (!result.ok) {
-    // Try to parse a structured ConfigApiError envelope. Falls back to a
-    // plain Error when the body is non-JSON or doesn't match the shape.
+    // Try to parse a structured ConfigApiError envelope. Falls back to an
+    // HttpError (status only) when the body is non-JSON or doesn't match.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
@@ -162,7 +295,7 @@ export async function apiFetch<T = unknown>(
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
+    throw new HttpError(result.status, result.text || result.statusText);
   }
 
   // Only 204 No Content is a genuinely empty success. A non-204 success with
@@ -228,7 +361,7 @@ export async function pair(code: string): Promise<{ token: string }> {
   // device in the device_registry so it shows up in the paired-devices list and
   // can be revoked. /pair only persists the bearer token, leaving the device
   // invisible/unmanageable in the UI. Both are unauthenticated (code-gated).
-  const response = await fetch(`${basePath}/api/pair`, {
+  const response = await fetchThroughRestart(`${basePath}/api/pair`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -254,9 +387,11 @@ export async function getAdminPairCode(): Promise<{
   pairing_code: string | null;
   pairing_required: boolean;
 }> {
-  // Use the public /pair/code endpoint which works in Docker and remote environments
-  // (no localhost restriction). Falls back to the admin endpoint for backward compat.
-  const publicResp = await fetch(`${basePath}/pair/code`);
+  // /pair/code reports whether pairing is required but never returns the code:
+  // no HTTP caller can prove it is on the gateway host. The operator reads the
+  // code from the gateway log or `zeroclaw gateway get-paircode` and types it in.
+  // The admin fallback only answers callers holding the gateway admin token.
+  const publicResp = await fetchThroughRestart(`${basePath}/pair/code`);
   if (publicResp.ok) {
     return publicResp.json() as Promise<{
       pairing_code: string | null;
@@ -264,7 +399,7 @@ export async function getAdminPairCode(): Promise<{
     }>;
   }
 
-  const response = await fetch("/admin/paircode");
+  const response = await fetchThroughRestart("/admin/paircode");
   if (!response.ok) {
     throw new Error(`Failed to fetch pairing code (${response.status})`);
   }
@@ -299,7 +434,7 @@ export async function generatePairCode(): Promise<{
   pairing_required: boolean;
   message?: string;
 }> {
-  const response = await fetch(`${basePath}/admin/paircode/new`, { method: 'POST' });
+  const response = await fetchThroughRestart(`${basePath}/admin/paircode/new`, { method: 'POST' });
   if (response.status === 403) {
     throw new PairCodeForbiddenError();
   }
@@ -322,7 +457,7 @@ export async function getPublicHealth(): Promise<{
   require_pairing: boolean;
   paired: boolean;
 }> {
-  const response = await fetch(`${basePath}/health`);
+  const response = await fetchThroughRestart(`${basePath}/health`);
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
@@ -718,10 +853,9 @@ export async function putPersonalityFile(
   agent?: string,
 ): Promise<PersonalityPutResult> {
   const url = `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`;
-  const token = getToken();
-  const headers = new Headers({ "Content-Type": "application/json" });
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(`${apiOrigin}${basePath}${url}`, {
+  const mode = getAuthMode();
+  const headers = authHeaders("PUT", { "Content-Type": "application/json" });
+  const response = await fetchThroughRestart(`${apiOrigin}${basePath}${url}`, {
     method: "PUT",
     headers,
     body: JSON.stringify({
@@ -730,8 +864,7 @@ export async function putPersonalityFile(
     }),
   });
   if (response.status === 401) {
-    clearToken();
-    window.dispatchEvent(new Event("zeroclaw-unauthorized"));
+    await routeUnauthorized(mode, await response.text().catch(() => ""));
     throw new UnauthorizedError();
   }
   if (response.status === 409) {
@@ -817,7 +950,12 @@ export interface SkillDocument {
 }
 
 /** Where a skill in an agent's effective set was loaded from. */
-export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
+export type AgentSkillOrigin =
+  | "built-in"
+  | "workspace"
+  | "open-skills"
+  | "plugin"
+  | "bundle";
 
 /**
  * A lower-precedence same-name skill that a winning skill shadowed (it did
@@ -903,7 +1041,8 @@ export function listSkillsInBundle(
 
 /**
  * The agent's EFFECTIVE skill set — every skill the runtime actually loads
- * for `alias`, across workspace / open-skills / plugin / bundle origins.
+ * for `alias`, across built-in / workspace / open-skills / plugin / bundle
+ * origins.
  * Unlike {@link listSkillsInBundle} (which only sees configured bundles),
  * this reflects what the agent can really use.
  */
@@ -2001,6 +2140,11 @@ export function getIntegrations(): Promise<Integration[]> {
   });
 }
 
+/** Read-only plugin packages from installed and cached-registry sources. */
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>("/api/plugins");
+}
+
 // ---------------------------------------------------------------------------
 // Doctor / Diagnostics
 // ---------------------------------------------------------------------------
@@ -2106,14 +2250,40 @@ export function getSessionMessages(
   );
 }
 
-/** Delete a persisted session by its full DB key. */
+/**
+ * Give a persisted session a display name.
+ *
+ * Takes the bare session id (the `gw_`-stripped `session_id`, not
+ * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
+ * the gateway has no metadata row for the session — notably when session
+ * persistence is disabled.
+ */
+export function renameSession(
+  id: string,
+  name: string,
+): Promise<{ session_id: string; name: string }> {
+  return apiFetch<{ session_id: string; name: string }>(
+    `/api/sessions/${encodeURIComponent(id)}`,
+    { method: "PUT", body: JSON.stringify({ name }) },
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
+}
+
+/**
+ * Delete a persisted session. Accepts either the full DB key or a bare gateway
+ * session id — the handler prefixes `gw_` only when the id carries no
+ * underscore. Unlike {@link renameSession}, which needs the bare id.
+ */
 export function deleteSession(
   sessionKey: string,
 ): Promise<{ deleted: boolean }> {
+  // A listing fetched before this delete settled must not be what a
+  // post-delete refresh reports: it would list the row just removed. Also on
+  // failure — a 404 means another client already deleted it, so an in-flight
+  // listing may be stale in exactly the same way.
   return apiFetch<{ deleted: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionKey)}`,
     { method: "DELETE" },
-  );
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
 /**
@@ -2181,7 +2351,7 @@ export interface LogEvent {
   service?: { name: string; version: string };
   trace_id?: string | null;
   span_id?: string | null;
-  zeroclaw: Record<string, string> & { duration_ms?: number };
+  zeroclaw: Record<string, string | number | undefined> & { duration_ms?: number };
   message?: string;
   attributes?: Record<string, unknown>;
   schema_version?: number;
@@ -2201,7 +2371,26 @@ export interface LogsResponse {
    *  walk older pages deterministically regardless of id ordering.
    *  `null` when the page is empty. */
   next_cursor_line_offset: number | null;
+  /** Segment-aware cursor for the oldest event on the current page. Treat
+   *  it as an OPAQUE token: it identifies a segment and a byte offset within
+   *  it, and for the active file also carries an anchor event id so the
+   *  cursor survives a rotation. Its shape may change. Pass the returned
+   *  string back verbatim as [`LogsQueryParams::until_segment_cursor`] —
+   *  never construct or parse one, since a hand-built cursor loses whatever
+   *  the daemon encoded to keep it stable.
+   *  Supersedes `next_cursor_line_offset` for `rotating`-mode deployments:
+   *  when the oldest event on a page lives in an archive rather than the
+   *  active file, `next_cursor_line_offset` is `null` and only this cursor
+   *  can advance. `null` when the page is empty, or omitted entirely by
+   *  daemons predating multi-segment reads. */
+  next_segment_cursor?: string | null;
   at_end: boolean;
+  persistence_enabled: boolean;
+  /** True when a retained segment could not be read and was left out of this
+   *  page. `at_end` then only means "no older events among the segments that
+   *  could be read", so the UI must not present the buffer as the complete
+   *  history. Omitted (treat as `false`) by daemons predating the field. */
+  incomplete?: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
    *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so
@@ -2220,6 +2409,11 @@ export interface LogsQueryParams {
    *  this offset so the follow-up page only sees lines strictly older
    *  than the previous one. Independent of id ordering. */
   until_line_offset?: number;
+  /** Segment-aware cursor passed back from the previous page's
+   *  `next_segment_cursor`. Identifies both the segment file and the byte
+   *  offset within it, so pagination continues across rotated archives.
+   *  Takes precedence over `until_line_offset` when both are set. */
+  until_segment_cursor?: string;
   action?: string;
   category?: string;
   outcome?: string;
@@ -2258,5 +2452,32 @@ export function getCliTools(): Promise<CliTool[]> {
       const result = unwrapField(data, "cli_tools");
       return Array.isArray(result) ? result : [];
     },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Chat image upload
+// ---------------------------------------------------------------------------
+
+export interface UploadImageResult {
+  /** Absolute path of the saved file inside the agent workspace. */
+  path: string;
+  /** `[IMAGE:<path>]` marker ready to embed in a chat message. */
+  marker: string;
+}
+
+/**
+ * Upload an image for the given agent's chat. The body is the raw file — the
+ * gateway types it by magic bytes (client MIME and filename are never
+ * trusted), saves it under the agent workspace, and returns the
+ * `[IMAGE:<path>]` marker to embed in the next message.
+ */
+export function uploadChatImage(
+  agent: string,
+  file: Blob,
+): Promise<UploadImageResult> {
+  return apiFetch<UploadImageResult>(
+    `/api/upload?agent=${encodeURIComponent(agent)}`,
+    { method: "POST", body: file },
   );
 }

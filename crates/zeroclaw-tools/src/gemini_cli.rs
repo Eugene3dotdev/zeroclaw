@@ -8,13 +8,8 @@ use zeroclaw_config::schema::GeminiCliConfig;
 
 use crate::coding_cli::{
     CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
-    add_safe_env,
+    add_coding_cli_env,
 };
-
-/// Environment variables safe to pass through to the Antigravity subprocess.
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
 
 fn is_forbidden_provider_env(name: &str) -> bool {
     let upper = name.trim().to_ascii_uppercase();
@@ -210,7 +205,7 @@ impl Tool for GeminiCliTool {
             CodingCliCommand::new(antigravity_bin, work_dir.clone(), self.config.timeout_secs);
         cmd.arg("-p").arg(prompt);
 
-        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
+        add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
 
         match self.executor.output(cmd).await {
             Ok(output) => {

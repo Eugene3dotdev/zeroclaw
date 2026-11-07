@@ -193,12 +193,28 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         type_keys: &["webhook"],
         compiled: cfg!(feature = "channel-webhook"),
     },
+    // Plugin channels have no `channel-*` feature of their own: whether they
+    // can run is decided by the runtime crate's WASM plugin support, so this
+    // row defers to that single source rather than restating the condition.
+    ChannelCompileSpec {
+        schema_name: Some("Plugin"),
+        type_keys: &["plugin"],
+        compiled: zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED,
+    },
     ChannelCompileSpec {
         schema_name: None,
         type_keys: &["acp-server", "acp_server"],
         compiled: cfg!(feature = "channel-acp-server"),
     },
 ];
+
+#[cfg(test)]
+pub(crate) fn channel_compile_specs_for_tests()
+-> impl Iterator<Item = (Option<&'static str>, &'static [&'static str], bool)> {
+    CHANNEL_COMPILE_SPECS
+        .iter()
+        .map(|spec| (spec.schema_name, spec.type_keys, spec.compiled))
+}
 
 fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
     CHANNEL_COMPILE_SPECS
@@ -279,6 +295,11 @@ mod tests {
     use super::{compiled_channels, configured_uncompiled_channels, is_channel_type_compiled};
     use std::collections::BTreeSet;
 
+    #[test]
+    fn empty_qr_pairing_channel_is_not_supported() {
+        assert!(super::qr_pairing_channel("").is_none());
+    }
+
     #[cfg(feature = "default-channels")]
     #[test]
     fn channel_type_compilation_tracks_enabled_features() {
@@ -294,6 +315,10 @@ mod tests {
         assert_eq!(
             is_channel_type_compiled("linq"),
             cfg!(feature = "channel-linq")
+        );
+        assert_eq!(
+            is_channel_type_compiled("plugin"),
+            zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED
         );
     }
 
@@ -336,6 +361,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::SlackConfig::default(),
         );
+        cfg.plugin.insert(
+            "mail".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "email-plugin".to_string(),
+                enabled: true,
+            },
+        );
 
         let names: BTreeSet<_> = configured_uncompiled_channels(&cfg)
             .into_iter()
@@ -343,6 +375,12 @@ mod tests {
             .collect();
 
         assert_eq!(names.contains("Slack"), !cfg!(feature = "channel-slack"));
+        assert_eq!(
+            names.contains("Plugin"),
+            !zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED,
+            "a configured plugin channel must be reported when this build \
+             cannot execute WASM plugins"
+        );
     }
 
     #[test]

@@ -8,13 +8,8 @@ use zeroclaw_config::schema::CodexCliConfig;
 
 use crate::coding_cli::{
     CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
-    add_safe_env,
+    add_coding_cli_env,
 };
-
-/// Environment variables safe to pass through to the `codex` subprocess.
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
 
 fn is_forbidden_provider_env(name: &str) -> bool {
     let upper = name.trim().to_ascii_uppercase();
@@ -231,7 +226,7 @@ impl Tool for CodexCliTool {
             });
         }
 
-        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
+        add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
 
         match self.executor.output(cmd).await {
             Ok(output) => {
@@ -452,9 +447,13 @@ mod tests {
             !error.contains("outside the workspace"),
             "relative working_directory should resolve inside workspace; got {error:?}"
         );
+        #[cfg(target_os = "windows")]
+        let expected_error = "Codex CLI ('codex') not found in PATH";
+        #[cfg(not(target_os = "windows"))]
+        let expected_error = "Unix coding CLI executable \"codex\" could not be resolved";
         assert!(
-            error.contains("Codex CLI ('codex') not found in PATH"),
-            "expected missing Codex CLI after path validation; got {error:?}"
+            error.contains(expected_error),
+            "unexpected error: {error:?}"
         );
     }
 
@@ -575,6 +574,12 @@ mod tests {
                 "--prompt-starting-with-a-dash"
             ]
         );
+    }
+
+    #[test]
+    fn codex_cli_command_args_keep_empty_prompt_after_terminator() {
+        let config = test_config();
+        assert_eq!(codex_exec_args(&config, ""), vec!["exec", "--", ""]);
     }
 
     #[test]

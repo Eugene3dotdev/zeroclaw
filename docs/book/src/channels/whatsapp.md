@@ -35,27 +35,77 @@ WhatsApp Web mode links a regular WhatsApp account through the optional Web back
 
 On first start, the Web backend pairs the account using QR or pair-code linking (`pair_phone` seeds pair-code linking; leave it unset for QR). Keep `session_path` on persistent storage; removing it forces a fresh device link. Bind the channel to an agent via that agent's `channels` list.
 
+`push_name` sets the display name recipients see; leave it unset and the account keeps the name the phone was registered with. It is applied on connect, only when it differs from the name the linked device already carries, and a failure to apply it is logged without stopping the channel. Cloud API mode ignores it; there the display name comes from the Meta Business profile.
+
 The shared `interrupt_on_new_message` option applies to both Cloud API mode and Web mode. When enabled, a newer WhatsApp message from the same sender/chat cancels the in-flight response.
 
 ## Personal and business behavior
 
-For Web mode, `mode = "personal"` applies separate DM, group, and self-chat policies:
+For Web mode, `dm_policy` and `group_policy` apply under **both** modes. `self_chat_mode` is personal-only:
 
-| Field | Values | Effect |
-|---|---|---|
-| `dm_policy` | `allowlist`, `ignore`, `all` | Controls direct messages |
-| `group_policy` | `allowlist`, `ignore`, `all` | Controls group chats |
-| `self_chat_mode` | `true`, `false` | Controls the user's self-chat |
-| `mention_only` | `true`, `false` | Requires group messages to mention the bot |
-| `passive_group_context` | `true`, `false` | Records allowed unaddressed group messages as context only |
+| Field | Values | Applies under | Effect |
+|---|---|---|---|
+| `dm_policy` | `allowlist`, `ignore`, `all` | both modes | Controls direct messages |
+| `group_policy` | `allowlist`, `ignore`, `all` | both modes | Controls group chats |
+| `self_chat_mode` | `true`, `false` | personal only | Controls the user's self-chat |
+| `mention_only` | `true`, `false` | both modes | Requires group messages to mention the bot |
+| `passive_group_context` | `true`, `false` | both modes | Records allowed unaddressed group messages as context only |
 
-The default `mode = "business"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = "personal"` with `dm_policy = "allowlist"` and `group_policy = "allowlist"`.
+`self_chat_mode` stays personal-only because the self-chat affordance is scoped to the personal branch by design. `mode` selects ZeroClaw's policy posture, not a WhatsApp account type: both modes drive the same linked-device session.
+
+WhatsApp mirrors the linked account's outbound messages as `fromMe` events in either mode. Business mode drops these echoes before approval-reply handling or user-message dispatch, so they cannot start another agent turn. Personal mode retains its intentional self-chat and explicit operator-trigger handling; this business-mode rule does not remove those exceptions.
+
+Admitted WhatsApp Web one-to-one messages, identified by the `@s.whatsapp.net` or `@lid` chat domain, bypass the reply-intent classifier even when precheck is enabled. Channel access policies still apply before dispatch, and bypassing this classifier does not guarantee a reply. Group and other chat domains do not receive this direct-message exemption; other existing bypass conditions, such as an explicit mention, remain unchanged. Business-mode `fromMe` echoes are dropped before they can receive the exemption.
+
+### Compatibility note for `mode = "business"`
+
+Business mode previously accepted `dm_policy` and `group_policy` and then never consulted either one, so a channel that read as restrictive answered every message it received. Both keys are now enforced under business mode.
+
+`dm_policy` defaults to `allowlist`, so a business-mode deployment that relied on the previous permissive behavior must choose one of:
+
+- **Keep answering everyone** - set `dm_policy = "all"` and `group_policy = "all"` explicitly.
+- **Keep the restriction** - leave the defaults and make sure the senders you intend to serve are reachable through the channel's peer group, via `[peer_groups.<name>].external_peers`.
+
+Do not wait for `config validate` to tell you this. Under `mode = "business"` it reports
+`self_chat_mode` as inert and says nothing about `dm_policy` or `group_policy`, precisely because
+those two are now live rather than inert. So the keys whose behaviour actually changed for you are
+the ones the validator will not mention. Read this section before upgrading; that is the only
+notice a business-mode deployment gets.
 
 `passive_group_context = true` is opt-in and applies only to WhatsApp Web group chats. Allowed unaddressed group messages are stored in the room-scoped conversation history without starting an agent turn, sending reactions, downloading media, or calling the model. Later addressed messages in the same group can use that passive context.
 
+## PDF previews (`document_thumbnails`)
+
+When the agent sends a PDF through a `[DOCUMENT:...]` marker, WhatsApp phones
+show a generic file card unless the message itself carries a preview. With
+`document_thumbnails = true` (Web mode, default `false`), the channel renders
+the first page and reads the page count, and both go on the same document
+card. No separate image message is sent.
+
+```toml
+[channels.whatsapp.myaccount]
+document_thumbnails = true   # default: false
+```
+
+The preview is attached the way the official apps attach it: a small JPEG
+(96 px on the longest side) inside the message, and a larger one (480 px)
+uploaded next to the document and encrypted with the document's key. Phones
+draw the card from the uploaded one; the inline one is what they fall back to.
+If that upload fails, the card keeps the small inline preview.
+
+Rendering uses `pdftoppm` and `pdfinfo` from poppler-utils, found on the
+daemon's `PATH` (for example `sudo apt install poppler-utils`). It runs while
+the file uploads, and each step (a tool run, or the preview upload) is capped
+at 5 seconds. If the tools are missing or fail, or a rendered preview is too
+large, the document goes out without that part of the preview, exactly as it
+does with the key off, and a warning is logged. Only PDFs are previewed.
+
+The rasteriser parses whatever PDF the agent sends, including files it
+downloaded, so keep poppler-utils up to date on hosts where this is on.
+
 ## Restricting which groups (`allowed_groups`)
 
-`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list is **not** permission: what it means is decided by `group_policy`. Under `allowlist` (the default) or `ignore` an empty list admits no group, and under `all` it admits every group. A list that admits everything cannot be told apart from a list nobody configured, so open group access has to be asked for by name. A non-empty list drops every group message whose chat JID matches no entry, and keeps doing so under every policy including `all`, so `all` widens the empty-list default rather than overriding an explicit list. **Direct messages always bypass this filter.**
 
 Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part - the segment before `@` (`123456789012345`) - compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
 
@@ -66,6 +116,14 @@ session_path = "/var/lib/zeroclaw/wa.db"
 # Only operate in these two groups; all other groups are dropped.
 allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 ```
+
+## Polls
+
+The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered text fallback used on channels without native polls. The tool accepts 2–10 options; the WhatsApp library accepts up to 12, but the tool schema does not expose 11–12. `multi_select` lets a voter select multiple options.
+
+Raw phone-number recipients are checked against the channel's number allowlist, and a disallowed number returns an error instead of silently doing nothing. As with ordinary sends, JID recipients bypass that number check. `duration_minutes` does not expire a native poll.
+
+Votes are not read back yet: the poll card shows the result to people in the chat, and the agent only learns that the poll was posted.
 
 ## Tool approval over chat (`approval_timeout_secs`)
 
