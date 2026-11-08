@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["POLICY_GATE_TIMEOUT"],"fn":["wrap_runtime"],"struct":["PolicyGate","PolicyGateRefusal","PolicyGatedRuntime"]};
