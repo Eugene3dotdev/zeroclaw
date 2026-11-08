@@ -212,6 +212,24 @@ version_gte() {
   return 0
 }
 
+# Extract the package version from `zeroclaw --version` output.
+# The line may end with a parenthesized build id, so the last field
+# is not always the version. Field 2 is the package version
+# for both the old and new formats.
+cli_package_version() {
+  local line="$1"
+  local ver
+  ver=$(printf '%s
+' "$line" | awk '{print $2}')
+  if [ -n "$ver" ]; then
+    printf '%s
+' "$ver"
+  else
+    return 1
+  fi
+}
+
+
 # ── Detect user's shell ──────────────────────────────────────────
 
 detect_shell_profile() {
@@ -264,17 +282,51 @@ detect_target_triple() {
     fi
     ;;
   Linux)
-    libc=$(detect_libc)
-    case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
-    armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
-    armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
-    *) echo "" ;;
-    esac
+    if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
+      case "$arch" in
+      aarch64 | arm64) echo "aarch64-linux-android" ;;
+      *)
+        printf "Unsupported Android architecture: %s (only aarch64/arm64 is supported)\n" "$arch" >&2
+        echo ""
+        ;;
+      esac
+    else
+      libc=$(detect_libc)
+      case "$arch" in
+      x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+      aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
+      armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
+      armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
+      *) echo "" ;;
+      esac
+    fi
     ;;
   *) echo "" ;;
   esac
+}
+
+# ── Fork: the zrc alias ───────────────────────────────────────────
+#
+# `zrc` is the EugOT fork's short name for the same CLI. It is a symlink to
+# `zeroclaw` in the same directory, not a second binary. Replaces an older
+# install's regular `zrc` copy or a stale link; refuses to touch a directory.
+link_zrc_alias() {
+  zrc_dir="$1"
+  if [ ! -f "$zrc_dir/zeroclaw" ]; then
+    return 0
+  fi
+  # Checked here, where it is used, like the installer's other tools: a
+  # missing `ln` names itself and leaves the zeroclaw install intact.
+  if ! command -v ln >/dev/null 2>&1; then
+    warn "ln not found: zrc alias not created. Create it with: ln -s zeroclaw $zrc_dir/zrc"
+    return 0
+  fi
+  if [ -d "$zrc_dir/zrc" ] && [ ! -L "$zrc_dir/zrc" ]; then
+    warn "Not linking $zrc_dir/zrc: a directory is in the way"
+    return 0
+  fi
+  rm -f "$zrc_dir/zrc"
+  ln -s zeroclaw "$zrc_dir/zrc"
 }
 
 # ── Pre-built binary install ──────────────────────────────────────
@@ -305,7 +357,7 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Channels: pre-built binaries ship the standard distribution channel set; availability is target-specific."
   info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 
@@ -315,7 +367,7 @@ install_prebuilt() {
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
-    info "[dry-run] Would install zrc to $CARGO_HOME/bin/zrc (if in tarball)"
+    info "[dry-run] Would link $CARGO_HOME/bin/zrc -> zeroclaw"
     info "[dry-run] Would install $TUI_BIN_NAME to $CARGO_HOME/bin/$TUI_BIN_NAME (if in tarball)"
     info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
@@ -367,11 +419,7 @@ install_prebuilt() {
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
-  if [ -f "$tmp_dir/zrc" ]; then
-    install -m 755 "$tmp_dir/zrc" "$CARGO_HOME/bin/zrc"
-  elif [ -f "$tmp_dir/zrc.exe" ]; then
-    install -m 755 "$tmp_dir/zrc.exe" "$CARGO_HOME/bin/zrc.exe"
-  fi
+  link_zrc_alias "$CARGO_HOME/bin"
   if [ -f "$tmp_dir/$TUI_BIN_NAME" ]; then
     install -m 755 "$tmp_dir/$TUI_BIN_NAME" "$CARGO_HOME/bin/$TUI_BIN_NAME"
   fi
@@ -405,6 +453,9 @@ Options:
   --full               Install everything: the 'full' feature preset plus every
                        installable app (implies --source)
   --minimal            Alias for --preset minimal
+  --cli-only           CLI-only build for servers: the standard features without
+                       the dashboard and web gateway (alias for --preset cli-only;
+                       builds from source)
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
   --with-gateway       Force the gateway feature on (overrides preset/feature default)
@@ -429,6 +480,7 @@ Examples:
   $0 --source --features agent-runtime,channel-discord  # custom feature set
   $0 --source --preset full                   # every channel plus heavyweight extras
   $0 --full                                    # everything: full preset + every app
+  $0 --cli-only                                # CLI-only server build (no dashboard)
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -456,6 +508,15 @@ do_uninstall() {
     info "Removed $bin"
   else
     warn "Binary not found at $bin"
+  fi
+
+  # Fork: remove the zrc alias only when it is this installer's link; a
+  # regular `zrc` may belong to another package.
+  local zrc_link="$CARGO_HOME/bin/zrc"
+  if [ -L "$zrc_link" ] && command -v readlink >/dev/null 2>&1 &&
+    [ "$(readlink "$zrc_link")" = zeroclaw ]; then
+    rm -f "$zrc_link"
+    info "Removed $zrc_link"
   fi
 
   local tui_bin="$CARGO_HOME/bin/$TUI_BIN_NAME"
@@ -501,7 +562,7 @@ do_uninstall() {
   other_bin=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
   if [ -n "$other_bin" ]; then
     local other_version
-    other_version=$("$other_bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    other_version=$(cli_package_version "$("$other_bin" --version 2>/dev/null)" 2>/dev/null || echo "unknown")
     echo
     warn "Another zeroclaw found at $other_bin (v$other_version)"
     warn "Remove it manually if you want a full uninstall"
@@ -764,7 +825,8 @@ DRY_RUN=false
 MODIFY_PATH=true # append PATH export to the shell profile; --no-modify-path opts out
 PREFIX="$HOME"
 INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
-PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features
+PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features, "cli-only"=--cli-only
+CLI_ONLY=false  # true once --cli-only or --preset cli-only is given, even if a later preset replaces it
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
@@ -780,7 +842,7 @@ while [ $# -gt 0 ]; do
   --minimal) MINIMAL=true ;;
   --preset)
     if [ $# -lt 2 ]; then
-      die "Missing value for --preset. Expected: --preset minimal|full"
+      die "Missing value for --preset. Expected: --preset minimal|full|cli-only"
     fi
     shift
     case "$1" in
@@ -789,13 +851,21 @@ while [ $# -gt 0 ]; do
       MINIMAL=true
       ;;
     full) PRESET="full" ;;
-    *) die "Unknown preset '$1'. Expected: minimal or full" ;;
+    cli-only)
+      PRESET="cli-only"
+      CLI_ONLY=true
+      ;;
+    *) die "Unknown preset '$1'. Expected: minimal, full or cli-only" ;;
     esac
     ;;
   --full)
     # Everything: the 'full' feature preset plus every installable app.
     PRESET="full"
     FULL_APPS=true
+    ;;
+  --cli-only)
+    PRESET="cli-only"
+    CLI_ONLY=true
     ;;
   --features)
     if [ $# -lt 2 ]; then
@@ -848,6 +918,18 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# `--cli-only` is one complete feature set, resolved from the registry when it
+# builds, so refuse every option that would change it before installing
+# anything. Extra features could turn the gateway back on, directly or through
+# `default`, and another preset would replace the set.
+if [ "$CLI_ONLY" = true ]; then
+  [ "$PRESET" = "cli-only" ] || die "--cli-only and the $PRESET preset are different feature sets; pick one"
+  [ "$FULL_APPS" = true ] && die "--cli-only and --full are different feature sets; pick one"
+  [ "$WITH_GATEWAY" = "true" ] && die "--cli-only builds have no gateway; drop --with-gateway"
+  [ "$MINIMAL" = true ] && die "--cli-only and --minimal are different feature sets; pick one"
+  [ -z "$USER_FEATURES" ] || die "--cli-only is a complete feature set and takes no --features (or ZEROCLAW_CARGO_FEATURES); drop them, or leave out --cli-only to choose the features yourself"
+fi
+
 # ── Derive paths from prefix ─────────────────────────────────────
 
 CARGO_HOME="${CARGO_HOME:-$PREFIX/.cargo}"
@@ -875,11 +957,12 @@ fi
 # ── Decide: pre-built or source ───────────────────────────────────
 
   # >>> generated:route-decision by `cargo generate installers` - do not edit <<<
-# --minimal, --features, --apps, --without-gateway, or --preset full imply
-# source. Prebuilt archives have fixed feature and app contents, so any flag
-# that changes the feature set or selects apps must force a source build.
+# --minimal, --features, --apps, --without-gateway, --cli-only, or --preset
+# full imply source. Prebuilt archives have fixed feature and app contents, so
+# any flag that changes the feature set or selects apps must force a source
+# build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] || [ -n "$USER_APPS" ] ||
-  [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
+  [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ] || [ "$PRESET" = "cli-only" ]; then
   INSTALL_MODE="source"
 fi
 
@@ -920,7 +1003,7 @@ fi
 [ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
   BIN="$CARGO_HOME/bin/zeroclaw"
   if [ -f "$BIN" ]; then
-    NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+    NEW_VERSION=$(cli_package_version "$("$BIN" --version 2>/dev/null)" 2>/dev/null || echo "?")
     SIZE=$(du -h "$BIN" | awk '{print $1}')
     echo
     info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
@@ -1027,6 +1110,13 @@ See all available features:
     CARGO_FLAGS="--no-default-features"
   fi
 
+  # `--cli-only` is its own complete feature set (resolved below); options
+  # that would change it were refused after parsing, and `--without-gateway`
+  # adds nothing to a set without the gateway.
+  if [ "$PRESET" = "cli-only" ]; then
+    WITH_GATEWAY=""
+  fi
+
   # `--without-gateway` overrides the default-features set: switch to
   # --no-default-features and re-add everything in `default` except gateway.
   if [ "$WITH_GATEWAY" = "false" ] && [ "$MINIMAL" != true ]; then
@@ -1057,6 +1147,21 @@ See all available features:
     else
       warn "Could not resolve --preset full from the feature registry; falling back to default features."
     fi
+  fi
+
+  # `--cli-only` builds the standard distribution without the dashboard, the
+  # web gateway and the ACP bridge that dials it. Resolve it from the canonical
+  # registry (`cargo generate features --selection cli-only`) for this host's
+  # target, as the release workflow resolves `dist`. Fail instead of falling
+  # back: Cargo's defaults would install the dashboard build.
+  if [ "$PRESET" = "cli-only" ]; then
+    cli_only_target=$(detect_target_triple)
+    cli_only_features=$(cargo run --quiet -p xtask --bin generate -- features --selection cli-only ${cli_only_target:+--target "$cli_only_target"} 2>/dev/null || true)
+    if [ -z "$cli_only_features" ]; then
+      die "Could not resolve the CLI-only feature set from the feature registry (cargo generate features --selection cli-only)."
+    fi
+    CARGO_FLAGS="--no-default-features"
+    USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$cli_only_features"
   fi
 
   # Interactive picker — only when the operator did not pin features or
@@ -1106,7 +1211,7 @@ See all available features:
 
   PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
   if [ -n "$PATH_BIN" ]; then
-    PATH_VERSION=$("$PATH_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    PATH_VERSION=$(cli_package_version "$("$PATH_BIN" --version 2>/dev/null)" 2>/dev/null || echo "unknown")
     TARGET_BIN="$CARGO_HOME/bin/zeroclaw"
     if [ "$PATH_BIN" != "$TARGET_BIN" ]; then
       warn "zeroclaw found at $PATH_BIN (v$PATH_VERSION)"
@@ -1268,13 +1373,13 @@ See all available features:
     BIN="$CARGO_HOME/bin/zeroclaw"
     if [ -f "$BIN" ]; then
       SIZE=$(du -h "$BIN" | awk '{print $1}')
-      NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
+      NEW_VERSION=$(cli_package_version "$("$BIN" --version 2>/dev/null)" 2>/dev/null || echo "$VERSION")
       echo
       info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
 
       ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
       if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
-        ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+        ACTIVE_VERSION=$(cli_package_version "$("$ACTIVE_BIN" --version 2>/dev/null)" 2>/dev/null || echo "unknown")
         echo
         warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
         warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
@@ -1283,10 +1388,11 @@ See all available features:
     else
       warn "Binary not found at expected path: $BIN"
     fi
+    # Fork: `cargo install` builds only `zeroclaw`; `zrc` is its link.
+    link_zrc_alias "$CARGO_HOME/bin"
     ZRC_BIN="$CARGO_HOME/bin/zrc"
-    if [ -f "$ZRC_BIN" ]; then
-      ZRC_SIZE=$(du -h "$ZRC_BIN" | awk '{print $1}')
-      info "Installed: $ZRC_BIN ($ZRC_SIZE)"
+    if [ -L "$ZRC_BIN" ]; then
+      info "Installed: $ZRC_BIN -> zeroclaw"
     fi
     TUI_BIN="$CARGO_HOME/bin/$TUI_BIN_NAME"
     if [ -f "$TUI_BIN" ]; then
@@ -1361,6 +1467,21 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
   if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
     info "Run '$QUICKSTART_COMMAND' to reconfigure."
+  elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ] && [ "$PRESET" = "cli-only" ]; then
+    # A CLI-only build has no dashboard to finish setup in, so it offers the
+    # CLI quickstart alone. Bare Enter accepts it.
+    echo
+    printf "%s" "$(bold "ZeroClaw installed. Run the CLI quickstart ($QUICKSTART_COMMAND) now? [Y/n] ")"
+    read -r quickstart_choice
+    case "${quickstart_choice:-y}" in
+    [Nn]*)
+      info "Skipped setup. Run '$QUICKSTART_COMMAND' when ready."
+      ;;
+    *)
+      echo
+      "$BIN" "$QUICKSTART_SUBCOMMAND" || warn "Quickstart exited with an error — run '$QUICKSTART_COMMAND' manually"
+      ;;
+    esac
   elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ]; then
     # 3-way setup choice. Bare Enter accepts the [1] CLI quickstart default;
     # option [2] foregrounds the daemon so the operator can finish in the
@@ -1404,6 +1525,9 @@ echo
 # fall back to a one-off CLI agent run.
 if [ -f "$CARGO_HOME/bin/$TUI_BIN_NAME" ]; then
   info "Done. Run $(bold "$TUI_BIN_NAME") to launch the terminal UI and start working."
+elif [ "$PRESET" = "cli-only" ] && [ -f "$CARGO_HOME/bin/zeroclaw" ]; then
+  info "Done. Run $(bold "zeroclaw daemon") for the always-on daemon (this build has no dashboard),"
+  info "or $(bold "zeroclaw agent") for a one-off CLI chat."
 elif [ -f "$CARGO_HOME/bin/zeroclaw" ] && "$CARGO_HOME/bin/zeroclaw" --help 2>/dev/null | grep -q '\bdaemon\b'; then
   info "Done. Run $(bold "zeroclaw daemon") for the always-on daemon + web dashboard,"
   info "or $(bold "zeroclaw agent") for a one-off CLI chat."

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "agent-runtime")]
@@ -94,10 +95,47 @@ fn install_dir_not_writable_message(dir: &str, error: &str) -> String {
     }
 }
 
-const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
-const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
+/// Why a CLI-only build updates only with `--standard`: what the standard
+/// build adds, with the gateway's default address, and how to choose.
+fn cli_only_needs_standard_message() -> String {
+    let gateway = zeroclaw_config::schema::GatewayConfig::default();
+    let address = format!("{}:{}", gateway.host, gateway.port);
+
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-cli-only-needs-standard",
+            &[("address", &address)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!(
+            "This is a CLI-only build, and releases publish only the standard build. The \
+             standard build adds the dashboard and web gateway, which start with the daemon, \
+             by default on {address} with pairing required.\n\
+             To switch to the standard build, run: zeroclaw update --standard\n\
+             To stay CLI-only, re-run the installer: install.sh --cli-only"
+        )
+    }
+}
+
+fn update_switching_to_standard_message() -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string("cli-update-switching-to-standard")
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        "Switching this CLI-only build to the standard build, which adds the dashboard and web \
+         gateway."
+            .to_string()
+    }
+}
+
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases";
 
 #[derive(Debug)]
 pub struct UpdateInfo {
@@ -116,7 +154,18 @@ pub struct UpdateInfo {
 
 /// Check for available updates without downloading.
 /// If `target_version` is `Some`, fetch that specific release tag instead of latest.
-pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
+/// `standard` is `zeroclaw update --standard`: a CLI-only build then takes the
+/// standard archive (see `stays_cli_only`).
+pub async fn check(target_version: Option<&str>, standard: bool) -> Result<UpdateInfo> {
+    check_from(GITHUB_RELEASES_URL, target_version, standard).await
+}
+
+/// `check` against the releases API at `releases_url`.
+async fn check_from(
+    releases_url: &str,
+    target_version: Option<&str>,
+    standard: bool,
+) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
     let client = reqwest::Client::builder()
@@ -131,9 +180,9 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
             } else {
                 format!("v{v}")
             };
-            format!("{GITHUB_RELEASES_TAG_URL}/{tag}")
+            format!("{releases_url}/tags/{tag}")
         }
-        None => GITHUB_RELEASES_LATEST_URL.to_string(),
+        None => format!("{releases_url}/latest"),
     };
 
     let resp = client
@@ -153,7 +202,7 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
         .trim_start_matches('v')
         .to_string();
 
-    let download_url = find_asset_url(&release);
+    let download_url = find_asset_url(&release, standard);
     let sha256sums_url = find_sha256sums_url(&release);
     let is_newer = version_is_newer(&current, &tag);
 
@@ -176,46 +225,84 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     })
 }
 
-pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
+pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> Result<()> {
+    run_from(
+        GITHUB_RELEASES_URL,
+        target_version,
+        force,
+        standard,
+        &mut std::io::stdout(),
+    )
+    .await
+}
+
+/// `run` against the releases API at `releases_url`, writing its messages to
+/// `out`.
+async fn run_from(
+    releases_url: &str,
+    target_version: Option<&str>,
+    force: bool,
+    standard: bool,
+    out: &mut (dyn Write + Send),
+) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "Phase 1/6: Preflight checks..."
     );
-    let update_info = check(target_version).await?;
+    let update_info = check_from(releases_url, target_version, standard).await?;
+    let switching = switches_to_standard(standard);
 
-    if !should_install(update_info.is_newer, force) {
-        println!(
+    if !should_install(
+        &update_info.current_version,
+        &update_info.latest_version,
+        force,
+        switching,
+    ) {
+        writeln!(
+            out,
             "{}",
             update_already_current_message(&update_info.current_version)
-        );
+        )?;
+        // A CLI-only build gets the same guidance as for a newer release:
+        // without --standard it never takes the standard build.
+        if stays_cli_only(standard) {
+            writeln!(out, "{}", cli_only_needs_standard_message())?;
+        }
         return Ok(());
     }
 
     if update_info.is_newer {
-        println!(
+        writeln!(
+            out,
             "{}",
             update_available_message(&update_info.current_version, &update_info.latest_version)
-        );
-    } else {
+        )?;
+    } else if force {
         // --force on a version that is not newer: reinstall or downgrade/pin.
-        println!(
+        // Without it, only a same-version switch to the standard build gets
+        // here, and the switching line below says what happens.
+        writeln!(
+            out,
             "{}",
             update_forcing_reinstall_message(
                 &update_info.current_version,
                 &update_info.latest_version
             )
-        );
+        )?;
     }
 
     let download_url = update_info
         .download_url
-        .context("no suitable binary found for this platform")?;
+        .with_context(|| no_release_archive_message(standard))?;
+    if switching {
+        writeln!(out, "{}", update_switching_to_standard_message())?;
+    }
 
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
-    let alias_exe = sibling_alias_path(&current_exe);
+    // Fork: resolves an invoked `zrc` link to the binary it names.
+    let (current_exe, alias_exe) =
+        update_paths(std::env::current_exe().context("cannot determine current executable path")?)?;
 
     // Fail fast before downloading if the install directory is not writable
     // (e.g. a system-wide install that needs sudo / an elevated console).
@@ -249,8 +336,8 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     tokio::fs::copy(&current_exe, &backup_path)
         .await
         .context("failed to backup current binary")?;
-    let alias_backup_path = if let Some(alias) = alias_exe.as_deref() {
-        backup_existing_binary(alias).await?
+    let alias_prior = if let Some(alias) = alias_exe.as_deref() {
+        Some(capture_alias_prior(alias).await?)
     } else {
         None
     };
@@ -297,20 +384,18 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     );
     match smoke_test(&current_exe).await {
         Ok(()) => {
-            if let Some(alias) = alias_exe.as_deref()
+            // The alias is smoke-tested through its own path, so a `zrc` link
+            // proves the binary still runs when invoked by that name.
+            if let (Some(alias), Some(prior)) = (alias_exe.as_deref(), alias_prior.as_ref())
                 && let Err(e) = async {
-                    sync_alias_binary(&current_exe, alias).await?;
+                    sync_alias(&current_exe, alias).await?;
                     smoke_test(alias).await
                 }
                 .await
             {
-                rollback_binary_pair(
-                    &backup_path,
-                    &current_exe,
-                    Some((alias, alias_backup_path.as_deref())),
-                )
-                .await
-                .context("rollback after alias sync failure")?;
+                rollback_binary_pair(&backup_path, &current_exe, Some((alias, prior)))
+                    .await
+                    .context("rollback after alias sync failure")?;
                 bail!("Update rolled back — alias sync failed: {e}");
             }
 
@@ -321,11 +406,15 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
             install_companion_artifacts(&staging, &current_exe, &host_dashboard_candidates()).await;
-            if let Some(alias_backup) = alias_backup_path.as_deref() {
+            if let Some(AliasPrior::File(alias_backup)) = alias_prior.as_ref() {
                 let _ = tokio::fs::remove_file(alias_backup).await;
             }
-            println!("{}", update_success_message(&update_info.latest_version));
-            println!("{}", prebuilt_channel_note_message());
+            writeln!(
+                out,
+                "{}",
+                update_success_message(&update_info.latest_version)
+            )?;
+            writeln!(out, "{}", prebuilt_channel_note_message())?;
             Ok(())
         }
         Err(e) => {
@@ -344,12 +433,12 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     }
 }
 
-fn find_asset_url(release: &serde_json::Value) -> Option<String> {
+fn find_asset_url(release: &serde_json::Value, standard: bool) -> Option<String> {
     let target = current_target_triple()?;
 
     release["assets"].as_array()?.iter().find_map(|asset| {
         let name = asset["name"].as_str()?;
-        if !is_installable_release_asset(name, target) {
+        if !is_installable_release_asset(name, target, standard) {
             return None;
         }
         let url = asset["browser_download_url"].as_str()?.trim();
@@ -393,7 +482,25 @@ fn is_sha256sums_asset(name: &str) -> bool {
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("sha256sums"))
 }
 
-fn is_installable_release_asset(name: &str, target: &str) -> bool {
+fn is_installable_release_asset(name: &str, target: &str, standard: bool) -> bool {
+    release_asset_matches(name, target, stays_cli_only(standard))
+}
+
+/// Whether this update keeps a CLI-only build (no gateway). Releases publish
+/// only the standard build, with the dashboard and web gateway, so a CLI-only
+/// build installs nothing unless `--standard` asks to switch to it. A standard
+/// build ignores the flag.
+fn stays_cli_only(standard: bool) -> bool {
+    !cfg!(feature = "gateway") && !standard
+}
+
+/// Whether `name` is the standard archive for `target`. With `stay_cli_only`
+/// nothing matches, so a CLI-only build is never replaced by the standard
+/// build without `--standard`.
+fn release_asset_matches(name: &str, target: &str, stay_cli_only: bool) -> bool {
+    if stay_cli_only {
+        return false;
+    }
     // .tar.gz and .tgz are universal across all platforms
     if name == format!("zeroclaw-{target}.tar.gz") || name == format!("zeroclaw-{target}.tgz") {
         return true;
@@ -403,6 +510,14 @@ fn is_installable_release_asset(name: &str, target: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Why `run` found nothing to install.
+fn no_release_archive_message(standard: bool) -> String {
+    if stays_cli_only(standard) {
+        return cli_only_needs_standard_message();
+    }
+    "no suitable binary found for this platform".to_string()
 }
 
 fn current_target_triple() -> Option<&'static str> {
@@ -436,9 +551,19 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
 /// Decide whether to proceed with the install. A newer version always installs;
 /// a non-newer one (same or older) installs only with `--force`, which enables
 /// reinstalling the current version or downgrading/pinning to a specific
-/// `--version`.
-fn should_install(is_newer: bool, force: bool) -> bool {
-    is_newer || force
+/// `--version`. A CLI-only build switching to the standard build also installs
+/// the same version, because the build changes; it still downgrades only with
+/// `--force`.
+fn should_install(current: &str, latest: &str, force: bool, switching: bool) -> bool {
+    let is_newer = version_is_newer(current, latest);
+    let is_older = version_is_newer(latest, current);
+    is_newer || force || (switching && !is_older)
+}
+
+/// Whether `--standard` switches this build: only a CLI-only build (no
+/// gateway) has another build to switch to.
+fn switches_to_standard(standard: bool) -> bool {
+    standard && !cfg!(feature = "gateway")
 }
 
 /// Download a release asset and unpack it into `staging`.
@@ -999,6 +1124,14 @@ async fn sweep_update_residue(parent: &Path, base: &str) {
     }
 }
 
+// ── Fork: the `zrc` alias ──────────────────────────────────────────
+//
+// `zrc` is the fork's short name for the same CLI, not a second compiled
+// binary. On Unix it is a `zrc -> zeroclaw` symlink beside the binary
+// (install.sh creates it) and the updater keeps it a link. Windows cannot rely
+// on symlinks without Developer Mode, so there `zrc.exe` stays a copy that the
+// updater refreshes, as before.
+
 /// Return the sibling alias path for `zeroclaw`/`zrc` binary names.
 fn sibling_alias_path(current_exe: &Path) -> Option<PathBuf> {
     let file_name = current_exe.file_name()?.to_str()?;
@@ -1012,31 +1145,135 @@ fn sibling_alias_path(current_exe: &Path) -> Option<PathBuf> {
     Some(current_exe.with_file_name(sibling_name))
 }
 
-/// Back up an existing binary if it is present at the given path.
-async fn backup_existing_binary(path: &Path) -> Result<Option<PathBuf>> {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) if meta.is_file() => {
-            let backup = path.with_extension("bak");
-            tokio::fs::copy(path, &backup)
+/// What was at the alias path before the update, so a rollback can put it back.
+#[derive(Debug, PartialEq, Eq)]
+enum AliasPrior {
+    /// Nothing; a rollback removes what the update created there.
+    Absent,
+    /// A symlink with this target, which a rollback recreates.
+    Link(PathBuf),
+    /// A regular file (a copy, as older fork releases installed), backed up
+    /// at this path.
+    File(PathBuf),
+}
+
+/// The binary the update replaces, and the alias path it keeps in step.
+///
+/// Invoked through the `zrc` link, the binary to replace is the link's target.
+/// On macOS `current_exe` names the link itself, and replacing that path would
+/// turn the link into a file and leave `zeroclaw` stale; Linux reports the
+/// target already. Invoked as a regular `zrc` copy beside `zeroclaw` (an older
+/// fork install), the update replaces `zeroclaw` and turns the copy into the
+/// link.
+#[cfg(not(windows))]
+fn update_paths(current_exe: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
+    if current_exe.file_name().and_then(|name| name.to_str()) != Some("zrc") {
+        let alias = sibling_alias_path(&current_exe);
+        return Ok((current_exe, alias));
+    }
+    let is_link = std::fs::symlink_metadata(&current_exe)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if is_link {
+        let target = std::fs::canonicalize(&current_exe)
+            .with_context(|| format!("cannot resolve the zrc alias {}", current_exe.display()))?;
+        return Ok((target, Some(current_exe)));
+    }
+    let primary = current_exe.with_file_name("zeroclaw");
+    if primary.is_file() {
+        Ok((primary, Some(current_exe)))
+    } else {
+        Ok((current_exe, None))
+    }
+}
+
+#[cfg(windows)]
+fn update_paths(current_exe: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
+    let alias = sibling_alias_path(&current_exe);
+    Ok((current_exe, alias))
+}
+
+/// Record what is at `alias` before the swap, backing up a regular file.
+async fn capture_alias_prior(alias: &Path) -> Result<AliasPrior> {
+    match tokio::fs::symlink_metadata(alias).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = tokio::fs::read_link(alias)
                 .await
-                .with_context(|| format!("failed to backup alias binary {}", path.display()))?;
-            Ok(Some(backup))
+                .with_context(|| format!("failed to read alias link {}", alias.display()))?;
+            Ok(AliasPrior::Link(target))
         }
-        Ok(_) => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.is_file() => {
+            let backup = alias.with_extension("bak");
+            tokio::fs::copy(alias, &backup)
+                .await
+                .with_context(|| format!("failed to backup alias binary {}", alias.display()))?;
+            Ok(AliasPrior::File(backup))
+        }
+        Ok(_) => Ok(AliasPrior::Absent),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AliasPrior::Absent),
         Err(err) => {
-            Err(err).with_context(|| format!("failed to stat alias binary {}", path.display()))
+            Err(err).with_context(|| format!("failed to stat alias binary {}", alias.display()))
         }
     }
 }
 
+/// Whether `alias` is a symlink that resolves to `primary`.
+#[cfg(not(windows))]
+async fn alias_links_to(alias: &Path, primary: &Path) -> bool {
+    let is_link = tokio::fs::symlink_metadata(alias)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if !is_link {
+        return false;
+    }
+    match (
+        tokio::fs::canonicalize(alias).await,
+        tokio::fs::canonicalize(primary).await,
+    ) {
+        (Ok(alias), Ok(primary)) => alias == primary,
+        _ => false,
+    }
+}
+
+/// The target to write into an alias link: the bare file name when the link
+/// sits beside the binary (so the pair can move together), else the full path.
+#[cfg(not(windows))]
+fn alias_link_target(primary: &Path, alias: &Path) -> PathBuf {
+    match (primary.parent(), alias.parent(), primary.file_name()) {
+        (Some(primary_dir), Some(alias_dir), Some(name)) if primary_dir == alias_dir => {
+            PathBuf::from(name)
+        }
+        _ => primary.to_path_buf(),
+    }
+}
+
+/// Make `alias` a symlink to the updated `primary`. A link that already
+/// resolves to it is kept as is: the swap replaced its target in place.
+#[cfg(not(windows))]
+async fn sync_alias(primary: &Path, alias: &Path) -> Result<()> {
+    if alias_links_to(alias, primary).await {
+        return Ok(());
+    }
+    match tokio::fs::remove_file(alias).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to replace alias {}", alias.display()));
+        }
+    }
+    tokio::fs::symlink(alias_link_target(primary, alias), alias)
+        .await
+        .with_context(|| format!("failed to link alias {}", alias.display()))
+}
+
 /// Copy the updated primary binary to its sibling alias path.
-async fn sync_alias_binary(current_exe: &Path, alias: &Path) -> Result<()> {
+#[cfg(windows)]
+async fn sync_alias(primary: &Path, alias: &Path) -> Result<()> {
     let _ = tokio::fs::remove_file(alias).await;
-    tokio::fs::copy(current_exe, alias)
+    tokio::fs::copy(primary, alias)
         .await
         .with_context(|| format!("failed to sync alias binary {}", alias.display()))?;
-    let perms = tokio::fs::metadata(current_exe)
+    let perms = tokio::fs::metadata(primary)
         .await
         .context("failed to read updated binary permissions")?
         .permissions();
@@ -1051,25 +1288,45 @@ async fn sync_alias_binary(current_exe: &Path, alias: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restore an optional alias backup, or remove an alias created during update.
-async fn rollback_optional_binary(target: &Path, backup: Option<&Path>) -> Result<()> {
-    if let Some(backup) = backup {
-        rollback_binary(backup, target).await
-    } else {
-        let _ = tokio::fs::remove_file(target).await;
-        Ok(())
+/// Put back what was at `alias` before the update.
+async fn restore_alias(alias: &Path, prior: &AliasPrior) -> Result<()> {
+    match prior {
+        AliasPrior::Absent => {
+            let _ = tokio::fs::remove_file(alias).await;
+            Ok(())
+        }
+        AliasPrior::Link(target) => restore_alias_link(alias, target).await,
+        AliasPrior::File(backup) => rollback_binary(backup, alias).await,
     }
 }
 
-/// Roll back the main binary and alias binary, attempting both paths.
+#[cfg(not(windows))]
+async fn restore_alias_link(alias: &Path, target: &Path) -> Result<()> {
+    let _ = tokio::fs::remove_file(alias).await;
+    tokio::fs::symlink(target, alias)
+        .await
+        .with_context(|| format!("failed to restore alias link {}", alias.display()))
+}
+
+#[cfg(windows)]
+async fn restore_alias_link(alias: &Path, target: &Path) -> Result<()> {
+    // The updater never creates links on Windows, but one an operator made
+    // (with Developer Mode) is put back as found.
+    let _ = tokio::fs::remove_file(alias).await;
+    tokio::fs::symlink_file(target, alias)
+        .await
+        .with_context(|| format!("failed to restore alias link {}", alias.display()))
+}
+
+/// Roll back the main binary and the alias, attempting both paths.
 async fn rollback_binary_pair(
     backup: &Path,
     target: &Path,
-    alias: Option<(&Path, Option<&Path>)>,
+    alias: Option<(&Path, &AliasPrior)>,
 ) -> Result<()> {
     let main_result = rollback_binary(backup, target).await;
-    let alias_result = if let Some((alias_target, alias_backup)) = alias {
-        rollback_optional_binary(alias_target, alias_backup).await
+    let alias_result = if let Some((alias_path, prior)) = alias {
+        restore_alias(alias_path, prior).await
     } else {
         Ok(())
     };
@@ -1185,6 +1442,12 @@ async fn install_companion_artifacts(
         }
         if name_str == main_name {
             // Already swapped + smoke-tested via the transactional path.
+            continue;
+        }
+        if matches!(name_str, "zrc" | "zrc.exe") {
+            // Fork: the `zrc` alias is kept in step (with rollback) alongside
+            // the main binary — a link on Unix, a copy on Windows — so a `zrc`
+            // in an older fork archive is not a companion.
             continue;
         }
         // Everything else must appear on `KNOWN_COMPANION_FILES` explicitly.
@@ -1489,11 +1752,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_install_requires_newer_or_force() {
-        assert!(should_install(true, false)); // newer → install
-        assert!(should_install(true, true)); // newer + force → install
-        assert!(!should_install(false, false)); // not newer → skip
-        assert!(should_install(false, true)); // not newer + force → reinstall/downgrade
+    fn should_install_requires_newer_force_or_a_same_version_switch() {
+        // (current, latest, force, switching to the standard build) → install
+        let table = [
+            ("0.9.0", "0.9.1", false, false, true), // newer
+            ("0.9.0", "0.9.1", true, false, true),
+            ("0.9.0", "0.9.1", false, true, true),
+            ("0.9.0", "0.9.1", true, true, true),
+            ("0.9.0", "0.9.0", false, false, false), // same: already up to date
+            ("0.9.0", "0.9.0", true, false, true),   // --force reinstalls
+            ("0.9.0", "0.9.0", false, true, true),   // the switch changes the build
+            ("0.9.0", "0.9.0", true, true, true),
+            ("0.9.0", "0.8.7", false, false, false), // older: only with --force
+            ("0.9.0", "0.8.7", true, false, true),
+            ("0.9.0", "0.8.7", false, true, false), // a switch never downgrades alone
+            ("0.9.0", "0.8.7", true, true, true),
+        ];
+        for (current, latest, force, switching, expected) in table {
+            assert_eq!(
+                should_install(current, latest, force, switching),
+                expected,
+                "{current} -> {latest}, force={force}, switching={switching}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_cli_only_build_switches_with_standard() {
+        assert!(!switches_to_standard(false));
+        assert_eq!(switches_to_standard(true), !cfg!(feature = "gateway"));
     }
 
     #[test]
@@ -1570,20 +1857,149 @@ mod tests {
         std::fs::write(&alias, b"new-alias").unwrap();
         std::fs::write(&alias_backup, b"old-alias").unwrap();
 
-        let err = rollback_binary_pair(
-            &missing_main_backup,
-            &current,
-            Some((&alias, Some(alias_backup.as_path()))),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let prior = AliasPrior::File(alias_backup.clone());
+        let err = rollback_binary_pair(&missing_main_backup, &current, Some((&alias, &prior)))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("failed to rollback main binary"),
             "unexpected rollback error: {err}"
         );
         assert_eq!(std::fs::read(&alias).unwrap(), b"old-alias");
+    }
+
+    // ── Fork: the `zrc` alias is a symlink on Unix ─────────────────
+
+    #[cfg(not(windows))]
+    fn assert_zrc_links_to_zeroclaw(dir: &Path, contents: &[u8]) {
+        let alias = dir.join("zrc");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "zrc must be a symlink"
+        );
+        assert_eq!(std::fs::read_link(&alias).unwrap(), Path::new("zeroclaw"));
+        assert_eq!(std::fs::read(&alias).unwrap(), contents);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn update_paths_resolves_an_invoked_zrc_link_to_the_binary_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"main").unwrap();
+        std::os::unix::fs::symlink("zeroclaw", &alias).unwrap();
+
+        let (target, kept) = update_paths(alias.clone()).unwrap();
+        assert_eq!(target, std::fs::canonicalize(&primary).unwrap());
+        assert_eq!(kept.as_deref(), Some(alias.as_path()));
+
+        let (target, kept) = update_paths(primary.clone()).unwrap();
+        assert_eq!(target, primary);
+        assert_eq!(kept.as_deref(), Some(alias.as_path()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn update_paths_updates_zeroclaw_when_invoked_as_a_legacy_zrc_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"main").unwrap();
+        std::fs::write(&alias, b"legacy copy").unwrap();
+
+        let (target, kept) = update_paths(alias.clone()).unwrap();
+        assert_eq!(target, primary);
+        assert_eq!(kept.as_deref(), Some(alias.as_path()));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn updater_replaces_the_target_and_keeps_the_zrc_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        let staged = tmp.path().join("staged-zeroclaw");
+        std::fs::write(&primary, b"old-main").unwrap();
+        std::fs::write(&staged, b"new-main").unwrap();
+        std::os::unix::fs::symlink("zeroclaw", &alias).unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        assert_eq!(prior, AliasPrior::Link(PathBuf::from("zeroclaw")));
+        swap_binary(&staged, &primary).await.unwrap();
+        sync_alias(&primary, &alias).await.unwrap();
+
+        assert_eq!(std::fs::read(&primary).unwrap(), b"new-main");
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn updater_turns_a_legacy_zrc_copy_into_the_link_and_rollback_restores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"new-main").unwrap();
+        std::fs::write(&alias, b"legacy copy").unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        let AliasPrior::File(backup) = &prior else {
+            panic!("a regular zrc must be backed up, got {prior:?}");
+        };
+        assert_eq!(std::fs::read(backup).unwrap(), b"legacy copy");
+        sync_alias(&primary, &alias).await.unwrap();
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+
+        restore_alias(&alias, &prior).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "rollback restores the regular file"
+        );
+        assert_eq!(std::fs::read(&alias).unwrap(), b"legacy copy");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn updater_creates_a_missing_zrc_link_and_rollback_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"new-main").unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        assert_eq!(prior, AliasPrior::Absent);
+        sync_alias(&primary, &alias).await.unwrap();
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+
+        restore_alias(&alias, &prior).await.unwrap();
+        assert!(std::fs::symlink_metadata(&alias).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn rollback_recreates_a_zrc_link_that_pointed_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("zeroclaw");
+        let other = tmp.path().join("other-zeroclaw");
+        let alias = tmp.path().join("zrc");
+        std::fs::write(&primary, b"new-main").unwrap();
+        std::fs::write(&other, b"other install").unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+
+        let prior = capture_alias_prior(&alias).await.unwrap();
+        sync_alias(&primary, &alias).await.unwrap();
+        assert_zrc_links_to_zeroclaw(tmp.path(), b"new-main");
+
+        restore_alias(&alias, &prior).await.unwrap();
+        assert_eq!(std::fs::read_link(&alias).unwrap(), other);
     }
 
     fn make_release(assets: &[&str]) -> serde_json::Value {
@@ -1599,6 +2015,8 @@ mod tests {
         serde_json::json!({ "assets": assets })
     }
 
+    // These pass `true` (`--standard`), with which every build selects the
+    // standard archive, so they run in CLI-only builds too.
     #[test]
     fn find_asset_url_picks_correct_gnu_over_android() {
         let release = make_release(&[
@@ -1611,7 +2029,7 @@ mod tests {
             "zeroclaw-aarch64-pc-windows-msvc.tar.gz",
         ]);
 
-        let url = find_asset_url(&release);
+        let url = find_asset_url(&release, true);
         assert!(url.is_some(), "should find an asset");
         let url = url.unwrap();
         // Must NOT match the android binary
@@ -1631,7 +2049,7 @@ mod tests {
             &format!("zeroclaw-{target}.tar.gz"),
         ]);
 
-        let url = find_asset_url(&release).expect("should select archive asset");
+        let url = find_asset_url(&release, true).expect("should select archive asset");
         let is_tar = url.ends_with(".tar.gz");
         let is_zip = url.ends_with(".zip");
         assert!(
@@ -1660,7 +2078,7 @@ mod tests {
             ]
         });
 
-        let url = find_asset_url(&release).expect("should skip unusable URLs");
+        let url = find_asset_url(&release, true).expect("should skip unusable URLs");
         assert_eq!(url, format!("https://example.com/zeroclaw-{target}.tar.gz"));
     }
 
@@ -1672,7 +2090,7 @@ mod tests {
             &format!("zeroclaw-{target}.tar.gz"),
         ]);
 
-        let url = find_asset_url(&release).expect("should select zeroclaw asset");
+        let url = find_asset_url(&release, true).expect("should select zeroclaw asset");
         assert!(
             url.contains(&format!("zeroclaw-{target}.tar.gz")),
             "should select zeroclaw archive, got: {url}"
@@ -1680,23 +2098,202 @@ mod tests {
     }
 
     #[test]
+    fn a_build_staying_cli_only_matches_no_release_archive() {
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            for name in [
+                format!("zeroclaw-{target}.tar.gz"),
+                format!("zeroclaw-{target}.tgz"),
+                format!("zeroclaw-{target}.zip"),
+            ] {
+                assert!(!release_asset_matches(&name, target, true), "{name}");
+            }
+        }
+        assert!(release_asset_matches(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "x86_64-unknown-linux-gnu",
+            false
+        ));
+    }
+
+    /// A release with this host's standard archive among other assets, and the
+    /// URL `find_asset_url` should select for it.
+    fn release_with_this_standard_archive() -> (serde_json::Value, String) {
+        let target = current_target_triple().expect("supported test platform");
+        let ext = if target.contains("windows") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let archive = format!("zeroclaw-{target}.{ext}");
+        let release = make_release(&[
+            "zeroclaw-aarch64-linux-android.tar.gz",
+            &archive,
+            "SHA256SUMS",
+        ]);
+        (release, format!("https://example.com/{archive}"))
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[test]
+    fn this_cli_only_build_selects_nothing_without_standard() {
+        let (release, _) = release_with_this_standard_archive();
+        assert_eq!(find_asset_url(&release, false), None);
+
+        let message = no_release_archive_message(false);
+        assert!(message.contains("zeroclaw update --standard"), "{message}");
+        assert!(message.contains("install.sh --cli-only"), "{message}");
+        let gateway = zeroclaw_config::schema::GatewayConfig::default();
+        let address = format!("{}:{}", gateway.host, gateway.port);
+        assert!(message.contains(&address), "{message}");
+        assert!(
+            gateway.require_pairing,
+            "the message says pairing is required"
+        );
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[test]
+    fn this_cli_only_build_selects_the_standard_archive_with_standard() {
+        let (release, standard_archive) = release_with_this_standard_archive();
+        assert_eq!(find_asset_url(&release, true), Some(standard_archive));
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn this_standard_build_selects_the_standard_archive_with_or_without_standard() {
+        let (release, standard_archive) = release_with_this_standard_archive();
+        assert_eq!(
+            find_asset_url(&release, false),
+            Some(standard_archive.clone())
+        );
+        assert_eq!(find_asset_url(&release, true), Some(standard_archive));
+        assert_eq!(
+            no_release_archive_message(false),
+            "no suitable binary found for this platform"
+        );
+    }
+
+    /// A releases API serving release `version` with this host's standard
+    /// archive and `SHA256SUMS`, which answer 404 and may be fetched only
+    /// `downloads` times in all.
+    async fn releases_api_with(version: &str, downloads: u64) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let target = current_target_triple().expect("supported test platform");
+        let release = serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "assets": [
+                {
+                    "name": format!("zeroclaw-{target}.tar.gz"),
+                    "browser_download_url": format!("{}/download/zeroclaw-{target}.tar.gz", server.uri()),
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": format!("{}/download/SHA256SUMS", server.uri()),
+                },
+            ],
+        });
+        for route in ["/latest".to_string(), format!("/tags/v{version}")] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&release))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path_regex("^/download/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(downloads)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn run_installs_nothing_from_the_same_or_an_older_release() {
+        let current = env!("CARGO_PKG_VERSION");
+        for (release, target_version) in [(current, None), ("0.0.1", Some("0.0.1"))] {
+            let server = releases_api_with(release, 0).await;
+            let mut out = Vec::new();
+            run_from(&server.uri(), target_version, false, false, &mut out)
+                .await
+                .unwrap_or_else(|e| panic!("v{release}: {e:#}"));
+
+            // Only a CLI-only build adds the guidance, as for a newer release.
+            let mut lines = vec![update_already_current_message(current)];
+            if !cfg!(feature = "gateway") {
+                lines.push(cli_only_needs_standard_message());
+            }
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("{}\n", lines.join("\n")),
+                "v{release}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn run_in_a_cli_only_build_refuses_a_newer_release_without_standard() {
+        let server = releases_api_with("999.0.0", 0).await;
+        let mut out = Vec::new();
+        let err = run_from(&server.uri(), None, false, false, &mut out)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), cli_only_needs_standard_message());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{}\n",
+                update_available_message(env!("CARGO_PKG_VERSION"), "999.0.0")
+            )
+        );
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn run_in_a_cli_only_build_with_standard_downloads_the_same_version() {
+        // The stub's 404 stops the download before anything is replaced.
+        let server = releases_api_with(env!("CARGO_PKG_VERSION"), 1).await;
+        let mut out = Vec::new();
+        let err = run_from(&server.uri(), None, false, true, &mut out)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("download returned 404"), "{err:#}");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", update_switching_to_standard_message())
+        );
+    }
+
+    #[test]
     fn installable_release_asset_rejects_unknown_target() {
         assert!(!is_installable_release_asset(
             "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
-            "unknown"
+            "unknown",
+            true
         ));
     }
 
     #[test]
     fn find_asset_url_returns_none_for_empty_assets() {
         let release = serde_json::json!({ "assets": [] });
-        assert!(find_asset_url(&release).is_none());
+        assert!(find_asset_url(&release, true).is_none());
     }
 
     #[test]
     fn find_asset_url_returns_none_for_missing_assets() {
         let release = serde_json::json!({});
-        assert!(find_asset_url(&release).is_none());
+        assert!(find_asset_url(&release, true).is_none());
     }
 
     #[test]
@@ -2618,5 +3215,277 @@ mod tests {
             !stale.exists(),
             "install_web_dist must sweep residue from previous runs"
         );
+    }
+
+    #[cfg(windows)]
+    mod windows_runtime_tests {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Output, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_CHILD";
+        const READY_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_READY";
+        const RELEASE_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_RELEASE";
+        const CHILD_TEST: &str =
+            "commands::update::tests::windows_runtime_tests::windows_update_runtime_child";
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        struct LockedTestExecutable {
+            child: Option<Child>,
+            ready: PathBuf,
+            release: PathBuf,
+        }
+
+        impl LockedTestExecutable {
+            fn spawn(executable: &Path, marker_dir: &Path, label: &str) -> Self {
+                let ready = marker_dir.join(format!("{label}.ready"));
+                let release = marker_dir.join(format!("{label}.release"));
+                let child = Command::new(executable)
+                    .arg(CHILD_TEST)
+                    .arg("--exact")
+                    .arg("--test-threads=1")
+                    .env(CHILD_ENV, "1")
+                    .env(READY_ENV, &ready)
+                    .env(RELEASE_ENV, &release)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|error| {
+                        panic!("failed to spawn locked test executable {executable:?}: {error}")
+                    });
+                Self {
+                    child: Some(child),
+                    ready,
+                    release,
+                }
+            }
+
+            fn pid(&self) -> u32 {
+                self.child
+                    .as_ref()
+                    .expect("locked test executable must be running")
+                    .id()
+            }
+
+            fn wait_ready(&mut self) {
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    if self.ready.is_file() {
+                        return;
+                    }
+                    let child_status = self
+                        .child
+                        .as_mut()
+                        .expect("locked test executable child is still present")
+                        .try_wait();
+                    match child_status {
+                        Ok(Some(status)) => {
+                            self.fail(format!(
+                                "locked test executable exited before ready: {status}"
+                            ));
+                        }
+                        Err(error) => {
+                            self.fail(format!(
+                                "failed to poll locked test executable before ready: {error}"
+                            ));
+                        }
+                        Ok(None) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        self.fail("timed out waiting for locked test executable readiness".into());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+
+            fn release_and_wait(mut self) {
+                std::fs::write(&self.release, b"release").unwrap_or_else(|error| {
+                    panic!(
+                        "failed to write child release marker {:?}: {error}",
+                        self.release
+                    )
+                });
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    let child_status = self
+                        .child
+                        .as_mut()
+                        .expect("locked test executable child is still present")
+                        .try_wait();
+                    match child_status {
+                        Ok(Some(status)) => {
+                            let child = self.child.take().unwrap();
+                            let output = child
+                                .wait_with_output()
+                                .expect("failed to collect locked test executable output");
+                            assert!(
+                                output.status.success(),
+                                "locked test executable exited unsuccessfully ({status}): {}",
+                                child_output(&output)
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            self.fail(format!("failed to poll released test executable: {error}"));
+                        }
+                        Ok(None) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        self.fail("timed out waiting for released test executable".into());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+
+            fn fail(&mut self, reason: String) -> ! {
+                let mut child = self
+                    .child
+                    .take()
+                    .expect("locked test executable child exists");
+                let _ = child.kill();
+                let details = match child.wait_with_output() {
+                    Ok(output) => child_output(&output),
+                    Err(error) => format!("failed to collect child output: {error}"),
+                };
+                panic!("{reason}; {details}");
+            }
+        }
+
+        impl Drop for LockedTestExecutable {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        fn child_output(output: &Output) -> String {
+            format!(
+                "stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+
+        fn copy_current_test_executable(destination: &Path) {
+            let source = std::env::current_exe().expect("resolve current test executable");
+            std::fs::copy(&source, destination).unwrap_or_else(|error| {
+                panic!("copy current test executable to {destination:?}: {error}")
+            });
+        }
+
+        fn sidecar_path_for_pid(target: &Path, pid: u32, suffix: &str) -> PathBuf {
+            let mut name = target.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".{pid}.{suffix}"));
+            target.with_file_name(name)
+        }
+
+        #[test]
+        fn windows_update_runtime_child() {
+            if std::env::var(CHILD_ENV).ok().as_deref() != Some("1") {
+                return;
+            }
+            let ready = PathBuf::from(
+                std::env::var_os(READY_ENV).expect("child ready marker path must be configured"),
+            );
+            let release = PathBuf::from(
+                std::env::var_os(RELEASE_ENV)
+                    .expect("child release marker path must be configured"),
+            );
+            std::fs::write(&ready, b"ready").expect("write child ready marker");
+
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            while !release.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for child release marker {:?}",
+                    release
+                );
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+
+        #[tokio::test]
+        async fn windows_swap_binary_handles_locked_sidecars() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("zeroclaw.exe");
+            let preexisting_seed = tmp.path().join("preexisting.exe");
+            copy_current_test_executable(&target);
+            copy_current_test_executable(&preexisting_seed);
+
+            let mut target_child = LockedTestExecutable::spawn(&target, tmp.path(), "target");
+            target_child.wait_ready();
+            let mut preexisting_child =
+                LockedTestExecutable::spawn(&preexisting_seed, tmp.path(), "preexisting");
+            preexisting_child.wait_ready();
+
+            let parent_sidecar = sidecar_path(&target, "old");
+            assert_eq!(
+                parent_sidecar,
+                sidecar_path_for_pid(&target, std::process::id(), "old"),
+                "production sidecar must include the current process ID"
+            );
+            let preexisting_sidecar = sidecar_path_for_pid(&target, preexisting_child.pid(), "old");
+            assert_ne!(
+                parent_sidecar, preexisting_sidecar,
+                "parent sidecar must not collide with a sidecar from another process"
+            );
+            std::fs::rename(&preexisting_seed, &preexisting_sidecar).unwrap();
+
+            let new = tmp.path().join("replacement.bin");
+            std::fs::write(&new, b"replacement bytes").unwrap();
+            swap_binary(&new, &target).await.unwrap();
+
+            assert_eq!(std::fs::read(&target).unwrap(), b"replacement bytes");
+            assert!(
+                parent_sidecar.is_file(),
+                "running target must leave its parent sidecar in place"
+            );
+            assert!(
+                preexisting_sidecar.is_file(),
+                "running pre-existing sidecar must survive the sweep"
+            );
+
+            target_child.release_and_wait();
+            preexisting_child.release_and_wait();
+            sweep_stale_sidecars(&target).await;
+
+            assert!(!parent_sidecar.exists());
+            assert!(!preexisting_sidecar.exists());
+        }
+
+        #[tokio::test]
+        async fn windows_swap_failure_restores_then_rolls_back_locked_target() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("zeroclaw.exe");
+            copy_current_test_executable(&target);
+            let original = std::fs::read(&target).unwrap();
+            let backup = tmp.path().join("zeroclaw.bak");
+            std::fs::write(&backup, b"backup bytes").unwrap();
+            let missing = tmp.path().join("missing.exe");
+
+            let mut target_child = LockedTestExecutable::spawn(&target, tmp.path(), "rollback");
+            target_child.wait_ready();
+
+            assert!(swap_binary(&missing, &target).await.is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            assert!(!sidecar_path(&target, "old").exists());
+
+            let rollback_sidecar = sidecar_path(&target, "rollback-old");
+            rollback_binary(&backup, &target).await.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"backup bytes");
+            assert!(
+                rollback_sidecar.is_file(),
+                "rollback residue must remain while the original image is mapped"
+            );
+
+            target_child.release_and_wait();
+            sweep_stale_sidecars(&target).await;
+            assert!(!rollback_sidecar.exists());
+        }
     }
 }

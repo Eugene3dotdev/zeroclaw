@@ -8,26 +8,8 @@ use zeroclaw_config::schema::ClaudeCodeConfig;
 
 use crate::coding_cli::{
     CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
-    add_safe_env,
+    add_coding_cli_env,
 };
-
-/// Environment variables safe to pass through to the `claude` subprocess.
-const SAFE_ENV_VARS: &[&str] = &[
-    // Windows system-level variables required for subprocess execution
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "SystemRoot",
-    "PATH",
-    "HOME",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "USER",
-    "SHELL",
-    "TMPDIR",
-];
 
 fn is_forbidden_provider_env(name: &str) -> bool {
     matches!(
@@ -266,7 +248,7 @@ impl Tool for ClaudeCodeTool {
 
         // Direct Anthropic credential passthrough is rejected before the
         // environment is populated so no forbidden variable can reach the
-        // subprocess. HOME stays in SAFE_ENV_VARS so `claude` still finds its
+        // subprocess. HOME stays in the shared coding-CLI safe env list so `claude` still finds its
         // approved session in ~/.claude/.
         if let Some(blocked) = self
             .config
@@ -284,7 +266,7 @@ impl Tool for ClaudeCodeTool {
             });
         }
 
-        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
+        add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
         cmd.working_dir = crate::util_helpers::clean_verbatim_path(&work_dir);
 
         match self.executor.output(cmd).await {
@@ -545,39 +527,5 @@ mod tests {
         assert_eq!(config.allowed_tools, vec!["Read", "Edit", "Bash", "Write"]);
         assert_eq!(config.model, "claude-opus-4-8");
         assert_eq!(config.effort, "xhigh");
-    }
-
-    #[test]
-    fn safe_env_vars_includes_windows_system_variables() {
-        // Verify that SAFE_ENV_VARS contains the Windows system-level
-        // variables required for subprocess execution. This test ensures
-        // the Windows-specific environment allowlist is not accidentally
-        // removed during future cleanup.
-        let safe_vars: Vec<&str> = SAFE_ENV_VARS.to_vec();
-
-        // Windows system variables must be present
-        assert!(
-            safe_vars.contains(&"USERPROFILE"),
-            "USERPROFILE must be in SAFE_ENV_VARS for Windows subprocess execution"
-        );
-        assert!(
-            safe_vars.contains(&"APPDATA"),
-            "APPDATA must be in SAFE_ENV_VARS for Windows subprocess execution"
-        );
-        assert!(
-            safe_vars.contains(&"LOCALAPPDATA"),
-            "LOCALAPPDATA must be in SAFE_ENV_VARS for Windows subprocess execution"
-        );
-        assert!(
-            safe_vars.contains(&"SystemRoot"),
-            "SystemRoot must be in SAFE_ENV_VARS for Windows subprocess execution"
-        );
-
-        // Standard Unix/common variables must also be present
-        assert!(safe_vars.contains(&"PATH"));
-        assert!(safe_vars.contains(&"HOME"));
-        assert!(safe_vars.contains(&"TERM"));
-        assert!(safe_vars.contains(&"LANG"));
-        assert!(safe_vars.contains(&"USER"));
     }
 }

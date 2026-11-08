@@ -1,12 +1,16 @@
 //! ZeroClaw API layer — trait definitions and shared types.
 
+pub mod a2a_wire;
 pub mod agent;
 pub mod attribution;
 pub mod channel;
+pub mod conversation_binding;
 pub mod elicitation;
+pub mod grants;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
+pub mod lifecycle;
 pub mod media;
 pub mod memory_traits;
 pub mod model_provider;
@@ -14,13 +18,19 @@ pub mod observability_traits;
 pub mod peripherals_traits;
 pub mod plan;
 pub mod platform;
+pub mod plugin;
+pub mod plugin_egress;
+pub mod plugin_key;
 pub mod principal;
 pub mod runtime_status;
 pub mod runtime_traits;
 pub mod schema;
 pub mod session_keys;
 pub mod tool;
+pub mod tool_carrier;
+pub mod turn_stop;
 pub mod vad;
+pub mod webhook;
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
@@ -34,6 +44,12 @@ tokio::task_local! {
     /// Session key for the currently active session.
     /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
+
+    /// The conversation the current turn is serving, when its surface
+    /// supports conversation binding. Scoped beside `TOOL_LOOP_SESSION_KEY`
+    /// by that surface; read by tools that record a binding.
+    pub static TOOL_LOOP_ACTIVE_CONVERSATION:
+        Option<crate::conversation_binding::ActiveConversation>;
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.

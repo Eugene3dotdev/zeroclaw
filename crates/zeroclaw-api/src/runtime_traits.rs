@@ -251,6 +251,18 @@ pub trait RuntimeAdapter: Send + Sync {
         ShellProfile::from_dialect(self.shell_dialect())
     }
 
+    /// Return the direct shell program before host executable resolution.
+    ///
+    /// Container sandbox wrappers use this exact identifier inside the image,
+    /// where a canonical host path may name a different or nonexistent file.
+    /// This must match the program and invocation convention used by the shell
+    /// builder, including platform overrides. Adapters that prepend another
+    /// runtime boundary must leave this as `None`: their outer program is not
+    /// the shell. Host execution must still use the resolved command program.
+    fn shell_program(&self) -> Option<&OsStr> {
+        None
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
@@ -268,6 +280,34 @@ pub trait RuntimeAdapter: Send + Sync {
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command>;
 
+    /// Build a shell command using the caller's effective child `PATH`.
+    ///
+    /// On Unix, an adapter that emits a bare launcher must override this
+    /// method when `effective_path` is present and resolve that launcher from
+    /// the supplied path. The default fails closed instead of letting command
+    /// spawn repeat a lookup against a different working directory or path.
+    fn build_shell_command_with_effective_path(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        effective_path: Option<&OsStr>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let process = self.build_shell_command(command, workspace_dir)?;
+
+        #[cfg(unix)]
+        if effective_path.is_some() && !Path::new(process.as_std().get_program()).is_absolute() {
+            anyhow::bail!(
+                "runtime {} returned a bare shell launcher while an effective PATH was supplied; the adapter must resolve it to an absolute path",
+                self.name()
+            );
+        }
+
+        #[cfg(not(unix))]
+        let _ = effective_path;
+
+        Ok(process)
+    }
+
     /// Build a shell command process with runtime-visible environment names.
     ///
     /// `env_keys` contains variable names selected by the caller for
@@ -282,6 +322,17 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> anyhow::Result<tokio::process::Command> {
         let _ = env_keys;
         self.build_shell_command(command, workspace_dir)
+    }
+
+    /// Approve a command line the caller spawns without going through a
+    /// shell (for example a native argv launch of a coding CLI).
+    ///
+    /// Callers that bypass `build_shell_command*` must call this first and
+    /// must not spawn on `Err`. Runtimes without an external policy gate allow
+    /// everything; a gated runtime consults its gate here.
+    fn approve_command(&self, command: &str) -> anyhow::Result<()> {
+        let _ = command;
+        Ok(())
     }
 }
 
@@ -382,12 +433,32 @@ mod tests {
     }
 
     #[test]
-    fn default_shell_dialect_is_posix() {
-        // Any adapter that does not override `shell_dialect` uses the
-        // conservative POSIX default. Concrete adapters report their actual
-        // execution sink, including the configured native shell dialect.
+    fn dummy_runtime_shell_dialect_matches_compilation_platform() {
         let runtime = DummyRuntime;
+        #[cfg(windows)]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
+        #[cfg(not(windows))]
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_path_rejects_default_adapter_bare_launcher() {
+        let runtime = DummyRuntime;
+        let error = runtime
+            .build_shell_command_with_effective_path(
+                "hello-runtime",
+                Path::new("."),
+                Some(OsStr::new("/usr/bin")),
+            )
+            .expect_err("a bare launcher must not bypass the effective PATH contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must resolve it to an absolute path"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

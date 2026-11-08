@@ -1,12 +1,13 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::traits::Sandbox;
+use crate::util::shell_escape;
 use async_trait::async_trait;
 use std::ffi::{OsStr, OsString};
 use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_tools::coding_cli::{
-    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, host_native_program,
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, host_native_program_for_command,
 };
 
 pub(crate) struct RuntimeCodingCliExecutor {
@@ -51,6 +52,11 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
 
         let timeout_secs = command.timeout_secs;
         let mut process = if self.use_native_argv {
+            // Fork: the native argv launch bypasses `build_shell_command*`, so
+            // it asks the runtime (and its `runtime.policy_gate`) explicitly.
+            self.runtime
+                .approve_command(&shell_command(&command))
+                .map_err(CodingCliExecutionError::Prepare)?;
             native_command(&command)?
         } else {
             let env_keys: Vec<&OsStr> = command
@@ -107,7 +113,7 @@ fn command_env_snapshot(process: &tokio::process::Command) -> Vec<(OsString, Opt
 fn native_command(
     command: &CodingCliCommand,
 ) -> Result<tokio::process::Command, CodingCliExecutionError> {
-    let mut process = tokio::process::Command::new(host_native_program(&command.program)?);
+    let mut process = tokio::process::Command::new(host_native_program_for_command(command)?);
     process.args(&command.args);
     process.current_dir(&command.working_dir);
     Ok(process)
@@ -121,19 +127,8 @@ fn shell_command(command: &CodingCliCommand) -> String {
         .join(" ")
 }
 
-fn shell_escape(value: &std::ffi::OsStr) -> String {
-    let value = value.to_string_lossy();
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '+'))
-    {
-        value.into_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-#[cfg(test)]
+// The executor's fixtures drive it through `CodexCliTool`.
+#[cfg(all(test, feature = "tool-codex-cli"))]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -152,6 +147,25 @@ mod tests {
 
         let rendered = shell_command(&command);
         assert_eq!(rendered, "codex exec 'hello world' 'it'\\''s safe; really'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_command_uses_the_command_specific_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().unwrap();
+        let launcher = launcher_dir.path().join("codex");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = CodingCliCommand::new("codex", PathBuf::from("."), 1);
+        command.env("PATH", launcher_dir.path().as_os_str());
+
+        let process = native_command(&command).unwrap();
+        assert_eq!(
+            process.as_std().get_program(),
+            launcher.canonicalize().unwrap().as_os_str()
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -415,6 +429,48 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn policy_gate_refusal_blocks_native_argv_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let gate = workspace.path().join("gate");
+        std::fs::write(
+            &gate,
+            "#!/bin/sh\ncat >/dev/null\necho 'native launch refused' >&2\nexit 2\n",
+        )
+        .expect("write gate fixture");
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755))
+            .expect("make gate executable");
+        let marker = workspace.path().join("ran");
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(zeroclaw_config::platform::PolicyGatedRuntime::new(
+                Box::new(FakeRuntime {
+                    seen_command: Arc::new(Mutex::new(None)),
+                }),
+                zeroclaw_config::platform::PolicyGate::from_argv(&[gate
+                    .to_string_lossy()
+                    .into_owned()])
+                .expect("gate argv"),
+            ));
+        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), true);
+        let mut command = CodingCliCommand::new("/bin/sh", workspace.path().to_path_buf(), 5);
+        command
+            .arg("-c")
+            .arg(format!("touch '{}'", marker.display()));
+
+        let error = executor
+            .output(command)
+            .await
+            .expect_err("a refused native launch must not run");
+        assert!(
+            error.to_string().contains("native launch refused"),
+            "unexpected error: {error}"
+        );
+        assert!(!marker.exists(), "a refused native launch must never spawn");
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn unsupported_sandbox_rejects_coding_cli_before_runtime_wrapping() {
@@ -460,7 +516,8 @@ mod tests {
         });
         let executor =
             RuntimeCodingCliExecutor::shared(runtime, Arc::new(ReplacingPwdSandbox), true);
-        let command = CodingCliCommand::new("/bin/false", workspace_path.clone(), 5);
+        let executable = std::env::current_exe().expect("current test executable");
+        let command = CodingCliCommand::new(executable, workspace_path.clone(), 5);
 
         let output = executor
             .output(command)

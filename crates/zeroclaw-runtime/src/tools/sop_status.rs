@@ -11,6 +11,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 pub struct SopStatusTool {
     engine: Arc<Mutex<SopEngine>>,
     collector: Option<Arc<SopMetricsCollector>>,
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 }
 
 impl SopStatusTool {
@@ -18,7 +19,16 @@ impl SopStatusTool {
         Self {
             engine,
             collector: None,
+            session_memory: None,
         }
+    }
+
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
     }
 
     pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
@@ -82,6 +92,12 @@ impl Tool for SopStatusTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let owner = self
+            .session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .and_then(|routed| routed.memory.principal_scope());
+
         let engine = self.engine.lock().map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -96,7 +112,10 @@ impl Tool for SopStatusTool {
 
         // Query specific run
         if let Some(run_id) = run_id {
-            return match engine.get_run(run_id) {
+            return match engine
+                .get_run(run_id)
+                .filter(|run| run.is_accessible_from(owner.as_ref()))
+            {
                 Some(run) => {
                     let mut output = format!(
                         "Run: {}\nSOP: {}\nStatus: {}\nStep: {} of {}\nStarted: {}\n",
@@ -109,6 +128,13 @@ impl Tool for SopStatusTool {
                     );
                     if let Some(ref completed) = run.completed_at {
                         let _ = writeln!(output, "Completed: {completed}");
+                    }
+                    if let Some(ref failure_reason) = run.failure_reason {
+                        let failure_line = crate::i18n::get_required_cli_string_with_args(
+                            "cli-sop-status-failure-reason",
+                            &[("reason", failure_reason)],
+                        );
+                        let _ = writeln!(output, "{failure_line}");
                     }
                     if !run.step_results.is_empty() {
                         let _ = writeln!(output, "\nStep results:");
@@ -142,6 +168,7 @@ impl Tool for SopStatusTool {
         let active: Vec<_> = engine
             .active_runs()
             .values()
+            .filter(|run| run.is_accessible_from(owner.as_ref()))
             .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
             .collect();
 
@@ -160,7 +187,11 @@ impl Tool for SopStatusTool {
         }
 
         // Finished runs
-        let finished = engine.finished_runs(sop_name);
+        let finished: Vec<_> = engine
+            .finished_runs(sop_name)
+            .into_iter()
+            .filter(|run| run.is_accessible_from(owner.as_ref()))
+            .collect();
         if !finished.is_empty() {
             let _ = writeln!(output, "\nFinished runs ({}):", finished.len());
             for run in finished.iter().rev().take(10) {
@@ -176,7 +207,8 @@ impl Tool for SopStatusTool {
         }
 
         // Metrics summary (when requested and collector is available)
-        if include_metrics {
+        // The collector aggregates every owner; it cannot answer a private query.
+        if include_metrics && owner.is_none() {
             if let Some(ref collector) = self.collector {
                 let prefix = sop_name.map_or("sop".to_string(), |n| format!("sop.{n}"));
                 let _ = writeln!(output, "\nMetrics ({prefix}):");
@@ -273,6 +305,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -331,6 +364,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_status_localizes_the_retained_reason() {
+        let engine = engine_with_sops(vec![test_sop("s1")]);
+        let run_id = {
+            let mut engine = engine.lock().unwrap();
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let run_id = match action {
+                crate::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id,
+                other => panic!("expected an executable first step, got {other:?}"),
+            };
+            engine
+                .finish_run(
+                    &run_id,
+                    crate::sop::SopRunStatus::Failed,
+                    Some("disk quota exceeded".to_string()),
+                )
+                .unwrap();
+            run_id
+        };
+        let tool = SopStatusTool::new(engine);
+        let result = tool.execute(json!({"run_id": run_id})).await.unwrap();
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "cli-sop-status-failure-reason",
+            &[("reason", "disk quota exceeded")],
+        );
+        assert!(result.success);
+        assert!(result.output.lines().any(|line| line == expected));
+    }
+
+    #[tokio::test]
     async fn status_unknown_run() {
         let engine = engine_with_sops(vec![]);
         let tool = SopStatusTool::new(engine);
@@ -377,6 +439,8 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Completed,
@@ -384,6 +448,7 @@ mod tests {
             total_steps: 1,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,
@@ -397,6 +462,8 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         collector.record_run_complete(&run);
 
@@ -418,6 +485,8 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Failed,
@@ -425,6 +494,7 @@ mod tests {
             total_steps: 2,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,
@@ -438,6 +508,8 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         collector.record_run_complete(&run);
 

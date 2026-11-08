@@ -2,9 +2,8 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -13,7 +12,36 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
-use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+use zeroclaw_config::schema::StreamReasoningMode;
+#[cfg(test)]
+use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::{ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+
+#[derive(Debug, thiserror::Error)]
+#[error("model_provider stream error: {source}")]
+pub(crate) struct StreamProviderFailure {
+    #[source]
+    source: zeroclaw_api::model_provider::StreamError,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    replay_safe: bool,
+}
+
+impl StreamProviderFailure {
+    pub(crate) fn usage(&self) -> Option<zeroclaw_providers::traits::TokenUsage> {
+        self.usage.clone()
+    }
+
+    pub(crate) fn replay_safe(&self) -> bool {
+        self.replay_safe
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.source,
+            zeroclaw_api::model_provider::StreamError::Terminal(_)
+        )
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -30,6 +58,26 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct SingleToolRoundViolation {
+    pub(super) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for SingleToolRoundViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string(
+            "turn-single-tool-rounds-violation",
+        ))
+    }
+}
+
+impl std::error::Error for SingleToolRoundViolation {}
+
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Request exposure and protocol recognition need distinct tool projections"
+)]
 pub(crate) async fn consume_provider_streaming_response(
     model_provider: &dyn ModelProvider,
     messages: &[ChatMessage],
@@ -40,8 +88,11 @@ pub(crate) async fn consume_provider_streaming_response(
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
+    draft_reasoning: StreamReasoningMode,
+    guard_tools: Option<&[crate::tools::ToolSpec]>,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
+    consume_provider_streaming_response_with_policy(
+        model_provider,
         ChatRequest {
             messages,
             tools: request_tools,
@@ -52,13 +103,48 @@ pub(crate) async fn consume_provider_streaming_response(
         },
         model,
         temperature,
-        zeroclaw_providers::traits::StreamOptions::new(true),
-    );
+        cancellation_token,
+        on_delta,
+        event_tx,
+        strict_tool_parsing,
+        draft_reasoning,
+        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        guard_tools,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Request exposure and protocol recognition need distinct tool projections"
+)]
+pub(crate) async fn consume_provider_streaming_response_with_policy(
+    model_provider: &dyn ModelProvider,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: Option<f64>,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    strict_tool_parsing: bool,
+    draft_reasoning: StreamReasoningMode,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    guard_tools: Option<&[crate::tools::ToolSpec]>,
+) -> Result<StreamedChatOutcome> {
+    let request_tools = request.tools;
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider)
+        .stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_providers::traits::StreamOptions::new(true),
+            policy,
+        );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
     let mut marker_stripper = StreamTerminalMarkerStripper::new();
-    let mut text_guard = StreamTextGuard::new(request_tools);
+    let mut text_guard = StreamTextGuard::new(guard_tools);
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -70,6 +156,7 @@ pub(crate) async fn consume_provider_streaming_response(
     // surfaces, so a non-streaming retry after a stream error overwrites
     // rather than duplicates.
     let mut visible_event_output = false;
+    let mut replay_blocking_activity = false;
     let mut forwarded_text = String::new();
 
     macro_rules! forward_visible {
@@ -139,6 +226,19 @@ pub(crate) async fn consume_provider_streaming_response(
         let event = match event_result {
             Ok(event) => event,
             Err(err) => {
+                if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                    && super::tool_specs::exceeds_single_tool_round(
+                        &outcome.response_text,
+                        outcome.tool_calls.len(),
+                        request_tools.is_some_and(|tools| !tools.is_empty()),
+                        strict_tool_parsing,
+                    )
+                {
+                    return Err(SingleToolRoundViolation {
+                        usage: outcome.usage,
+                    }
+                    .into());
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -149,20 +249,36 @@ pub(crate) async fn consume_provider_streaming_response(
                 );
                 let message = format!("model_provider stream error: {err}");
                 if visible_event_output {
+                    let provider_error = anyhow::Error::msg(message.clone());
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
                     // suppression-buffered output nobody received.
+                    let mut usage = outcome.usage;
+                    if usage.is_none()
+                        && let zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal) =
+                            &err
+                    {
+                        usage = refusal.usage.as_deref().cloned();
+                    }
+                    let cause = zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                        &provider_error,
+                    )
+                    .with_terminal_cause(anyhow::Error::new(err));
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
-                        usage: outcome.usage,
+                        usage,
+                        cause,
                     }
                     .into());
                 }
-                return Err(StreamErrorWithUsage {
-                    message,
+                return Err(StreamProviderFailure {
+                    source: err,
                     usage: outcome.usage,
+                    // Mutable drafts allow the original request's fallback, but
+                    // image-free recovery requires no output on either sink.
+                    replay_safe: !replay_blocking_activity && !outcome.forwarded_live_deltas,
                 }
                 .into());
             }
@@ -173,12 +289,41 @@ pub(crate) async fn consume_provider_streaming_response(
                 outcome.usage = Some(usage);
             }
             StreamEvent::ToolCall(tool_call) => {
+                replay_blocking_activity = true;
                 outcome.tool_calls.push(tool_call);
+            }
+            // Transient, human-readable thinking progress. Surfaced via
+            // TurnEvent::Thinking (draft forwarding stays gated by the
+            // visibility policy). It never enters reasoning_content: the
+            // durable signed replay payload arrives separately via
+            // StreamEvent::ReasoningFinalized.
+            StreamEvent::ThinkingDelta(delta) => {
+                if delta.is_empty() {
+                    continue;
+                }
+                replay_blocking_activity = true;
+                if draft_reasoning == StreamReasoningMode::Full
+                    && let Some(tx) = on_delta
+                {
+                    let _ = tx.send(StreamDelta::Reasoning(delta.clone())).await;
+                }
+                if let Some(tx) = event_tx {
+                    visible_event_output = true;
+                    let _ = tx.send(TurnEvent::Thinking { delta }).await;
+                }
+            }
+            // Durable replay-only finalized reasoning: appended to
+            // reasoning_content for history reconstruction and never
+            // surfaced as user-visible progress.
+            StreamEvent::ReasoningFinalized(payload) => {
+                replay_blocking_activity = true;
+                outcome.reasoning_content.push_str(&payload);
             }
             // Pre-executed tool events are for observability only: they are
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
@@ -197,6 +342,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
@@ -218,7 +364,18 @@ pub(crate) async fn consume_provider_streaming_response(
                 if let Some(reasoning) = chunk.reasoning.as_deref()
                     && !reasoning.is_empty()
                 {
+                    // Legacy readable-reasoning path (providers that stream
+                    // unsigned reasoning text in the chunk): accumulated for
+                    // history and surfaced per the visibility policy. The
+                    // signed Anthropic replay payload never travels here —
+                    // providers must use StreamEvent::ReasoningFinalized for
+                    // that.
                     outcome.reasoning_content.push_str(reasoning);
+                    if draft_reasoning == StreamReasoningMode::Full
+                        && let Some(tx) = on_delta
+                    {
+                        let _ = tx.send(StreamDelta::Reasoning(reasoning.to_string())).await;
+                    }
                     // Thinking is surfaced as its own TurnEvent variant; it
                     // must never reach the Chunk/draft text surfaces.
                     if let Some(tx) = event_tx {
@@ -289,6 +446,23 @@ pub(crate) async fn consume_provider_streaming_response(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+    if text_guard.suppressed_protocol
+        && let Some(diagnostic) = text_guard.suppression
+    {
+        // Attributes carry only the detector and the candidate offset so a
+        // false positive can be diagnosed without logging the withheld text.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "detector": diagnostic.detector,
+                    "candidate_offset": diagnostic.candidate_offset,
+                })),
+            "streaming text guard suppressed protocol candidate"
+        );
+    }
 
     if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
         ::zeroclaw_log::record!(
@@ -331,6 +505,7 @@ mod tests {
     struct ToolThenTextProvider;
 
     struct EmptyStreamProvider;
+    struct ReasoningProvider;
 
     struct CancelAfterUsageProvider {
         cancellation: CancellationToken,
@@ -360,6 +535,20 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ReasoningProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ReasoningProvider"
         }
     }
 
@@ -475,6 +664,128 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelProvider for ReasoningProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk {
+                    delta: "answer<eom>".to_string(),
+                    reasoning: Some("private <eom>".to_string()),
+                    is_final: false,
+                    token_count: 0,
+                })),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    /// Emits the post-repair Anthropic pair: a durable signed replay payload
+    /// plus a transient readable delta, in that order, then text.
+    struct ThinkingSplitProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingSplitProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ThinkingSplitProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingSplitProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ReasoningFinalized(
+                    r#"{"thinking":"secret reasoning","signature":"SIG"}"#.to_string(),
+                )),
+                Ok(StreamEvent::ThinkingDelta("readable progress".to_string())),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("answer"))),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[async_trait]
     impl ModelProvider for CancelAfterUsageProvider {
         async fn chat_with_system(
             &self,
@@ -517,6 +828,7 @@ mod tests {
                                 input_tokens: Some(10),
                                 output_tokens: Some(5),
                                 cached_input_tokens: None,
+                                cache_creation_input_tokens: None,
                             })),
                             1,
                         )),
@@ -557,6 +869,8 @@ mod tests {
             None,
             Some(&event_tx),
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -588,6 +902,8 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect_err("a semantically empty stream must not complete successfully");
@@ -616,6 +932,8 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect_err("cancellation must interrupt the stream");
@@ -656,6 +974,8 @@ mod tests {
             None,
             Some(&event_tx),
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect_err("cancellation must interrupt the stream");
@@ -676,14 +996,204 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn thinking_lifetime_split_keeps_signatures_out_of_visible_events() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+        let outcome = consume_provider_streaming_response(
+            &ThinkingSplitProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Full,
+            None,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(event_tx);
+
+        // Durable payload retained byte-for-byte for replay.
+        assert_eq!(
+            outcome.reasoning_content,
+            r#"{"thinking":"secret reasoning","signature":"SIG"}"#
+        );
+        assert_eq!(outcome.response_text, "answer");
+
+        let mut thinking_events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let TurnEvent::Thinking { delta } = event {
+                thinking_events.push(delta);
+            }
+        }
+        assert_eq!(
+            thinking_events,
+            vec!["readable progress"],
+            "only the transient delta is user-visible thinking"
+        );
+        assert!(
+            !thinking_events
+                .iter()
+                .any(|delta| delta.contains("SIG") || delta.contains("signature")),
+            "the signed replay payload must never reach TurnEvent::Thinking"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_deltas_forward_to_drafts_only_in_full_mode() {
+        // Full mode: the readable delta is forwarded to drafts.
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        consume_provider_streaming_response(
+            &ThinkingSplitProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Full,
+            None,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+        let deltas: Vec<_> = std::iter::from_fn(|| delta_rx.try_recv().ok()).collect();
+        assert!(deltas.iter().any(
+            |delta| matches!(delta, StreamDelta::Reasoning(text) if text == "readable progress")
+        ));
+
+        // Status mode (default): no reasoning in drafts.
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        consume_provider_streaming_response(
+            &ThinkingSplitProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Status,
+            None,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+        while let Some(delta) = delta_rx.recv().await {
+            assert!(
+                !matches!(delta, StreamDelta::Reasoning(_)),
+                "status mode must not expose reasoning deltas"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_status_mode_keeps_reasoning_out_of_draft_deltas() {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let outcome = consume_provider_streaming_response(
+            &ReasoningProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Status,
+            None,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+
+        assert_eq!(outcome.reasoning_content, "private <eom>");
+        while let Some(delta) = delta_rx.recv().await {
+            assert!(
+                !matches!(delta, StreamDelta::Reasoning(_)),
+                "status mode must not expose raw reasoning"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_full_mode_keeps_raw_reasoning_separate_from_terminal_markers() {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let outcome = consume_provider_streaming_response(
+            &ReasoningProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Full,
+            None,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+
+        let deltas: Vec<_> = std::iter::from_fn(|| delta_rx.try_recv().ok()).collect();
+        assert_eq!(outcome.reasoning_content, "private <eom>");
+        assert_eq!(outcome.response_text, "answer");
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Reasoning(text) if text == "private <eom>"
+        )));
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Text(text) if text == "answer"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_off_mode_emits_no_reasoning_draft_delta() {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        consume_provider_streaming_response(
+            &ReasoningProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Off,
+            None,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+
+        while let Some(delta) = delta_rx.recv().await {
+            assert!(
+                !matches!(delta, StreamDelta::Reasoning(_)),
+                "off mode must not expose raw reasoning"
+            );
+        }
+    }
+
     struct MarkerTestProvider {
         text_sequence: Vec<&'static str>,
+        captured_tool_names: std::sync::Mutex<Vec<String>>,
     }
 
     impl MarkerTestProvider {
         fn with_text_sequence(texts: Vec<&'static str>) -> Self {
             Self {
                 text_sequence: texts,
+                captured_tool_names: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -741,11 +1251,17 @@ mod tests {
 
         fn stream_chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            *self.captured_tool_names.lock().unwrap() = request
+                .tools
+                .unwrap_or(&[])
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
             let events: Vec<StreamResult<StreamEvent>> = self
                 .text_sequence
                 .iter()
@@ -754,6 +1270,60 @@ mod tests {
                 .collect();
             Box::pin(futures_util::stream::iter(events))
         }
+    }
+
+    #[tokio::test]
+    async fn deferred_builtin_streaming_call_is_suppressed_without_exposing_its_schema() {
+        let provider = MarkerTestProvider::with_text_sequence(vec![
+            "{\"name\":\"cal",
+            "endar\",\"arguments\":{}}",
+        ]);
+        let exposed = vec![crate::tools::ToolSpec::new(
+            "tool_search",
+            "search",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut callable = exposed.clone();
+        callable.push(crate::tools::ToolSpec::new(
+            "calendar",
+            "events",
+            serde_json::json!({"type": "object"}),
+        ));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            Some(&exposed),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+            Some(&callable),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *provider.captured_tool_names.lock().unwrap(),
+            vec!["tool_search"]
+        );
+        assert!(outcome.suppressed_protocol);
+        assert_eq!(
+            outcome.response_text,
+            "{\"name\":\"calendar\",\"arguments\":{}}"
+        );
+        assert!(outcome.forwarded_visible_text.is_empty());
+        assert!(
+            !std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, TurnEvent::Chunk { .. }))
+        );
+        assert!(
+            !std::iter::from_fn(|| delta_rx.try_recv().ok())
+                .any(|delta| matches!(delta, StreamDelta::Text(_)))
+        );
     }
 
     #[tokio::test]
@@ -770,6 +1340,8 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -795,6 +1367,8 @@ mod tests {
             None,
             None,
             true, // strict_tool_parsing = true
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -903,6 +1477,8 @@ mod tests {
             None,      // on_delta (draft sink)
             Some(&tx), // event_tx
             true,      // strict_tool_parsing = true
+            StreamReasoningMode::Status,
+            None,
         )
         .await;
 
@@ -949,6 +1525,8 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -973,6 +1551,8 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -997,6 +1577,8 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1108,6 +1690,8 @@ mod tests {
                 None,
                 Some(&event_tx),
                 false,
+                StreamReasoningMode::Status,
+                None,
             )
             .await
         });
@@ -1136,5 +1720,140 @@ mod tests {
             outcome.response_text, "A large answer",
             "the final accumulated response strips the terminal marker"
         );
+    }
+
+    struct VisibleOutputThenRefusalProvider {
+        refusal: zeroclaw_api::model_provider::ModelRefusalError,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for VisibleOutputThenRefusalProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleOutputThenRefusalProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for VisibleOutputThenRefusalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let refusal = self.refusal.clone();
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "Visible partial text before refusal",
+                ))),
+                Err(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+                    Box::new(refusal),
+                )),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn visible_output_refusal_preserves_usage_and_retains_typed_cause() {
+        let refusal_usage = TokenUsage {
+            input_tokens: Some(412),
+            output_tokens: Some(15),
+            cached_input_tokens: Some(50),
+            cache_creation_input_tokens: None,
+        };
+        let provider = VisibleOutputThenRefusalProvider {
+            refusal: zeroclaw_api::model_provider::ModelRefusalError {
+                requested_model: "claude-sonnet-4-6".to_string(),
+                category: Some("hate".to_string()),
+                usage: Some(Box::new(refusal_usage)),
+                attempted_candidate: None,
+                attempted_candidate_index: None,
+            },
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let result = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "claude-sonnet-4-6",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("stream must fail with interruption after visible text");
+        let interrupted = err
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("must produce StreamInterruptedAfterOutput");
+        assert_eq!(
+            interrupted.partial_text,
+            "Visible partial text before refusal"
+        );
+        let usage = interrupted
+            .usage
+            .as_ref()
+            .expect("refusal usage must be carried through StreamInterruptedAfterOutput");
+        assert_eq!(usage.input_tokens, Some(412));
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.cached_input_tokens, Some(50));
+        let cause_err = interrupted
+            .cause
+            .terminal_cause()
+            .expect("typed terminal cause must be retained");
+        let refusal = cause_err
+            .downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+            .and_then(|e| match e {
+                zeroclaw_api::model_provider::StreamError::ModelRefusal(r) => Some(r),
+                _ => None,
+            })
+            .expect("terminal cause must contain the typed ModelRefusal");
+        assert_eq!(refusal.category.as_deref(), Some("hate"));
+        assert_eq!(refusal.requested_model, "claude-sonnet-4-6");
+
+        // Drain the event channel and ensure the visible chunk was received before error
+        let mut chunks = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                chunks.push(delta);
+            }
+        }
+        assert_eq!(chunks, vec!["Visible partial text before refusal"]);
     }
 }

@@ -11,40 +11,12 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-/// Thread-safe ring buffer that retains recent events for history replay.
-pub struct EventBuffer {
-    inner: Mutex<VecDeque<serde_json::Value>>,
-    capacity: usize,
-}
-
-impl EventBuffer {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            inner: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity,
-        }
-    }
-
-    /// Push an event into the buffer, evicting the oldest if at capacity.
-    pub fn push(&self, event: serde_json::Value) {
-        let mut buf = self.inner.lock().unwrap();
-        if buf.len() == self.capacity {
-            buf.pop_front();
-        }
-        buf.push_back(event);
-    }
-
-    /// Return a snapshot of all buffered events (oldest first).
-    pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.inner.lock().unwrap().iter().cloned().collect()
-    }
-}
+pub use zeroclaw_runtime::observability::broadcast::{BroadcastObserver, EventBuffer};
+use zeroclaw_runtime::observability::broadcast::{history_events, is_public_event};
 
 /// GET /api/events — SSE event stream.
 ///
@@ -58,14 +30,19 @@ impl EventBuffer {
 /// buffering the secret, which the credential boundary forbids.
 pub async fn handle_sse_events(
     State(state): State<AppState>,
+    dashboard: Option<axum::Extension<std::sync::Arc<crate::dashboard_session::DashboardAuth>>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    use crate::dashboard_session::{OperatorSession, operator_session, session_lost};
+
     // Auth check. When pairing is enabled every subscriber that reaches the
     // stream below has passed the bearer check, so the stream is authenticated;
     // when it is disabled no subscriber is authenticated. That posture decides
     // whether broadcast-only pairing secrets may ride the stream (see
-    // `sse_frame_for_stream`).
+    // `sse_frame_for_stream`). A signed-in administrator session stands in for
+    // the bearer; its stream ends when the session stops admitting it.
     let auth_enforced = state.pairing.require_pairing();
+    let mut session_watch = None;
     if auth_enforced {
         let token = headers
             .get(header::AUTHORIZATION)
@@ -73,14 +50,43 @@ pub async fn handle_sse_events(
             .and_then(|auth| auth.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>",
-            )
-                .into_response();
+        let session = if token.is_empty() {
+            operator_session(dashboard.as_ref().map(|axum::Extension(auth)| auth), &state)
+        } else {
+            OperatorSession::Absent
+        };
+        match session {
+            OperatorSession::Admitted(watch) => session_watch = watch,
+            OperatorSession::Denied(denied) => return denied,
+            OperatorSession::Absent => {
+                if !state.pairing.is_authenticated(token) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized — provide Authorization: Bearer <token>",
+                    )
+                        .into_response();
+                }
+            }
         }
     }
+    // The session is watched from a task of its own, so a response body the
+    // transport stopped polling holds nothing of the session: the stream
+    // keeps only the cancellation that ends it, and the guard that stops the
+    // watching task when the stream is dropped.
+    let session_ended = tokio_util::sync::CancellationToken::new();
+    let direct_ends = session_watch
+        .as_ref()
+        .map(crate::dashboard_session::SessionWatch::direct_ends);
+    let watcher = session_watch.map(|watch| {
+        let ended = session_ended.clone();
+        let watch_state = state.clone();
+        crate::dashboard_session::TaskGuard(zeroclaw_spawn::spawn!(async move {
+            let mut watch = Some(watch);
+            session_lost(&mut watch, &watch_state).await;
+            drop(watch);
+            ended.cancel();
+        }))
+    });
 
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
@@ -95,6 +101,25 @@ pub async fn handle_sse_events(
             }
         },
     );
+
+    // Ends with the dashboard session that opened it; never, otherwise. What
+    // the stream can see by itself ends it at once; the rest (expiry, a
+    // recheck the policy fails) arrives through the watching task.
+    let ended = async move {
+        match direct_ends {
+            Some((session_cancelled, mut stopping)) => tokio::select! {
+                () = session_ended.cancelled() => {}
+                () = session_cancelled.cancelled() => {}
+                () = crate::dashboard_session::SessionWatch::generation_stopped(&mut stopping) => {}
+            },
+            None => session_ended.cancelled().await,
+        }
+    };
+    let stream = futures_util::StreamExt::take_until(stream, ended);
+    let stream = futures_util::StreamExt::map(stream, move |event| {
+        let _watching = &watcher;
+        event
+    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -140,332 +165,17 @@ pub async fn handle_events_history(
 }
 
 fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
-    let events: Vec<_> = buffer
-        .snapshot()
-        .into_iter()
-        .filter(is_public_sse_event)
-        // Pairing credentials are broadcast-only and delivery-once: they are
-        // never replayed from history, so a client that connects after pairing
-        // cannot recover the QR payload / pair code. Login events bypass the
-        // observer that fills this buffer, so a marked frame should never be
-        // here in the first place — this filter fails closed as defense in
-        // depth for the non-persistent credential boundary.
-        .filter(|event| !zeroclaw_log::frame_carries_ephemeral_credentials(event))
-        .collect();
-    serde_json::json!({ "events": events })
+    serde_json::json!({ "events": history_events(buffer) })
 }
 
 fn is_public_sse_event(event: &serde_json::Value) -> bool {
-    if event.get("source").and_then(serde_json::Value::as_str) == Some("observability") {
-        return true;
-    }
-    event
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .is_none()
-}
-
-pub(crate) struct BroadcastObserver {
-    tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    buffer: Arc<EventBuffer>,
-}
-
-impl BroadcastObserver {
-    pub(crate) fn new(
-        tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-        buffer: Arc<EventBuffer>,
-    ) -> Self {
-        Self { tx, buffer }
-    }
-}
-
-impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
-    fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
-        // Helper for optional string fields
-        fn add_optional_string(json: &mut serde_json::Value, key: &str, value: &Option<String>) {
-            if let Some(value) = value {
-                json[key] = serde_json::Value::String(value.clone());
-            }
-        }
-
-        // Recording into the primary observer (logs / Prometheus) is the
-        // responsibility of whoever built the event source; `TeeObserver`
-        // takes care of that fan-out. Here we only translate to JSON and
-        // ship to SSE subscribers.
-        let json = match event {
-            zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
-                model_provider,
-                model,
-                messages_count,
-                channel,
-                agent_alias,
-                parent_agent_alias,
-                turn_id,
-            } => {
-                let mut json = serde_json::json!({
-                    "type": "llm_request",
-                    "source": "observability",
-                    "model_provider": model_provider,
-                    "model": model,
-                    "messages_count": messages_count,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                add_optional_string(&mut json, "channel", channel);
-                add_optional_string(&mut json, "agent_alias", agent_alias);
-                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
-                add_optional_string(&mut json, "turn_id", turn_id);
-                json
-            }
-            zeroclaw_runtime::observability::ObserverEvent::ToolCall {
-                tool,
-                duration,
-                success,
-                channel,
-                agent_alias,
-                parent_agent_alias,
-                turn_id,
-                ..
-            } => {
-                let mut json = serde_json::json!({
-                    "type": "tool_call",
-                    "source": "observability",
-                    "tool": tool,
-                    "duration_ms": duration.as_millis(),
-                    "success": success,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                add_optional_string(&mut json, "channel", channel);
-                add_optional_string(&mut json, "agent_alias", agent_alias);
-                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
-                add_optional_string(&mut json, "turn_id", turn_id);
-                json
-            }
-            zeroclaw_runtime::observability::ObserverEvent::ToolCallStart {
-                tool,
-                channel,
-                agent_alias,
-                parent_agent_alias,
-                turn_id,
-                ..
-            } => {
-                let mut json = serde_json::json!({
-                    "type": "tool_call_start",
-                    "source": "observability",
-                    "tool": tool,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                add_optional_string(&mut json, "channel", channel);
-                add_optional_string(&mut json, "agent_alias", agent_alias);
-                add_optional_string(&mut json, "parent_agent_alias", parent_agent_alias);
-                add_optional_string(&mut json, "turn_id", turn_id);
-                json
-            }
-            zeroclaw_runtime::observability::ObserverEvent::Error { component, message } => {
-                serde_json::json!({
-                    "type": "error",
-                    "source": "observability",
-                    "component": component,
-                    "message": message,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-            }
-            zeroclaw_runtime::observability::ObserverEvent::AgentStart {
-                model_provider,
-                model,
-                channel,
-                agent_alias,
-                turn_id,
-            } => {
-                let mut json = serde_json::json!({
-                    "type": "agent_start",
-                    "source": "observability",
-                    "model_provider": model_provider,
-                    "model": model,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                add_optional_string(&mut json, "channel", channel);
-                add_optional_string(&mut json, "agent_alias", agent_alias);
-                add_optional_string(&mut json, "turn_id", turn_id);
-                json
-            }
-            zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                model_provider,
-                model,
-                duration,
-                tokens_used,
-                cost_usd,
-                channel,
-                agent_alias,
-                turn_id,
-            } => {
-                let (tokens_total, input_tokens, output_tokens) = tokens_used
-                    .as_ref()
-                    .map(|usage| {
-                        (
-                            Some(usage.input_tokens.saturating_add(usage.output_tokens)),
-                            Some(usage.input_tokens),
-                            Some(usage.output_tokens),
-                        )
-                    })
-                    .unwrap_or((None, None, None));
-                let mut json = serde_json::json!({
-                    "type": "agent_end",
-                    "source": "observability",
-                    "model_provider": model_provider,
-                    "model": model,
-                    "duration_ms": duration.as_millis(),
-                    "tokens_used": tokens_total,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cost_usd": cost_usd,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                add_optional_string(&mut json, "channel", channel);
-                add_optional_string(&mut json, "agent_alias", agent_alias);
-                add_optional_string(&mut json, "turn_id", turn_id);
-                json
-            }
-            zeroclaw_runtime::observability::ObserverEvent::HistoryTrimmed {
-                dropped_messages,
-                kept_turns,
-                reason,
-                channel,
-                agent_alias,
-                turn_id,
-            } => {
-                let mut json = serde_json::json!({
-                    "type": "history_trimmed",
-                    "source": "observability",
-                    "dropped_messages": dropped_messages,
-                    "kept_turns": kept_turns,
-                    "reason": reason,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                add_optional_string(&mut json, "channel", channel);
-                add_optional_string(&mut json, "agent_alias", agent_alias);
-                add_optional_string(&mut json, "turn_id", turn_id);
-                json
-            }
-            _ => return, // Skip events we don't broadcast
-        };
-
-        self.buffer.push(json.clone());
-        let _ = self.tx.send(json);
-    }
-
-    fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
-        // Metrics are not broadcast over SSE; the primary observer records them.
-    }
-
-    fn name(&self) -> &str {
-        "broadcast"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+    is_public_event(event)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_runtime::observability::{Observer, ObserverEvent};
-
-    // The broadcast hook is process-wide; serialize hook-touching tests
-    // within this test binary so they don't observe each other's state.
-    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    fn make_broadcast() -> (
-        Arc<BroadcastObserver>,
-        tokio::sync::broadcast::Receiver<serde_json::Value>,
-        Arc<EventBuffer>,
-    ) {
-        let (tx, rx) = tokio::sync::broadcast::channel(16);
-        let buffer = Arc::new(EventBuffer::new(16));
-        let obs = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
-        (obs, rx, buffer)
-    }
-
-    #[test]
-    fn tool_call_event_is_broadcast_and_buffered() {
-        let (obs, mut rx, buffer) = make_broadcast();
-
-        obs.record_event(&ObserverEvent::ToolCall {
-            parent_agent_alias: None,
-            tool: "shell".into(),
-            tool_call_id: None,
-            duration: std::time::Duration::from_millis(42),
-            success: true,
-            arguments: None,
-            result: None,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
-        });
-
-        let value = rx.try_recv().expect("event should be broadcast");
-        assert_eq!(value["type"], "tool_call");
-        assert_eq!(value["tool"], "shell");
-        assert_eq!(value["success"], true);
-
-        let snap = buffer.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0]["type"], "tool_call");
-    }
-
-    #[test]
-    fn tool_call_start_event_is_broadcast() {
-        let (obs, mut rx, _buffer) = make_broadcast();
-
-        obs.record_event(&ObserverEvent::ToolCallStart {
-            parent_agent_alias: None,
-            tool: "mcp_filesystem__read_file".into(),
-            tool_call_id: None,
-            arguments: None,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
-        });
-
-        let value = rx.try_recv().expect("event should be broadcast");
-        assert_eq!(value["type"], "tool_call_start");
-        assert_eq!(value["tool"], "mcp_filesystem__read_file");
-    }
-
-    #[test]
-    fn history_trimmed_event_is_broadcast_with_cut_accounting() {
-        let (obs, mut rx, _buffer) = make_broadcast();
-
-        obs.record_event(&ObserverEvent::HistoryTrimmed {
-            dropped_messages: 12,
-            kept_turns: 1,
-            reason: "context token budget exceeded".into(),
-            channel: Some("wss".into()),
-            agent_alias: Some("trimtest".into()),
-            turn_id: Some("turn-1".into()),
-        });
-
-        let value = rx.try_recv().expect("history_trimmed must broadcast");
-        assert_eq!(value["type"], "history_trimmed");
-        assert_eq!(value["source"], "observability");
-        assert_eq!(value["dropped_messages"], 12);
-        assert_eq!(value["kept_turns"], 1);
-        assert_eq!(value["reason"], "context token budget exceeded");
-        assert_eq!(value["channel"], "wss");
-        assert_eq!(value["agent_alias"], "trimtest");
-        assert_eq!(value["turn_id"], "turn-1");
-        assert!(is_public_sse_event(&value));
-    }
-
-    #[test]
-    fn unmapped_events_are_skipped() {
-        let (obs, mut rx, buffer) = make_broadcast();
-
-        obs.record_event(&ObserverEvent::HeartbeatTick);
-
-        assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
-        assert!(buffer.snapshot().is_empty());
-    }
+    use std::sync::Arc;
 
     #[test]
     fn session_scoped_events_are_not_public_sse_events() {
@@ -584,217 +294,6 @@ mod tests {
         assert!(is_public_sse_event(&obs));
     }
 
-    #[test]
-    fn broadcast_agent_end_includes_turn_metadata_and_token_total() {
-        let (obs, mut rx, _buffer) = make_broadcast();
-
-        obs.record_event(&ObserverEvent::AgentEnd {
-            model_provider: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
-            duration: std::time::Duration::from_millis(42),
-            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
-                input_tokens: 12,
-                output_tokens: 34,
-            }),
-            cost_usd: Some(0.001),
-            channel: Some("wss".into()),
-            agent_alias: Some("default".into()),
-            turn_id: Some("turn-1".into()),
-        });
-
-        let value = rx.try_recv().expect("event should be broadcast");
-        assert_eq!(value["type"], "agent_end");
-        assert_eq!(value["source"], "observability");
-        assert_eq!(value["tokens_used"], 46);
-        assert_eq!(value["input_tokens"], 12);
-        assert_eq!(value["output_tokens"], 34);
-        assert_eq!(value["channel"], "wss");
-        assert_eq!(value["agent_alias"], "default");
-        assert_eq!(value["turn_id"], "turn-1");
-    }
-
-    #[test]
-    fn broadcast_observer_tags_every_event_with_observability_source() {
-        // The chat-WS filter relies on this tag as a defense-in-depth check
-        // (any future emitter that forgets to set session_id still gets
-        // routed correctly). Cover every variant the observer broadcasts.
-        let (obs, mut rx, _buffer) = make_broadcast();
-
-        let cases: Vec<ObserverEvent> = vec![
-            ObserverEvent::LlmRequest {
-                parent_agent_alias: None,
-                model_provider: "p".into(),
-                model: "m".into(),
-                messages_count: 0,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            },
-            ObserverEvent::ToolCall {
-                parent_agent_alias: None,
-                tool: "shell".into(),
-                tool_call_id: None,
-                duration: std::time::Duration::from_millis(1),
-                success: true,
-                arguments: None,
-                result: None,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            },
-            ObserverEvent::ToolCallStart {
-                parent_agent_alias: None,
-                tool: "shell".into(),
-                tool_call_id: None,
-                arguments: None,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            },
-            ObserverEvent::Error {
-                component: "any".into(),
-                message: "boom".into(),
-            },
-            ObserverEvent::AgentStart {
-                model_provider: "p".into(),
-                model: "m".into(),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            },
-            ObserverEvent::AgentEnd {
-                model_provider: "p".into(),
-                model: "m".into(),
-                duration: std::time::Duration::from_millis(1),
-                tokens_used: None,
-                cost_usd: None,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            },
-        ];
-        for ev in cases {
-            obs.record_event(&ev);
-            let v = rx.try_recv().expect("event must broadcast");
-            assert_eq!(
-                v["source"], "observability",
-                "every BroadcastObserver event must be tagged source=observability: {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn factory_observer_events_reach_broadcast_hook() {
-        let _guard = HOOK_TEST_LOCK.lock();
-
-        zeroclaw_runtime::observability::clear_broadcast_hook();
-
-        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let buffer = Arc::new(EventBuffer::new(16));
-        let bo: Arc<dyn Observer> = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
-        zeroclaw_runtime::observability::set_broadcast_hook(bo);
-
-        // Same factory call site as `process_message` in the agent loop.
-        let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: zeroclaw_config::schema::ObservabilityBackend::None,
-            ..Default::default()
-        };
-        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
-
-        observer.record_event(&ObserverEvent::ToolCall {
-            parent_agent_alias: None,
-            tool: "shell".into(),
-            tool_call_id: None,
-            duration: std::time::Duration::from_millis(7),
-            success: true,
-            arguments: None,
-            result: None,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
-        });
-
-        let value = rx
-            .try_recv()
-            .expect("factory-built observer event must reach the SSE broadcast channel");
-        assert_eq!(value["type"], "tool_call");
-        assert_eq!(value["tool"], "shell");
-        assert_eq!(value["success"], true);
-
-        let snap = buffer.snapshot();
-        assert_eq!(
-            snap.len(),
-            1,
-            "broadcast events must also land in the buffer"
-        );
-
-        zeroclaw_runtime::observability::clear_broadcast_hook();
-    }
-
-    /// Pins the `/api/events/history` surface for the turn-lifecycle
-    /// brackets: `AgentStart`/`AgentEnd` recorded through a factory-built
-    /// observer (the path channel and daemon turns take) must land in the
-    /// history buffer as public `agent_start`/`agent_end` frames — the
-    /// contract external pollers (e.g. ZeroHome) rely on to detect
-    /// in-flight turns.
-    #[test]
-    fn agent_lifecycle_events_reach_history_payload_via_broadcast_hook() {
-        let _guard = HOOK_TEST_LOCK.lock();
-
-        zeroclaw_runtime::observability::clear_broadcast_hook();
-
-        let (tx, _rx) = tokio::sync::broadcast::channel(16);
-        let buffer = Arc::new(EventBuffer::new(16));
-        let bo: Arc<dyn Observer> = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
-        zeroclaw_runtime::observability::set_broadcast_hook(bo);
-
-        // Same factory call site as the channel orchestrator and agent loop.
-        let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: zeroclaw_config::schema::ObservabilityBackend::None,
-            ..Default::default()
-        };
-        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
-
-        observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: "p".into(),
-            model: "m".into(),
-            channel: Some("telegram".into()),
-            agent_alias: Some("default".into()),
-            turn_id: Some("turn-1".into()),
-        });
-        observer.record_event(&ObserverEvent::AgentEnd {
-            model_provider: "p".into(),
-            model: "m".into(),
-            duration: std::time::Duration::from_millis(5),
-            tokens_used: None,
-            cost_usd: None,
-            channel: Some("telegram".into()),
-            agent_alias: Some("default".into()),
-            turn_id: Some("turn-1".into()),
-        });
-
-        let payload = history_events_payload(&buffer);
-        let events = payload["events"].as_array().expect("events array");
-        assert_eq!(
-            events.len(),
-            2,
-            "both brackets must be retained: {events:?}"
-        );
-        assert_eq!(events[0]["type"], "agent_start");
-        assert_eq!(events[1]["type"], "agent_end");
-        for event in events {
-            assert_eq!(event["source"], "observability");
-            assert!(
-                event["timestamp"].is_string(),
-                "history frames must carry a timestamp: {event}"
-            );
-            assert_eq!(event["turn_id"], "turn-1");
-            assert_eq!(event["channel"], "telegram");
-        }
-
-        zeroclaw_runtime::observability::clear_broadcast_hook();
-    }
-
     /// Warning follow-up (non-persistent boundary): even if a credential-marked
     /// login frame reached the replay buffer, `/api/events/history` must
     /// withhold it. Pairing secrets are delivery-once — a client that connects
@@ -876,7 +375,9 @@ mod tests {
     ) -> Arc<zeroclaw_runtime::security::pairing::PairingGuard> {
         let owned: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
         Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
-            require, &owned,
+            require,
+            &owned,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ))
     }
 

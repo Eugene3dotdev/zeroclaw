@@ -97,7 +97,7 @@ async fn mqtt_listener_preserves_mqtt311_credentials_keepalive_and_all_subscript
         let (engine, audit) = listener_state();
         timeout(DEADLINE, async {
             tokio::select! {
-                result = run_mqtt_sop_listener(&config, engine, audit) => {
+                result = run_mqtt_sop_listener(&config, engine, audit, None) => {
                     panic!("listener exited before subscription: {result:?}");
                 }
                 () = async {
@@ -276,7 +276,7 @@ async fn mqtt_tls_listener_reconnect_never_falls_back_to_plaintext() {
     let (engine, audit) = listener_state();
     timeout(DEADLINE, async {
         tokio::select! {
-            result = run_mqtt_sop_listener(&config, engine, audit) => {
+            result = run_mqtt_sop_listener(&config, engine, audit, None) => {
                 panic!("listener exited before TLS retry: {result:?}");
             }
             () = async {

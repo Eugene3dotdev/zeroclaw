@@ -18,12 +18,7 @@ On launch:
    `web/src/App.tsx`) sends first-time users — no agents yet, Quickstart never
    completed — to `/quickstart`. Returning users land on the dashboard.
 
-> The app looks for a gateway on `127.0.0.1:42617`: it reuses a running
-> daemon, or spawns `zeroclaw daemon` itself (preferring a kernel bundled
-> next to the app executable, then `PATH` and the common install dirs — see
-> `src/daemon.rs::find_zeroclaw_binary`). The self-contained installer below
-> bundles the kernel as a Tauri sidecar — the "full experience" distribution
-> from architecture RFC fnd-001, D5.
+> The app looks for a gateway on `127.0.0.1:42617`: it reuses a running daemon, or starts the discovered kernel with `zeroclaw service run-desktop-daemon --port 42617` (preferring a kernel bundled next to the app executable, then `PATH` and the common install dirs — see `src/daemon.rs::find_zeroclaw_binary`). Before launch, Desktop verifies that the kernel accepts this supervisor command. An externally installed kernel must therefore support the Desktop supervisor command; an older unsupported kernel produces an actionable startup error instead of falling back to an uncaptured daemon. The self-contained installer below bundles the matching kernel as a Tauri sidecar — the "full experience" distribution from architecture RFC fnd-001, D5.
 >
 > **Run `zeroclaw daemon`, not `zeroclaw gateway start`.** Both serve the
 > dashboard on 42617, but only the daemon attaches the supervisor that powers
@@ -31,6 +26,8 @@ On launch:
 > a standalone `gateway start` has no supervisor and returns
 > `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
 > won't go live until the process is restarted. The daemon hot-reloads instead.
+
+The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows canonical config resolution precedence: `ZEROCLAW_CONFIG_DIR`, then `ZEROCLAW_DATA_DIR`, then deprecated `ZEROCLAW_WORKSPACE`, then Homebrew/default resolution. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
 
 ## Self-contained build (bundled kernel)
 
@@ -107,6 +104,16 @@ open /Applications/ZeroClaw.app
   normal dashboard, not the Quickstart.
 - Quit from the tray → relaunch → splash → dashboard again (tray icon persists
   in the menu bar).
+- Close the dashboard window: the app keeps running in the tray. Clicking the
+  tray icon, choosing **Show Dashboard** or **Agent Chat**, or launching the
+  app again brings the same window back, restored if it was minimized and
+  without reloading the page.
+- Close the splash before the dashboard opens: the same routes reopen the
+  splash, which shows any startup error again (such as a missing `zeroclaw`
+  binary) and hands off to the dashboard once the gateway is healthy.
+- **Quit ZeroClaw** in the tray menu ends the app and removes the tray icon. A
+  daemon the app started keeps running, and the next launch reuses it.
+- Inspect `<config-dir>/logs/zeroclaw-desktop-daemon.log` after startup to verify combined stdout/stderr capture; the file stays at or below 8 MiB and keeps the newest tail during continuous output.
 
 ### Native command boundary
 
@@ -119,6 +126,8 @@ ACL design.
 
 The app builds and runs the same splash → gateway → Quickstart flow. Bundle
 targets are unchanged (`.deb`/`.AppImage` on Linux, `.exe`/`.msi` on Windows).
+The window checks above apply on both. Linux tray icons report no clicks, so
+use the tray menu there.
 Screen capture and AppleScript capabilities remain macOS-only; the other
 platforms register stubs that return an unsupported-platform error.
 
@@ -131,10 +140,17 @@ cargo tauri build          # native build on each platform
 #   cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-## CI matrix to add (separate issue)
+## CI coverage
 
-```yaml
-# Suggested when #6501 lands — run all three at minimum on cargo check
-matrix:
-  os: [macos-14, ubuntu-22.04, windows-2022]
+- `.github/workflows/desktop-check.yml` runs clippy and `cargo test -p zeroclaw-desktop`
+  on macOS, Linux, and Windows for PRs that touch `apps/tauri/**`.
+- The installers are built only by the desktop jobs in
+  `.github/workflows/release-stable-manual.yml`, during a stable release. Before bundling,
+  each job checks that the staged kernel serves the dashboard: Linux and Windows run
+  `scripts/desktop/smoke-dashboard.sh`, and macOS runs an equivalent inline step.
+
+To run the dashboard smoke locally against a staged kernel:
+
+```sh
+scripts/desktop/smoke-dashboard.sh apps/tauri/binaries/zeroclaw-<target-triple>
 ```

@@ -64,6 +64,38 @@ pub use zeroclaw_api::model_provider::{
     MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams,
 };
 
+/// User-facing control for Anthropic's `thinking.display` beta
+/// (`thinking-display-updates-2026-08-18`), which shapes how thinking blocks
+/// come back: omitted, as progress updates, or summarized. `Off` (the default)
+/// leaves the field out of requests entirely, matching pre-beta behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplayMode {
+    #[default]
+    Off,
+    Omitted,
+    Updates,
+    Summarized,
+}
+
+impl HasPropKind for ThinkingDisplayMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
+impl ThinkingDisplayMode {
+    /// Map to the wire-level `ThinkingDisplay`. `Off` maps to `None` so
+    /// requests with the default setting carry no `display` key at all.
+    pub fn to_display(self) -> Option<zeroclaw_api::model_provider::ThinkingDisplay> {
+        match self {
+            Self::Off => None,
+            Self::Omitted => Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+            Self::Updates => Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+            Self::Summarized => Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        }
+    }
+}
+
 /// Configuration for thinking/reasoning level control.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -76,6 +108,10 @@ pub struct ThinkingConfig {
     pub native_thinking: bool,
     #[serde(default)]
     pub budget_tokens: HashMap<String, u32>,
+    /// Anthropic `thinking.display` beta control. Only meaningful when
+    /// `native_thinking` is enabled and the provider is Anthropic.
+    #[serde(default)]
+    pub display: ThinkingDisplayMode,
 }
 
 impl Default for ThinkingConfig {
@@ -84,6 +120,7 @@ impl Default for ThinkingConfig {
             default_level: ThinkingLevel::Medium,
             native_thinking: false,
             budget_tokens: HashMap::new(),
+            display: ThinkingDisplayMode::Off,
         }
     }
 }
@@ -181,6 +218,40 @@ impl Default for AutoClassifyConfig {
     }
 }
 
+/// Whether an effort-routed turn may leave the configured local route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CloudEscalationPolicy {
+    /// Keep every automatically classified turn on the local route.
+    #[default]
+    Never,
+    /// Send complex turns to the configured cloud route.
+    Auto,
+}
+
+impl HasPropKind for CloudEscalationPolicy {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
+/// Opt-in deterministic local/cloud routing for one runtime profile.
+///
+/// The hints reference existing `[[model_routes]]` entries; provider
+/// credentials, models, and reliability remain owned by those entries and
+/// their provider profiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.effort_routing"]
+pub struct EffortRoutingConfig {
+    /// Exact `[[model_routes]].hint` used for simple and standard turns.
+    pub local_hint: String,
+    /// Exact `[[model_routes]].hint` eligible for complex turns.
+    pub cloud_hint: String,
+    /// Whether complex turns may select `cloud_hint`; defaults to `never`.
+    #[serde(default)]
+    pub cloud_escalation: CloudEscalationPolicy,
+}
+
 fn default_min_quality_score() -> f64 {
     0.5
 }
@@ -211,7 +282,7 @@ impl Default for EvalConfig {
 }
 
 fn default_eval_suite_dir() -> String {
-    "evals".to_string()
+    "evals/regression".to_string()
 }
 fn default_eval_mode() -> String {
     "replay".to_string()
@@ -225,6 +296,9 @@ fn default_eval_mode() -> String {
 #[prefix = "eval"]
 pub struct EvalHarnessConfig {
     /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    /// Defaults to `evals/regression`, the CI-gating suite. Planned sibling suites
+    /// `evals/capability/` (tracked, non-gating) and `evals/live/` (real-provider,
+    /// never in CI) live alongside it.
     #[serde(default = "default_eval_suite_dir")]
     pub suite_dir: String,
     /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
@@ -300,9 +374,6 @@ pub struct ContextCompressionConfig {
     /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
-    /// DEPRECATED bare model id retained as a compatibility fallback.
-    #[serde(default)]
-    pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
     pub identifier_policy: String,
     #[serde(default = "default_tool_result_retrim_chars")]
@@ -323,7 +394,6 @@ impl Default for ContextCompressionConfig {
             source_max_chars: default_source_max_chars(),
             timeout_secs: default_cc_timeout_secs(),
             summary_provider: crate::providers::ModelProviderRef::default(),
-            summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
             tool_result_trim_exempt: Vec::new(),
@@ -508,7 +578,11 @@ pub struct EmailConfig {
     pub imap_port: u16,
     #[serde(default = "default_imap_folder")]
     pub imap_folder: String,
-    pub smtp_host: String,
+    /// SMTP relay host. Optional: when omitted (or blank) the channel stays
+    /// read-write on IMAP (inbound processing, flag updates) but refuses to
+    /// send, so an operator can grant mailbox access without outbound email.
+    #[serde(default)]
+    pub smtp_host: Option<String>,
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
     #[serde(default = "default_true")]
@@ -521,7 +595,11 @@ pub struct EmailConfig {
     pub username: String,
     #[secret]
     pub password: String,
-    pub from_address: String,
+    /// From identity for outbound mail. Optional for the same reason as
+    /// `smtp_host`: outbound sending requires both, and inbound-only channels
+    /// never build an outbound message.
+    #[serde(default)]
+    pub from_address: Option<String>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     /// Polling interval used when the IMAP server does not advertise the IDLE
@@ -567,14 +645,14 @@ impl Default for EmailConfig {
             imap_host: String::new(),
             imap_port: default_imap_port(),
             imap_folder: default_imap_folder(),
-            smtp_host: String::new(),
+            smtp_host: None,
             smtp_port: default_smtp_port(),
             smtp_tls: true,
             smtp_username: None,
             smtp_password: None,
             username: String::new(),
             password: String::new(),
-            from_address: String::new(),
+            from_address: None,
             idle_timeout_secs: default_idle_timeout(),
             poll_interval_secs: default_poll_interval_secs(),
             default_subject: default_subject(),
@@ -583,6 +661,66 @@ impl Default for EmailConfig {
             html_body: true,
             oauth2: None,
             observer_mode: false,
+        }
+    }
+}
+
+/// Configuration state of the outbound SMTP pair on an [`EmailConfig`].
+///
+/// `smtp_host` and `from_address` are both optional so an IMAP-only mailbox
+/// can be read without granting send access, and sending needs BOTH. This is
+/// the single definition of that rule: the channel gate (`send`, `listen`'s
+/// inbound-only notice, `supports_outbound_send`) and the
+/// `email_smtp_partially_configured` warning both classify through it, so
+/// `config validate` and the runtime cannot drift into disagreeing about
+/// whether an alias can send. Blank values count as unset so a legacy
+/// `field = ""` stays inbound-only instead of pointing SMTP at an empty host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboundSmtp {
+    /// Both halves are set: the channel can send.
+    Configured,
+    /// Neither half is set: the supported inbound-only mode.
+    InboundOnly,
+    /// Exactly one half is set, so the operator configured sending that the
+    /// channel cannot perform. Values are the TOML keys under the alias.
+    Partial {
+        /// The half that is set.
+        set: &'static str,
+        /// The half that is missing.
+        missing: &'static str,
+    },
+}
+
+impl EmailConfig {
+    /// Whether this alias can send mail.
+    ///
+    /// The canonical answer to "is outbound configured": `EmailChannel` gates
+    /// `send`, its startup notice and `supports_outbound_send` on this, and
+    /// `validate_email_smtp_semantics` reads the same classification, so the
+    /// warning cannot claim sending is disabled for an alias that can send.
+    #[must_use]
+    pub fn outbound_smtp_configured(&self) -> bool {
+        matches!(self.outbound_smtp(), OutboundSmtp::Configured)
+    }
+
+    /// Classify the outbound SMTP pair. See [`OutboundSmtp`].
+    #[must_use]
+    pub(crate) fn outbound_smtp(&self) -> OutboundSmtp {
+        let set = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+        match (
+            set(self.smtp_host.as_deref()),
+            set(self.from_address.as_deref()),
+        ) {
+            (true, true) => OutboundSmtp::Configured,
+            (false, false) => OutboundSmtp::InboundOnly,
+            (true, false) => OutboundSmtp::Partial {
+                set: "smtp_host",
+                missing: "from_address",
+            },
+            (false, true) => OutboundSmtp::Partial {
+                set: "from_address",
+                missing: "smtp_host",
+            },
         }
     }
 }
@@ -830,6 +968,44 @@ mod tests {
             .has_required_credentials()
         );
         assert!(!VoiceCallConfig::default().has_required_credentials());
+    }
+
+    #[test]
+    fn email_outbound_smtp_classification_is_single_source() {
+        let cfg = |host: Option<&str>, from: Option<&str>| EmailConfig {
+            smtp_host: host.map(str::to_string),
+            from_address: from.map(str::to_string),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg(Some("smtp.example.com"), Some("bot@example.com")).outbound_smtp(),
+            OutboundSmtp::Configured
+        );
+        assert_eq!(cfg(None, None).outbound_smtp(), OutboundSmtp::InboundOnly);
+        assert_eq!(
+            cfg(Some("smtp.example.com"), None).outbound_smtp(),
+            OutboundSmtp::Partial {
+                set: "smtp_host",
+                missing: "from_address"
+            }
+        );
+        assert_eq!(
+            cfg(None, Some("bot@example.com")).outbound_smtp(),
+            OutboundSmtp::Partial {
+                set: "from_address",
+                missing: "smtp_host"
+            }
+        );
+
+        // Blank counts as unset, matching the legacy `field = ""` handling that
+        // keeps such configs inbound-only rather than relaying to an empty host.
+        assert_eq!(
+            cfg(Some("   "), Some("")).outbound_smtp(),
+            OutboundSmtp::InboundOnly
+        );
+        assert!(!cfg(Some("   "), Some("bot@example.com")).outbound_smtp_configured());
+        assert!(cfg(Some("smtp.example.com"), Some("bot@example.com")).outbound_smtp_configured());
     }
 
     #[test]

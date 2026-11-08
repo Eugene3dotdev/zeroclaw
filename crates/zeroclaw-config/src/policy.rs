@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroclaw_api::runtime_traits::ShellDialect;
@@ -80,12 +80,14 @@ impl ActionTracker {
         state.committed.len()
     }
 
+    #[cfg(test)]
     fn used(&self) -> usize {
+        self.used_at(Instant::now())
+    }
+
+    fn used_at(&self, now: Instant) -> usize {
         let mut state = self.state.lock();
-        retain_actions_after(
-            &mut state.committed,
-            Instant::now().checked_sub(ACTION_WINDOW),
-        );
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
         state.committed.len() + state.in_flight
     }
 
@@ -261,8 +263,12 @@ impl PerSenderTracker {
     }
 
     pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
+        self.is_exhausted_at(key, max, Instant::now())
+    }
+
+    fn is_exhausted_at(&self, key: &str, max: u32, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
-        let used = buckets.get(key).map_or(0, ActionTracker::used);
+        let used = buckets.get(key).map_or(0, |tracker| tracker.used_at(now));
         if used == 0 {
             buckets.remove(key);
         }
@@ -370,6 +376,10 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Container image for the docker sandbox backend. `None` inherits the
+    /// built-in default; carried here so status surfaces report the image the
+    /// sandbox will actually run rather than assuming the default.
+    pub sandbox_image: Option<String>,
     pub tracker: PerSenderTracker,
 }
 
@@ -521,6 +531,109 @@ fn path_contains(parent: &Path, child: &Path) -> bool {
     canonical_child.starts_with(&canonical_parent) || child.starts_with(parent)
 }
 
+/// Depth, in normal path components, of `prefix` when `target` starts with it.
+/// Returns `None` when `prefix` is not a prefix of `target`.
+///
+/// Used to rank competing allow/deny matches by specificity so the most
+/// specific rule wins: an explicit `forbidden_paths` entry nested under a
+/// broad `allowed_roots` entry denies, while an `allowed_roots` entry nested
+/// under a broad default forbidden root (e.g. `/home`) still allows.
+fn prefix_match_depth(prefix: &Path, target: &Path) -> Option<usize> {
+    if target.starts_with(prefix) {
+        Some(
+            prefix
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Namespace in which competing path-policy rules are compared.
+///
+/// Lexical checks compare the configured spellings because they have not yet
+/// resolved filesystem aliases. Resolved checks compare every rule after
+/// symlink resolution so an alias cannot make an equivalent deny disappear.
+#[derive(Clone, Copy)]
+enum PathMatchNamespace {
+    Configured,
+    Resolved,
+}
+
+fn namespace_prefix_match_depth(
+    prefix: &Path,
+    target: &Path,
+    namespace: PathMatchNamespace,
+) -> Option<usize> {
+    match namespace {
+        PathMatchNamespace::Configured => prefix_match_depth(prefix, target),
+        PathMatchNamespace::Resolved => resolve_symlinked_path(prefix)
+            .and_then(|resolved_prefix| prefix_match_depth(&resolved_prefix, target)),
+    }
+}
+
+/// Deepest (most specific) allow-root match depth for `expanded`, considering
+/// the workspace directory and every provided allow-root list. `None` when no
+/// allow rule matches. Every rule is compared in `namespace`; callers must use
+/// the configured namespace for lexical targets and the resolved namespace for
+/// resolved targets so competing depths are never derived from different path
+/// spellings.
+fn deepest_allow_depth(
+    workspace_dir: &Path,
+    root_lists: &[&[PathBuf]],
+    expanded: &Path,
+    namespace: PathMatchNamespace,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut consider = |root: &Path| {
+        if let Some(depth) = namespace_prefix_match_depth(root, expanded, namespace) {
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+    };
+    consider(workspace_dir);
+    for list in root_lists {
+        for root in *list {
+            consider(root);
+        }
+    }
+    best
+}
+
+/// Deepest (most specific) forbidden match depth for `expanded`. `None` when no
+/// forbidden entry matches. Entries are compared in the same namespace as the
+/// target and any competing allow rules.
+fn deepest_forbidden_depth(
+    forbidden_paths: &[String],
+    expanded: &Path,
+    namespace: PathMatchNamespace,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for forbidden in forbidden_paths {
+        let forbidden_path = expand_user_path(forbidden);
+        if let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) {
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+    }
+    best
+}
+
+/// Decide whether a `forbidden_paths` entry should deny a path even though an
+/// allow rule also matches. Deny wins when the most specific forbidden prefix
+/// is at least as deep as the most specific allowing prefix, so an explicit
+/// forbidden path nested under an allowed root takes effect, while a broad
+/// default forbidden root (e.g. `/home`) does not override an operator's more
+/// specific `allowed_roots` entry. A tie resolves to deny — an explicit "no"
+/// at the same boundary as the allow should hold.
+fn forbidden_overrides_allow(forbidden_depth: Option<usize>, allow_depth: Option<usize>) -> bool {
+    match (forbidden_depth, allow_depth) {
+        (Some(f), Some(a)) => f >= a,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// Specific kind of escalation violation returned by
 /// [`SecurityPolicy::ensure_no_escalation_beyond`]. Each variant names
 /// the field that violated subset semantics so the SubAgent spawn path
@@ -665,6 +778,7 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            sandbox_image: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -771,6 +885,29 @@ fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether `path` is the host's discard-only null device.
+///
+/// This helper short-circuits filesystem authorization (`is_path_allowed`,
+/// `is_resolved_path_*`, `resolve_policy_target`), so it recognizes only the
+/// spelling that names the null device on the host evaluating policy:
+///
+/// - Unix: `/dev/null` is always allowed, before filesystem resolution and
+///   regardless of workspace or `forbidden_paths` config (including a
+///   forbidden `/dev`). The exception does not depend on the device node
+///   resolving where policy is evaluated.
+/// - Windows: `nul` / `\\.\nul`, case-insensitive. Here `/dev/null` is an
+///   ordinary file at `\dev\null` on the current drive, so it gets normal
+///   forbidden-path checks.
+///
+/// Each host's foreign spelling is an ordinary filename on that host and may be
+/// a regular file or a symlink to a forbidden target, so it must go through
+/// normal resolution and policy checks. Whether a *shell* treats a redirect
+/// target as discard-only is a separate, dialect-aware decision
+/// (`is_safe_device_redirect_target`): a POSIX `2>/dev/null` redirect is still
+/// accepted on a Windows host, and a `cmd.exe` `2>nul` redirect on a Unix host.
+///
+/// Matching is exact. `nul.txt`, `/dev/null/extra`, and `/dev/zero` are not the
+/// null device.
 fn is_null_device(path: &Path) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
@@ -868,18 +1005,34 @@ fn skip_env_assignments(s: &str) -> &str {
         let Some(word) = rest.split_whitespace().next() else {
             return rest;
         };
-        // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
+        if is_env_assignment_word(word) {
             // Advance past this word
             rest = rest[word.len()..].trim_start();
         } else {
             return rest;
         }
+    }
+}
+
+fn is_env_assignment_word(word: &str) -> bool {
+    env_assignment_name(word).is_some()
+}
+
+fn env_assignment_name(word: &str) -> Option<&str> {
+    let (raw_name, _) = word.split_once('=')?;
+    normalized_assignment_name(raw_name)
+}
+
+fn normalized_assignment_name(raw_name: &str) -> Option<&str> {
+    let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Some(name)
+    } else {
+        None
     }
 }
 
@@ -890,29 +1043,673 @@ enum QuoteState {
     Double,
 }
 
-fn split_unquoted_segments(command: &str) -> Vec<String> {
+/// A heredoc queued on a command line, waiting for its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeredocDelimiter {
+    /// The terminator line, or `None` when it cannot be proven.
+    terminator: Option<String>,
+    /// `<<-`: leading tabs are removed from the start of each logical line
+    /// before it is compared.
+    strip_tabs: bool,
+    /// The delimiter word was unquoted, so the body is expanded: a line
+    /// ending in an odd number of backslashes continues onto the next one.
+    joins_lines: bool,
+}
+
+/// Whether a heredoc body line ends in a backslash that continues it onto the
+/// next line: an odd number of trailing backslashes (`\\` is an escaped one).
+fn ends_with_line_continuation(line: &str) -> bool {
+    line.bytes().rev().take_while(|&byte| byte == b'\\').count() % 2 == 1
+}
+
+/// What closes an open [`SegmentFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentFrameKind {
+    /// `$(`, `<(`, `>(`, or a grouping `(`; closed by an unquoted `)`.
+    Paren,
+    /// Old-style command substitution; closed by the next unescaped backtick.
+    Backtick,
+}
+
+/// A POSIX substitution or subshell that is open while splitting segments.
+struct SegmentFrame {
+    kind: SegmentFrameKind,
+    /// The enclosing segment to resume when this frame closes, with a
+    /// placeholder (`$()`, `<()`, `>()`, or ``` `` ```) standing in for the
+    /// inner command. `None` for a grouping subshell, which is itself a segment
+    /// boundary.
+    resume: Option<String>,
+    /// Quote state of the enclosing word: command substitution also opens
+    /// inside double quotes.
+    resume_quote: QuoteState,
+    /// Inside `$((...))`, where `<<` is a shift rather than a heredoc.
+    arithmetic: bool,
+    /// Syntax state of the commands inside this frame.
+    nest: SegmentNest,
+    /// The enclosing heredoc queue, set aside while a substitution is open.
+    /// Bash and dash parse `$(...)` and backticks (and Bash `<(...)`) with
+    /// their own heredoc list: a newline inside starts only heredocs opened
+    /// inside, and the enclosing ones start at the first newline after the
+    /// substitution closes. A newline inside `$((...))` starts none either. A shared queue started the outer heredoc at the inner newline,
+    /// swallowed the inner terminator, and then skipped the commands after the
+    /// real outer terminator as the inner body. `None` for a grouping
+    /// subshell, which shares the enclosing queue just as both shells do.
+    outer_heredocs: Option<VecDeque<HeredocDelimiter>>,
+    /// For a `$((` frame: text of the expression, held back until the frame
+    /// closes. It runs no command only if the expression is confirmed.
+    arithmetic_text: Vec<String>,
+    /// For a `$((` frame: whether its first inner group has closed yet.
+    first_group_closed: bool,
+    /// For a `$((` frame: the second `(` closed with `)` right after it.
+    /// Bash then reads arithmetic, and dash reads `$((` as arithmetic always,
+    /// so neither runs the text as commands.
+    arithmetic_confirmed: bool,
+    /// A grouping `(` followed at once by `(`. Bash reads `((...))` as an
+    /// arithmetic command and dash as nested subshells, so a `<<` inside is a
+    /// shift to one and a heredoc to the other.
+    double_paren: bool,
+}
+
+/// Per-frame syntax that changes what a `)` means. Bash parses a whole
+/// substitution before running it, so a `case` pattern's `)` or a `)` inside
+/// `${...}` does not close `$(...)`. Treating either as the closer would
+/// restore the enclosing quote state and hide the rest of the inner command
+/// inside one quoted argument.
+#[derive(Debug, Default, Clone, Copy)]
+struct SegmentNest {
+    /// Open `case` statements, whose pattern terminators are `)`.
+    case_depth: usize,
+    /// Open `${...}` parameter expansions, where `(` and `)` are literal.
+    param_depth: usize,
+}
+
+fn segment_nest_mut<'a>(
+    frames: &'a mut [SegmentFrame],
+    top: &'a mut SegmentNest,
+) -> &'a mut SegmentNest {
+    match frames.last_mut() {
+        Some(frame) => &mut frame.nest,
+        None => top,
+    }
+}
+
+/// Track `case`/`esac` keywords as the word in `current` ends. A keyword only
+/// counts in command position: first in the simple command, or after words
+/// that can precede a command (`then case`, `coproc case`, `time -p case`).
+/// A lone `&` ends a command without ending the segment, so the word after it
+/// is in command position too (`true & case`). `esac` also closes an empty
+/// `case x in esac`. Missing a `case` lets its pattern `)` close the
+/// substitution early, and missing an `esac` hides the real closer. Either
+/// restores the enclosing quote over commands the shell runs.
+fn note_case_keyword(current: &str, nest: &mut SegmentNest) {
+    if !current.ends_with(|c: char| !c.is_whitespace()) {
+        return;
+    }
+    let words: Vec<&str> = current[background_command_start(current)..]
+        .split_whitespace()
+        .collect();
+    let Some((&last, before)) = words.split_last() else {
+        return;
+    };
+    let prefix = match (last, before) {
+        ("esac", [prefix @ .., "case", _, "in"]) => prefix,
+        _ => before,
+    };
+    if !is_command_prefix(prefix) {
+        return;
+    }
+    match last {
+        "case" => nest.case_depth += 1,
+        "esac" => nest.case_depth = nest.case_depth.saturating_sub(1),
+        _ => {}
+    }
+}
+
+/// Whether every word is a reserved word or prefix after which the next word
+/// is still in command position.
+fn is_command_prefix(words: &[&str]) -> bool {
+    let mut previous = None;
+    words.iter().all(|&word| {
+        let prefix = match word {
+            "!" | "{" | "coproc" | "do" | "elif" | "else" | "if" | "then" | "time" | "until"
+            | "while" => true,
+            // `time -p` and `time -p --` still time a pipeline.
+            "-p" | "--" => matches!(previous, Some("time" | "-p")),
+            _ => false,
+        };
+        previous = Some(word);
+        prefix
+    })
+}
+
+/// Byte offset just past the last `&` in `current` that ends a command,
+/// rather than one in a redirection (`>&`, `<&`, `&>`) or escaped. A quoted
+/// `&` can be mistaken for one, but its closing quote then sits in a word
+/// before the keyword, and no command prefix contains a quote.
+fn background_command_start(current: &str) -> usize {
+    let bytes = current.as_bytes();
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte != b'&' {
+            continue;
+        }
+        let before = index.checked_sub(1).and_then(|i| bytes.get(i));
+        let backslashes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+        if matches!(before, Some(b'>' | b'<'))
+            || bytes.get(index + 1) == Some(&b'>')
+            || backslashes % 2 == 1
+        {
+            continue;
+        }
+        start = index + 1;
+    }
+    start
+}
+
+fn push_segment(segments: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    current.clear();
+}
+
+fn open_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
+    kind: SegmentFrameKind,
+    placeholder: Option<&str>,
+    arithmetic: bool,
+) {
+    let resume = match placeholder {
+        Some(placeholder) => {
+            let mut resume = std::mem::take(current);
+            resume.push_str(placeholder);
+            Some(resume)
+        }
+        None => {
+            emit_segment(frames, segments, current);
+            None
+        }
+    };
+    // Arithmetic carries into the parentheses of an arithmetic expression,
+    // but a command substitution or backtick inside it is ordinary shell
+    // syntax again (heredocs included).
+    let arithmetic = arithmetic
+        || (placeholder.is_none() && frames.last().is_some_and(|frame| frame.arithmetic));
+    frames.push(SegmentFrame {
+        kind,
+        resume,
+        resume_quote: *quote,
+        arithmetic,
+        nest: SegmentNest::default(),
+        outer_heredocs: placeholder
+            .is_some()
+            .then(|| std::mem::take(pending_heredocs)),
+        arithmetic_text: Vec::new(),
+        first_group_closed: false,
+        arithmetic_confirmed: false,
+        double_paren: false,
+    });
+    *quote = QuoteState::None;
+}
+
+/// End a segment of text. Inside a `$((` expression the text is held on that
+/// frame until the expression is confirmed (see
+/// [`SegmentFrame::arithmetic_confirmed`]); everywhere else it is a segment.
+fn emit_segment(frames: &mut [SegmentFrame], segments: &mut Vec<String>, current: &mut String) {
+    let root = if frames.last().is_some_and(|frame| frame.arithmetic) {
+        frames
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.arithmetic && frame.resume.is_some())
+    } else {
+        None
+    };
+    match root {
+        Some(root) => push_segment(&mut root.arithmetic_text, current),
+        None => push_segment(segments, current),
+    }
+}
+
+/// Pop the innermost frame. A `$((` frame's held text becomes segments unless
+/// the expression was confirmed as arithmetic.
+fn pop_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+) -> Option<SegmentFrame> {
+    let mut frame = frames.pop()?;
+    if !frame.arithmetic_confirmed {
+        segments.append(&mut frame.arithmetic_text);
+    }
+    Some(frame)
+}
+
+fn close_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
+) {
+    emit_segment(frames, segments, current);
+    if let Some(frame) = pop_segment_frame(frames, segments) {
+        *current = frame.resume.unwrap_or_default();
+        *quote = frame.resume_quote;
+        // Heredocs still pending here were opened inside the substitution with
+        // no newline after them before it closed, so they have no body. Dash
+        // reads them as empty and drops them. Bash carries them out to the
+        // next line, so dropping them can only scan lines Bash treats as body,
+        // never skip lines it runs.
+        if let Some(outer) = frame.outer_heredocs {
+            *pending_heredocs = outer;
+        }
+    }
+}
+
+/// Open a backtick substitution. Closing one is handled before quote and
+/// comment state, because the shell finds the closer first (see the backtick
+/// check in [`split_unquoted_segments_checked`]).
+fn open_backtick_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
+) {
+    open_segment_frame(
+        frames,
+        segments,
+        current,
+        quote,
+        pending_heredocs,
+        SegmentFrameKind::Backtick,
+        Some("``"),
+        false,
+    );
+}
+
+/// Read the delimiter word after `<<` (or `<<-`), copying its raw text into
+/// `current` and returning it with quotes and escapes removed.
+///
+/// The delimiter is one shell word: it ends at unquoted whitespace or a
+/// metacharacter, and the rest of the line (`| wc -l`, more redirects, a
+/// second `<<B`) is scanned as ordinary command text. Reading to the end of the
+/// line instead made a delimiter like `EOF | wc -l` that never matches, so every
+/// later command was skipped as heredoc body.
+///
+/// `None` means this is not a heredoc (`<<$(cmd)`). `Some(Err(()))` means it is
+/// a heredoc whose delimiter this scanner cannot prove. Callers must not skip
+/// lines in that case: a wrong terminator hides every command after the body.
+/// `Some(Ok(delimiter))` is a one-line terminator the body matcher can compare
+/// exactly. `strip_tabs` is the `<<-` operator: bash removes leading
+/// tabs from the body and from the terminator line before comparing it.
+///
+/// `in_backtick` means a backtick substitution is open. The shell cuts its
+/// text at the next unescaped backtick before parsing it, so that backtick
+/// ends the delimiter word. The backslash removal done while cutting is not
+/// modeled, so a delimiter with a backslash or backtick there is unproven.
+fn read_heredoc_delimiter(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    current: &mut String,
+    backslash_is_literal: bool,
+    in_backtick: bool,
+) -> Option<Result<HeredocDelimiter, ()>> {
+    let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
+        current.push(dash);
+        true
+    } else {
+        false
+    };
+    while let Some(blank) = chars.next_if(|ch| matches!(ch, ' ' | '\t')) {
+        current.push(blank);
+    }
+    let mut raw = String::new();
+    let mut quote = QuoteState::None;
+    let mut ansi_c = false;
+    while let Some(&ch) = chars.peek() {
+        // Leave the closing backtick to the caller. A quote still open here is
+        // reported below as an unfinished delimiter.
+        if in_backtick && ch == '`' {
+            break;
+        }
+        // An escape is part of the word, including when the escaped character
+        // is itself a word boundary. Checking the boundary first turned
+        // `<<E\ OF` into the delimiter `E\` (the space ended the word), which
+        // never matches the terminator `E OF` and hides every later command.
+        // Inside `$'...'` the backslash is an ANSI-C escape, not a shell
+        // escape, so it does not protect the following character from ending
+        // the quote.
+        if quote == QuoteState::None && ch == '\\' && !backslash_is_literal && !ansi_c {
+            chars.next();
+            current.push(ch);
+            raw.push(ch);
+            match chars.peek() {
+                // A backslash-newline joins the delimiter (`<<E\<newline>OF`
+                // is `EOF`). Record the newline and keep reading the word.
+                Some('\n') => {
+                    let newline = chars.next().expect("peeked newline");
+                    current.push(newline);
+                    raw.push(newline);
+                }
+                // Any other escaped character is part of the word, even when
+                // it would otherwise end it (`<<E\ OF` is `E OF`).
+                Some(_) => {
+                    let escaped = chars.next().expect("peeked escape");
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+                // A backslash at the end of the input is not a join. Leave it
+                // in the word so the body scanner does not treat the following
+                // line as part of the delimiter.
+                None => {}
+            }
+            continue;
+        }
+        if quote == QuoteState::None
+            && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')'))
+        {
+            break;
+        }
+        chars.next();
+        current.push(ch);
+        raw.push(ch);
+        match (quote, ch) {
+            // Recognize `$'...'` / `$"..."` to find where the word ends, even
+            // though such a delimiter is refused afterwards. Otherwise
+            // `<<$'E\'OF'` is read as an ordinary single-quoted word whose `\'`
+            // closes it, and the rest of the command is swallowed into it.
+            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => {
+                let opener = chars.next().expect("peeked quote");
+                current.push(opener);
+                raw.push(opener);
+                quote = if opener == '\'' {
+                    ansi_c = true;
+                    QuoteState::Single
+                } else {
+                    QuoteState::Double
+                };
+            }
+            (QuoteState::Single, '\'') if !ansi_c => quote = QuoteState::None,
+            (QuoteState::Single, '\'') => {
+                quote = QuoteState::None;
+                ansi_c = false;
+            }
+            // An escaped `"`, `$`, `` ` ``, or `\` inside double quotes is part
+            // of the word, not its closer. Stopping at `\"` turned `<<"E\" F"`
+            // into the delimiter `E"`, which never matches `E" F`.
+            (QuoteState::Double, '\\') if !backslash_is_literal => {
+                if let Some(escaped) = chars.next_if(|next| matches!(next, '$' | '`' | '"' | '\\'))
+                {
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+            }
+            (QuoteState::Double, '"') => quote = QuoteState::None,
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            // Inside `$'...'`, `\'` is an escaped apostrophe, not the closer.
+            (QuoteState::Single, '\\') if ansi_c => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+            }
+            // A backslash-newline joins the delimiter word before quote removal,
+            // quoted or not. Other escapes stay in the raw word for quote
+            // removal afterwards.
+            (QuoteState::None | QuoteState::Double, '\\')
+                if !backslash_is_literal && chars.next_if_eq(&'\n').is_some() =>
+            {
+                current.push('\n');
+                raw.push('\n');
+            }
+            _ => {}
+        }
+    }
+    if chars.peek() == Some(&'(') {
+        // `<<$(cmd)` is a command substitution, not a heredoc.
+        return None;
+    }
+    if quote != QuoteState::None {
+        // The opener is a heredoc, but its quote never closed. Do not skip a
+        // body against a delimiter this scanner did not finish reading.
+        return Some(Err(()));
+    }
+    if in_backtick && raw.contains(['\\', '`']) {
+        return Some(Err(()));
+    }
+    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
+        // `$'...'`, `$"..."`, and any other form whose terminator depends on
+        // the shell. The opener is still a heredoc. Skipping its lines against a guessed
+        // terminator is the bypass, so the caller scans them instead.
+        return Some(Err(()));
+    };
+    // A newline in the delimiter is not a one-line terminator. An empty delimiter is the blank line after `<<''`, and a
+    // carriage return can end a physical line. Both are matched before the
+    // body line is trimmed.
+    if delimiter.contains('\n') {
+        return Some(Err(()));
+    }
+    // A backslash-newline is removed before the word is read, so it is not
+    // quoting. `<<E\<newline>OF` is the unquoted delimiter `EOF`, and its body
+    // still joins continued lines. Counting that backslash as quoting left the
+    // body literal: the scanner waited for a later physical `EOF` and skipped
+    // the command bash runs after the joined terminator. A quote, or a
+    // backslash that survives the removal, still leaves the body literal.
+    let without_continuations = raw.replace("\\\n", "");
+    let joins_lines = !without_continuations.contains(['\'', '"', '\\']);
+    Some(Ok(HeredocDelimiter {
+        terminator: Some(delimiter),
+        strip_tabs,
+        joins_lines,
+    }))
+}
+
+/// Apply shell quote removal to a heredoc delimiter word. `None` means the
+/// word's terminator depends on the shell or is not modeled, so no body may be
+/// skipped against it.
+///
+/// `$'...'` and `$"..."` are refused. Bash expands `$'...'` (and translates
+/// `$"..."` through the locale catalog) before matching the terminator, but
+/// dash, the usual `sh`, has neither: `<<$'EOF'` ends at a literal `$EOF`
+/// line there, and the commands after that line run while a bash reading
+/// still treats them as body. Modeling either shell hides commands from the
+/// other, and the bash expansion was also byte-oriented (`\0` truncation,
+/// `\xc3`) in ways a `String` cannot represent.
+fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
+    let mut delimiter = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quote = QuoteState::None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => return None,
+            // A bare `$` or backtick in a heredoc delimiter is literal. Neither
+            // shell expands `<<$EOF`, `<<"$EOF"`, or `<<`echo EOF``. Treating
+            // every `$` as an unsupported expansion opened no heredoc, so a
+            // quote in the body swallowed the following command.
+            (QuoteState::None | QuoteState::Double, '\\') => match chars.next() {
+                Some('\n') => {}
+                Some(escaped)
+                    if quote == QuoteState::None || matches!(escaped, '$' | '`' | '"' | '\\') =>
+                {
+                    delimiter.push(escaped);
+                }
+                Some(escaped) => {
+                    delimiter.push('\\');
+                    delimiter.push(escaped);
+                }
+                None => delimiter.push('\\'),
+            },
+            _ => delimiter.push(ch),
+        }
+    }
+    Some(delimiter)
+}
+
+/// Split a command into the simple commands a shell would run, so each one
+/// can be checked on its own.
+///
+/// Segments end at unquoted `;`, newlines, `|`, `||`, and `&&`. Under the
+/// POSIX dialect, command substitution (`$(...)`, `` `...` ``), process
+/// substitution (`<(...)`, `>(...)`), and subshells (`(...)`) are boundaries
+/// too: the inner command becomes its own segment, and the enclosing word keeps
+/// a `$()`-style placeholder. Otherwise the closing `)` or backtick sticks to
+/// the last inner word (`$(ls 2>/dev/null)` yields a `/dev/null)` redirect
+/// target), and the inner command hides behind the outer one.
+///
+/// Every character other than those delimiters lands in a segment, except
+/// heredoc bodies and confirmed `$((...))` arithmetic, which both bash and
+/// dash read as data. That alone does not mean the checks see the rest. If the
+/// scanner closes a substitution where the shell does not, it restores the
+/// enclosing quote state, and commands the shell runs end up inside one quoted
+/// argument that the checks never look into. The scanner therefore follows
+/// the shell where a `)` or backtick is ambiguous (`case` patterns, `${...}`,
+/// comments, backtick closers). As a backstop, a scan that ends with a frame,
+/// quote, `case`, or `${` still open, or that meets a `)` closing nothing,
+/// also returns the flat split that ignores substitutions, the split this
+/// function made before it modeled them. That only adds segments to check,
+/// so it refuses nothing the flat split accepted. It is not a proof: input
+/// crafted to rebalance a misparse is only as safe as the specific rules.
+/// Where the shells disagree or no split can bound a heredoc body (`<<` in a
+/// bare `((`, a body running to the end inside an open substitution), the
+/// split is refused instead.
+/// Segments are returned in the order they end, so an inner command comes
+/// before the command containing it.
+fn split_unquoted_segments_checked(
+    command: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<String>, UnreadableHeredoc> {
+    let (mut segments, balanced) = scan_unquoted_segments(command, dialect, true)?;
+    if !balanced {
+        let (flat, _) = scan_unquoted_segments(command, dialect, false)?;
+        segments.extend(flat);
+    }
+    Ok(segments)
+}
+
+/// A heredoc whose delimiter this scanner cannot prove. Its body is data, but
+/// the commands after the real terminator still run. Skipping them hides a
+/// forbidden path, and parsing them lets a quote in the body swallow the next
+/// command. Either guess is a bypass, so the command is refused.
+struct UnreadableHeredoc;
+
+fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
+    split_unquoted_segments_checked(command, dialect).unwrap_or_default()
+}
+
+/// One pass of [`split_unquoted_segments_checked`]. `model_substitutions`
+/// enables the POSIX substitution, subshell, `case`, and comment model. The
+/// returned flag is `false` when that model ended unbalanced.
+fn scan_unquoted_segments(
+    command: &str,
+    dialect: ShellDialect,
+    model_substitutions: bool,
+) -> Result<(Vec<String>, bool), UnreadableHeredoc> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut escaped = false;
-    // Heredoc state: Some(delim) while inside a heredoc body.
-    let mut heredoc_delimiter: Option<String> = None;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    // `cmd.exe` has no command substitution, and its parenthesized blocks are
+    // not modeled here, so only the POSIX dialect splits at these boundaries.
+    let posix_substitution = model_substitutions && matches!(dialect, ShellDialect::Posix);
+    // A `)` that closed nothing and was not a `case` pattern terminator.
+    let mut stray_closer = false;
+    let mut frames: Vec<SegmentFrame> = Vec::new();
+    // The previous character if it was unescaped syntax outside single quotes,
+    // so `(` can tell `$(`, `<(`, and `>(` from a grouping subshell.
+    let mut last_syntax_char: Option<char> = None;
+    // `case` and `${...}` state outside every frame.
+    let mut top_nest = SegmentNest::default();
+    // Inside a `#` comment, until the next newline.
+    let mut in_comment = false;
+    // Heredoc state: Some(delim) while inside a heredoc body. `None` in the
+    // pair means the opener is a heredoc whose delimiter this scanner cannot
+    // prove. Its body runs to the end of the command, so the text stays data
+    // instead of being parsed as shell.
+    let mut heredoc_delimiter: Option<HeredocDelimiter> = None;
+    // The command-frame depth that owns an unproven heredoc body. The body
+    // ends when that frame closes, so it cannot hide the command after a
+    // substitution. `None` means the opener was at top level: its body has no
+    // frame to close it, so the following lines are scanned with quotes
+    // disabled instead of being discarded.
+    let mut heredoc_owner: Option<usize> = None;
+    // After a top-level heredoc whose delimiter cannot be proven, quotes in
+    // the remainder are not syntax. A quote in the body must not join the
+    // following command into one word.
+    let mut quotes_are_literal = false;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
-    // True while reading the delimiter word that follows `<<`.
-    let mut reading_heredoc_word = false;
-    let mut heredoc_word_buf = String::new();
+    // The joined text of a logical body line whose physical lines so far each
+    // ended in a line continuation (unquoted delimiters only).
+    // A logical body line in progress (unquoted delimiters only): the joined
+    // text of its physical lines so far, each of which ended in a line
+    // continuation, and whether dash is still at the start of the line
+    // (every line so far was exactly `\`). `None` at the start of a line.
+    let mut heredoc_logical_line: Option<(String, bool)> = None;
+    // Delimiters of heredocs opened on the current command line, in order.
+    // Their bodies start at the next unquoted newline.
+    // A substitution sets this queue aside and starts its own (see
+    // `SegmentFrame::outer_heredocs`).
+    let mut pending_heredocs: VecDeque<HeredocDelimiter> = VecDeque::new();
+    // Backslash state for finding a backtick's closer, which ignores quotes,
+    // comments, and heredoc bodies (see the backtick check below).
+    let mut backtick_escaped = false;
     let mut chars = command.chars().peekable();
 
-    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
-        let trimmed = current.trim();
-        if !trimmed.is_empty() {
-            segments.push(trimmed.to_string());
-        }
-        current.clear();
-    };
-
     while let Some(ch) = chars.next() {
+        let opener = last_syntax_char.take();
+        // Bash and dash find the end of a backtick substitution before they
+        // parse the text inside: the next backtick not escaped by a backslash
+        // closes it, inside a comment, a heredoc body, or a `$(` opened within
+        // it. Bash does so inside quotes too, where dash rejects the whole
+        // script. Following the inner syntax instead let a comment or quote
+        // swallow the closer, so the next backtick restored the enclosing
+        // double quote over commands the shell runs.
+        if posix_substitution
+            && let Some(backtick) = frames
+                .iter()
+                .rposition(|frame| frame.kind == SegmentFrameKind::Backtick)
+        {
+            if backtick_escaped {
+                backtick_escaped = false;
+            } else if ch == '\\' && !backslash_is_literal {
+                backtick_escaped = true;
+            } else if ch == '`' {
+                while frames.len() > backtick {
+                    close_segment_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                    );
+                }
+                // Comments, heredoc bodies, and escapes inside the backticks
+                // end with them.
+                in_comment = false;
+                escaped = false;
+                heredoc_delimiter = None;
+                heredoc_logical_line = None;
+                heredoc_line_buf.clear();
+                if heredoc_owner.is_some_and(|owner| owner >= frames.len()) {
+                    heredoc_owner = None;
+                }
+                continue;
+            }
+        }
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -926,94 +1723,256 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     current.push(ch);
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     current.push(ch);
                     continue;
                 }
+                if posix_substitution && ch == '(' && opener == Some('$') {
+                    let arithmetic = chars.peek() == Some(&'(');
+                    open_segment_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                        SegmentFrameKind::Paren,
+                        Some("()"),
+                        arithmetic,
+                    );
+                    continue;
+                }
+                // No backtick substitution is open here (the check at the top
+                // of the loop closes one), so this backtick opens one.
+                if posix_substitution && ch == '`' {
+                    open_backtick_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                    );
+                    continue;
+                }
                 if ch == '"' {
                     quote = QuoteState::None;
+                } else if ch == '$' {
+                    last_syntax_char = Some(ch);
                 }
                 current.push(ch);
             }
             QuoteState::None => {
+                // Heredoc bodies and comments are line-based and come first. A
+                // backslash cannot extend a comment past its newline. In the
+                // body of an unquoted delimiter it can: the terminator is
+                // compared against logical lines (see below).
+                if let Some(HeredocDelimiter {
+                    terminator: delim,
+                    strip_tabs,
+                    joins_lines,
+                }) = heredoc_delimiter.as_ref()
+                {
+                    // An unproven delimiter has no terminator this scanner can
+                    // match. Bash still treats the following text as body, so
+                    // keep it data through the end of the command. Parsing it
+                    // lets a quote in the body swallow the next command.
+                    if delim.is_none() {
+                        match heredoc_owner {
+                            // The body belongs to the command frame that was
+                            // open when it started. A `)` that closes that
+                            // frame is the end of the body, not more body text.
+                            Some(owner)
+                                if ch == ')'
+                                    && frames.len() > owner
+                                    && frames.last().is_some_and(|frame| {
+                                        frame.kind == SegmentFrameKind::Paren
+                                    }) =>
+                            {
+                                heredoc_delimiter = None;
+                                heredoc_logical_line = None;
+                                heredoc_line_buf.clear();
+                                heredoc_owner = None;
+                                close_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                );
+                            }
+                            // At top level there is no frame to close the body.
+                            // Discarding the rest hides commands bash runs
+                            // after the real terminator. End the opaque line at
+                            // the next newline and scan what follows, but do
+                            // not let a quote in the body join those words.
+                            None if ch == '\n' => {
+                                heredoc_delimiter = None;
+                                heredoc_logical_line = None;
+                                heredoc_line_buf.clear();
+                                quotes_are_literal = true;
+                                push_segment(&mut segments, &mut current);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if ch == '\n' {
+                        // `<<-` removes leading tabs before the comparison, and
+                        // nothing else. A tab-only line is therefore the blank
+                        // terminator of `<<-''`. Trimming spaces, or ignoring
+                        // the dash, misses that terminator and hides the
+                        // following command. A carriage return stays part of
+                        // the line (`<<$'E\rF'` ends at `E<CR>F`).
+                        //
+                        // An unquoted delimiter's body is expanded, so a line
+                        // ending in an odd number of backslashes continues onto
+                        // the next one, and the shells find the terminator
+                        // differently (both checked against bash 3.2 to 5.3 and
+                        // dash 0.5.12):
+                        // - Bash joins the physical lines and compares the
+                        //   logical line. `<<-` strips leading tabs from each
+                        //   physical line while the joined text is still empty.
+                        // - Dash, at the start of a line, skips lines that are
+                        //   exactly `\`, strips tabs, and compares the rest of
+                        //   that one physical line. It joins nothing else.
+                        // Both end at `\` then `EOF`, and neither at `body \`
+                        // then `EOF`, where ending let a quote in the real body
+                        // swallow a later command. Where only one ends (`EO\`
+                        // then `F`), either guess hides the following commands
+                        // from the other shell, so the command is refused.
+                        let physical = std::mem::take(&mut heredoc_line_buf);
+                        let (prefix, dash_at_line_start) =
+                            heredoc_logical_line.take().unwrap_or((String::new(), true));
+                        let strip = |line: &'_ str| -> String {
+                            if *strip_tabs {
+                                line.trim_start_matches('\t').to_string()
+                            } else {
+                                line.to_string()
+                            }
+                        };
+                        let bash_line = if prefix.is_empty() {
+                            strip(&physical)
+                        } else {
+                            physical.clone()
+                        };
+                        if *joins_lines && ends_with_line_continuation(&bash_line) {
+                            let joined = format!("{prefix}{}", &bash_line[..bash_line.len() - 1]);
+                            heredoc_logical_line =
+                                Some((joined, dash_at_line_start && physical == "\\"));
+                            continue;
+                        }
+                        let bash_ends =
+                            delim.as_deref() == Some(format!("{prefix}{bash_line}").as_str());
+                        let dash_ends = dash_at_line_start
+                            && delim.as_deref() == Some(strip(&physical).as_str());
+                        if bash_ends != dash_ends {
+                            return Err(UnreadableHeredoc);
+                        }
+                        let ends = bash_ends;
+                        if ends {
+                            // Terminator line reached. Start the next queued
+                            // heredoc body from the same command line, if any.
+                            heredoc_delimiter = pending_heredocs.pop_front();
+                            push_segment(&mut segments, &mut current);
+                        }
+                    } else {
+                        heredoc_line_buf.push(ch);
+                    }
+                    continue;
+                }
+
+                // A comment runs to the newline. Its text stays in the segment,
+                // and separators still split (conservative), but `)`, quotes,
+                // backticks, backslashes, and `$(` inside it are not syntax, so
+                // a comment cannot close a substitution early or continue past
+                // its newline.
+                if in_comment {
+                    if ch == '\n' {
+                        in_comment = false;
+                    } else if !matches!(ch, ';' | '|' | '&') {
+                        current.push(ch);
+                        continue;
+                    }
+                }
+
                 if escaped {
                     escaped = false;
-                    if heredoc_delimiter.is_some() {
-                        heredoc_line_buf.push(ch);
-                    } else {
-                        current.push(ch);
-                    }
+                    current.push(ch);
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
-                    if heredoc_delimiter.is_some() {
-                        heredoc_line_buf.push(ch);
-                    } else {
-                        current.push(ch);
-                    }
+                    current.push(ch);
                     continue;
                 }
 
-                // Reading the delimiter word that follows `<<`.
-                if reading_heredoc_word {
-                    if ch == '\n' {
-                        // Finalise the delimiter and enter the heredoc body.
-                        let raw = heredoc_word_buf.trim().trim_start_matches('-');
-                        let delim = raw
-                            .trim_matches(|c| c == '\'' || c == '"' || c == '\\')
-                            .to_string();
-                        if !delim.is_empty() {
-                            heredoc_delimiter = Some(delim);
-                        }
-                        heredoc_word_buf.clear();
-                        reading_heredoc_word = false;
-                        // The newline after `<<WORD` belongs to the same segment.
-                        current.push(ch);
-                    } else {
-                        heredoc_word_buf.push(ch);
-                        current.push(ch);
-                    }
-                    continue;
+                let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
+                // Arithmetic has no commands, so `case` there is a name.
+                if posix_substitution
+                    && !in_comment
+                    && !in_arithmetic
+                    && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | ')'))
+                {
+                    note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
                 }
-
-                if let Some(delim) = heredoc_delimiter.as_deref() {
-                    if ch == '\n' {
-                        if heredoc_line_buf.trim() == delim {
-                            // Terminator line reached — end of heredoc body.
-                            heredoc_delimiter = None;
-                            heredoc_line_buf.clear();
-                            push_segment(&mut segments, &mut current);
-                        } else {
-                            heredoc_line_buf.clear();
-                        }
-                    } else {
-                        heredoc_line_buf.push(ch);
-                    }
-                    continue;
-                }
+                let SegmentNest {
+                    case_depth,
+                    param_depth,
+                } = *segment_nest_mut(&mut frames, &mut top_nest);
 
                 match ch {
-                    '\'' => {
+                    '#' if posix_substitution
+                        && !in_comment
+                        && !in_arithmetic
+                        && param_depth == 0
+                        && (current.trim().is_empty()
+                            || opener.is_some_and(char::is_whitespace)) =>
+                    {
+                        in_comment = true;
+                        current.push(ch);
+                    }
+                    '{' if posix_substitution && opener == Some('$') => {
+                        segment_nest_mut(&mut frames, &mut top_nest).param_depth += 1;
+                        current.push(ch);
+                    }
+                    '}' if posix_substitution && param_depth > 0 => {
+                        segment_nest_mut(&mut frames, &mut top_nest).param_depth -= 1;
+                        current.push(ch);
+                    }
+                    '\'' if single_quotes_are_syntax && !quotes_are_literal => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
-                    '"' => {
+                    '"' if !quotes_are_literal => {
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
-                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    // Separators inside `$((...))` (`&&`, `||`, newlines) end
+                    // text held for the expression, not command segments.
+                    ';' => emit_segment(&mut frames, &mut segments, &mut current),
+                    '\n' => {
+                        emit_segment(&mut frames, &mut segments, &mut current);
+                        heredoc_delimiter = pending_heredocs.pop_front();
+                        heredoc_owner = match heredoc_delimiter.as_ref() {
+                            // Top level has no frame. `saturating_sub(1)` on an
+                            // empty stack is `Some(0)`, which cannot be told
+                            // apart from a body owned by the outermost frame.
+                            Some(HeredocDelimiter {
+                                terminator: None, ..
+                            }) if !frames.is_empty() => Some(frames.len() - 1),
+                            _ => None,
+                        };
+                    }
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
                             // Consume full `||`; both characters are separators.
                         }
-                        push_segment(&mut segments, &mut current);
+                        emit_segment(&mut frames, &mut segments, &mut current);
                     }
                     '&' => {
                         if chars.next_if_eq(&'&').is_some() {
                             // `&&` is a separator; single `&` is handled separately.
-                            push_segment(&mut segments, &mut current);
+                            emit_segment(&mut frames, &mut segments, &mut current);
                         } else {
                             current.push(ch);
                         }
@@ -1021,27 +1980,954 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     '<' => {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
+                        // Inside `$((...))`, `<<` is a left shift.
                         if chars.peek() == Some(&'<') {
-                            let second = chars.next().unwrap();
-                            current.push(second);
-                            if chars.peek() != Some(&'<') {
-                                reading_heredoc_word = true;
+                            if let Some(second) = chars.next() {
+                                current.push(second);
+                            }
+                            if chars.peek() != Some(&'<') && !in_arithmetic {
+                                // Inside a bare `((`, `<<` is a shift to bash and a
+                                // heredoc to dash. Either reading hides the lines
+                                // after it from the other shell.
+                                if frames
+                                    .iter()
+                                    .rev()
+                                    .take_while(|frame| frame.resume.is_none())
+                                    .any(|frame| frame.double_paren)
+                                {
+                                    return Err(UnreadableHeredoc);
+                                }
+                                let in_backtick = frames
+                                    .iter()
+                                    .any(|frame| frame.kind == SegmentFrameKind::Backtick);
+                                match read_heredoc_delimiter(
+                                    &mut chars,
+                                    &mut current,
+                                    backslash_is_literal,
+                                    in_backtick,
+                                ) {
+                                    // A proven one-line delimiter. Its body is
+                                    // data, so it is safe to skip.
+                                    Some(Ok(delimiter)) => pending_heredocs.push_back(delimiter),
+                                    // The opener is a heredoc, but its delimiter
+                                    // uses syntax this scanner cannot prove
+                                    // (`$"..."`, an unclosed quote, a newline
+                                    // inside the word). There is no safe body
+                                    // boundary to guess, so refuse the command.
+                                    Some(Err(())) => return Err(UnreadableHeredoc),
+                                    // Not a heredoc (`<<$(cmd)`). The following
+                                    // text is ordinary command text.
+                                    None => {}
+                                }
                             }
                             // `<<<` falls through with no heredoc tracking.
+                        } else {
+                            last_syntax_char = Some(ch);
                         }
                     }
-                    _ => current.push(ch),
+                    // Inside `${...}` only `$(` opens a frame; other parentheses
+                    // are literal pattern text (`${x/)/y}`).
+                    '(' if posix_substitution && (param_depth == 0 || opener == Some('$')) => {
+                        match opener {
+                            Some('$') => {
+                                let arithmetic = chars.peek() == Some(&'(');
+                                open_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                    SegmentFrameKind::Paren,
+                                    Some("()"),
+                                    arithmetic,
+                                );
+                            }
+                            Some('<' | '>') => open_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                &mut pending_heredocs,
+                                SegmentFrameKind::Paren,
+                                Some("()"),
+                                false,
+                            ),
+                            // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
+                            // that is still a word boundary.
+                            _ => {
+                                let in_arithmetic_group =
+                                    frames.last().is_some_and(|frame| frame.arithmetic);
+                                open_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                    SegmentFrameKind::Paren,
+                                    None,
+                                    false,
+                                );
+                                if !in_arithmetic_group
+                                    && chars.peek() == Some(&'(')
+                                    && let Some(frame) = frames.last_mut()
+                                {
+                                    frame.double_paren = true;
+                                }
+                            }
+                        }
+                    }
+                    ')' if posix_substitution && param_depth == 0 => {
+                        if case_depth == 0
+                            && frames
+                                .last()
+                                .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
+                        {
+                            // Closing the first group of a `$((` frame. If `)`
+                            // follows at once, the expression is arithmetic.
+                            let group_of_root = frames.len() >= 2
+                                && frames.last().is_some_and(|frame| {
+                                    frame.arithmetic && frame.resume.is_none()
+                                });
+                            if group_of_root
+                                && let Some(root) = frames.iter_mut().rev().nth(1)
+                                && root.arithmetic
+                                && root.resume.is_some()
+                                && !root.first_group_closed
+                            {
+                                root.first_group_closed = true;
+                                root.arithmetic_confirmed = chars.peek() == Some(&')');
+                            }
+                            close_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                &mut pending_heredocs,
+                            );
+                            // An unproven heredoc body belongs to the command
+                            // frame that was just closed. Continuing it would
+                            // hide the command after the substitution.
+                            if heredoc_owner == Some(frames.len()) {
+                                heredoc_delimiter = None;
+                                heredoc_logical_line = None;
+                                heredoc_line_buf.clear();
+                                heredoc_owner = None;
+                            }
+                        } else {
+                            // A `case` pattern terminator, or an unmatched `)`,
+                            // ends the word before it without closing a frame.
+                            stray_closer |= case_depth == 0;
+                            push_segment(&mut segments, &mut current);
+                        }
+                    }
+                    // No backtick substitution is open here (the check at the
+                    // top of the loop closes one), so this backtick opens one.
+                    '`' if posix_substitution => {
+                        open_backtick_frame(
+                            &mut frames,
+                            &mut segments,
+                            &mut current,
+                            &mut quote,
+                            &mut pending_heredocs,
+                        );
+                    }
+                    _ => {
+                        last_syntax_char = Some(ch);
+                        current.push(ch);
+                    }
                 }
             }
         }
     }
 
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
+    // A keyword at the very end (`...; esac`) has no delimiter after it.
+    if posix_substitution
+        && quote == QuoteState::None
+        && !in_comment
+        && !escaped
+        && heredoc_delimiter.is_none()
+    {
+        note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
+    }
+    push_segment(&mut segments, &mut current);
+    // Valid shell ends with every substitution, quote, `case`, and `${`
+    // closed. Anything else means this model diverged from the shell's.
+    let balanced = !posix_substitution
+        || (!stray_closer
+            && frames.is_empty()
+            && quote == QuoteState::None
+            && top_nest.case_depth == 0
+            && top_nest.param_depth == 0);
+    // A heredoc body that runs to the end inside an open substitution may
+    // have swallowed its closer: bash ends a body at `EOF)` there and runs the
+    // rest. Neither split can tell where commands resume, so refuse.
+    if posix_substitution && heredoc_delimiter.is_some() && !frames.is_empty() {
+        return Err(UnreadableHeredoc);
+    }
+    // Flush the enclosing text of any substitution left open, so an
+    // unterminated `$(` cannot hide the command around it.
+    while let Some(frame) = pop_segment_frame(&mut frames, &mut segments) {
+        if let Some(mut resume) = frame.resume {
+            push_segment(&mut segments, &mut resume);
+        }
     }
 
-    segments
+    Ok((segments, balanced))
+}
+
+#[derive(Clone, Copy)]
+struct RedirectionMetadata {
+    marker_idx: usize,
+    operator_end: usize,
+    has_attached_word: bool,
+    prefix_is_unquoted: bool,
+    has_multiple_operators: bool,
+}
+
+struct ShellWord {
+    text: String,
+    is_assignment: bool,
+    redirection: Option<RedirectionMetadata>,
+}
+
+fn split_shell_words_with_metadata(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut is_assignment = false;
+    let mut assignment_prefix_is_unquoted = true;
+    let mut word_prefix_is_unquoted = true;
+    let mut redirection: Option<RedirectionMetadata> = None;
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut in_word = false;
+
+    let push_word = |words: &mut Vec<ShellWord>,
+                     current: &mut String,
+                     is_assignment: &mut bool,
+                     assignment_prefix_is_unquoted: &mut bool,
+                     word_prefix_is_unquoted: &mut bool,
+                     redirection: &mut Option<RedirectionMetadata>,
+                     in_word: &mut bool| {
+        if *in_word {
+            words.push(ShellWord {
+                text: std::mem::take(current),
+                is_assignment: *is_assignment,
+                redirection: redirection.take(),
+            });
+            *is_assignment = false;
+            *assignment_prefix_is_unquoted = true;
+            *word_prefix_is_unquoted = true;
+            *in_word = false;
+        }
+    };
+
+    for ch in segment.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                } else {
+                    current.push(ch);
+                    in_word = true;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    if matches!(ch, '$' | '`' | '"' | '\\') {
+                        current.push(ch);
+                    } else if ch != '\n' {
+                        current.push('\\');
+                        current.push(ch);
+                    }
+                    escaped = false;
+                    if !is_assignment {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' if backslash_is_literal => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                    '\\' => {
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '"' => quote = QuoteState::None,
+                    _ => {
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    current.push(ch);
+                    escaped = false;
+                    if !is_assignment {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' if backslash_is_literal => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                    '\\' => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '\'' if single_quotes_are_syntax => {
+                        if !is_assignment {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        quote = QuoteState::Single;
+                        in_word = true;
+                    }
+                    '"' => {
+                        if !is_assignment {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        quote = QuoteState::Double;
+                        in_word = true;
+                    }
+                    _ if ch.is_whitespace() => {
+                        push_word(
+                            &mut words,
+                            &mut current,
+                            &mut is_assignment,
+                            &mut assignment_prefix_is_unquoted,
+                            &mut word_prefix_is_unquoted,
+                            &mut redirection,
+                            &mut in_word,
+                        );
+                    }
+                    _ => {
+                        if ch == '=' && !is_assignment && assignment_prefix_is_unquoted {
+                            is_assignment = normalized_assignment_name(&current).is_some();
+                        }
+                        if matches!(ch, '<' | '>') {
+                            match &mut redirection {
+                                Some(redirection)
+                                    if !redirection.has_attached_word
+                                        && current.len() == redirection.operator_end =>
+                                {
+                                    redirection.operator_end += ch.len_utf8();
+                                }
+                                None => {
+                                    redirection = Some(RedirectionMetadata {
+                                        marker_idx: current.len(),
+                                        operator_end: current.len() + ch.len_utf8(),
+                                        has_attached_word: false,
+                                        prefix_is_unquoted: word_prefix_is_unquoted,
+                                        has_multiple_operators: false,
+                                    });
+                                }
+                                Some(redirection) => {
+                                    redirection.has_multiple_operators = true;
+                                    redirection.has_attached_word = true;
+                                }
+                            }
+                        } else if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    push_word(
+        &mut words,
+        &mut current,
+        &mut is_assignment,
+        &mut assignment_prefix_is_unquoted,
+        &mut word_prefix_is_unquoted,
+        &mut redirection,
+        &mut in_word,
+    );
+    words
+}
+
+fn shell_words_after_env_assignments(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let words = split_shell_words_with_metadata(segment, dialect);
+    let first_command = words
+        .iter()
+        .position(|word| !word.is_assignment)
+        .unwrap_or(words.len());
+    words.into_iter().skip(first_command).collect()
+}
+
+struct NormalizedShellCommand {
+    has_leading_env_assignment: bool,
+    words: Vec<String>,
+    has_ambiguous_redirection: bool,
+}
+
+fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedShellCommand {
+    let raw_words = split_shell_words_with_metadata(segment, dialect);
+    let mut has_leading_env_assignment = false;
+    let mut words = Vec::with_capacity(raw_words.len());
+    let mut has_ambiguous_redirection = false;
+    let mut before_executable = true;
+    let mut idx = 0;
+
+    while idx < raw_words.len() {
+        let raw = raw_words[idx].text.as_str();
+        if before_executable && raw_words[idx].is_assignment {
+            has_leading_env_assignment = true;
+            idx += 1;
+            continue;
+        }
+
+        let redirection_metadata = raw_words[idx].redirection;
+        if redirection_metadata.is_some_and(|metadata| metadata.has_multiple_operators) {
+            has_ambiguous_redirection = true;
+        }
+        let redirection = redirection_metadata.map_or(RedirectionArgument::None, |metadata| {
+            parse_redirection_argument_at(raw, metadata)
+        });
+        let (prefix, consumes_next) = match redirection {
+            RedirectionArgument::Target { prefix, .. } | RedirectionArgument::FdOnly { prefix } => {
+                (prefix, false)
+            }
+            RedirectionArgument::NeedsNextToken { prefix } => (prefix, true),
+            RedirectionArgument::None => {
+                words.push(raw_words[idx].text.clone());
+                before_executable = false;
+                idx += 1;
+                continue;
+            }
+        };
+
+        let is_io_number = !prefix.is_empty()
+            && prefix.chars().all(|c| c.is_ascii_digit())
+            && redirection_metadata.is_some_and(|metadata| metadata.prefix_is_unquoted);
+        if !prefix.is_empty() && !is_io_number {
+            words.push(prefix.to_string());
+            before_executable = false;
+        }
+        idx += if consumes_next { 2 } else { 1 };
+    }
+
+    NormalizedShellCommand {
+        has_leading_env_assignment,
+        words,
+        has_ambiguous_redirection,
+    }
+}
+
+fn is_git_write_verb(verb: &str) -> bool {
+    matches!(
+        verb.to_ascii_lowercase().as_str(),
+        "am" | "commit"
+            | "push"
+            | "pull"
+            | "reset"
+            | "clean"
+            | "rebase"
+            | "merge"
+            | "cherry-pick"
+            | "revert"
+            | "branch"
+            | "checkout"
+            | "switch"
+            | "tag"
+            // Index and working-tree mutations. These are conservatively gated
+            // to medium risk; read-only subcommands such as `git stash list` are
+            // over-approved in the safe direction rather than parsed further.
+            | "add"
+            | "rm"
+            | "mv"
+            | "restore"
+            | "apply"
+            | "stash"
+    )
+}
+
+fn git_command_is_write(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return false;
+    };
+    let subcommand = args[subcommand_idx].as_str();
+    if is_git_write_verb(subcommand) {
+        return true;
+    }
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "archive" => {
+            if git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+                arg.starts_with("-o") || git_arg_is_long_option_or_abbreviation(arg, "--output")
+            }) {
+                return true;
+            }
+        }
+        "bundle" => {
+            if git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+                .is_some_and(|action| git_arg_eq(action, "create"))
+            {
+                return true;
+            }
+        }
+        "diff" | "diff-tree" | "diff-files" | "diff-index" | "log" | "show" | "whatchanged" => {
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+            {
+                return true;
+            }
+        }
+        "fsck" => {
+            // `git fsck --lost-found` writes recovered objects into
+            // `.git/lost-found/`, so it mutates the repository despite `fsck`
+            // being a read by default.
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--lost-found"))
+            {
+                return true;
+            }
+        }
+        "format-patch" => return true,
+        _ => {}
+    }
+
+    git_arg_eq(subcommand, "worktree")
+        && git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| !git_arg_eq(action, "list"))
+}
+
+fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        match arg {
+            "--" => return args.get(idx + 1).map(|_| idx + 1),
+            // Global options whose value is a separate following token. Git
+            // consumes that token as the option value, so the real subcommand is
+            // the token after it. Missing any of these lets a value that
+            // resembles a read verb hide the actual (possibly mutating)
+            // subcommand from the approval classifier: `git --attr-source log
+            // commit` runs `commit`, not `log`. `-c`/`--config-env` also take a
+            // separate value and are included so this resolver is correct on its
+            // own, independent of the allowlist gate that separately rejects
+            // them.
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+            | "--super-prefix" | "--attr-source" | "-c" | "--config-env" => {
+                idx += 2;
+            }
+            "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-pager"
+            | "--paginate"
+            | "--version"
+            | "--help"
+            | "-h"
+            | "-p" => {
+                idx += 1;
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                idx += 1;
+            }
+            _ if arg.starts_with("--git-dir=")
+                || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=")
+                || arg.starts_with("--exec-path=")
+                || arg.starts_with("--super-prefix=")
+                || arg.starts_with("--attr-source=")
+                || arg.starts_with("--config-env=") =>
+            {
+                idx += 1;
+            }
+            _ if arg.starts_with('-') => {
+                idx += 1;
+            }
+            _ => return Some(idx),
+        }
+    }
+
+    None
+}
+
+fn git_subcommand_is_policy_modeled(subcommand: &str) -> bool {
+    if subcommand.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return false;
+    }
+
+    is_git_write_verb(subcommand)
+        || matches!(
+            subcommand,
+            "add"
+                | "apply"
+                | "archive"
+                | "bisect"
+                | "blame"
+                | "bundle"
+                | "cat-file"
+                | "check-attr"
+                | "check-ignore"
+                | "check-mailmap"
+                | "check-ref-format"
+                | "clone"
+                | "count-objects"
+                | "describe"
+                | "diff"
+                | "diff-files"
+                | "diff-index"
+                | "diff-tree"
+                | "fetch"
+                | "for-each-ref"
+                | "format-patch"
+                | "fsck"
+                | "gc"
+                | "grep"
+                | "help"
+                | "init"
+                | "log"
+                | "ls-files"
+                | "ls-remote"
+                | "ls-tree"
+                | "maintenance"
+                | "merge-base"
+                | "merge-tree"
+                | "mv"
+                | "name-rev"
+                | "notes"
+                | "range-diff"
+                | "reflog"
+                | "remote"
+                | "restore"
+                | "rev-list"
+                | "rev-parse"
+                | "rm"
+                | "shortlog"
+                | "show"
+                | "show-branch"
+                | "show-ref"
+                | "sparse-checkout"
+                | "stash"
+                | "status"
+                | "submodule"
+                | "verify-commit"
+                | "verify-tag"
+                | "version"
+                | "whatchanged"
+                | "worktree"
+        )
+}
+
+fn git_delegates_to_external_command(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg));
+    };
+
+    if args[..subcommand_idx]
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg))
+    {
+        return true;
+    }
+
+    let subcommand = args[subcommand_idx].as_str();
+    if !git_subcommand_is_policy_modeled(subcommand) {
+        return true;
+    }
+
+    if git_subcommand_selects_remote_helper(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    if git_subcommand_selects_transfer_program(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    let subcommand_args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    if (git_arg_eq(subcommand, "clone") && subcommand_args().any(git_arg_is_clone_process_control))
+        || (git_arg_eq(subcommand, "init")
+            && subcommand_args().any(git_arg_is_template_process_control))
+        || (git_arg_eq(subcommand, "rebase")
+            && subcommand_args().any(git_arg_is_rebase_process_control))
+    {
+        return true;
+    }
+
+    if git_arg_eq(subcommand, "difftool")
+        || git_arg_eq(subcommand, "difftool--helper")
+        || git_arg_eq(subcommand, "mergetool")
+        || git_arg_eq(subcommand, "mergetool--helper")
+        || git_arg_eq(subcommand, "submodule--helper")
+    {
+        return true;
+    }
+
+    if git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_is_external_diff_option) {
+        return true;
+    }
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "bisect" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "run")),
+        "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "foreach")),
+        "grep" => {
+            git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_opens_files_in_pager)
+        }
+        "help" => git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+            git_arg_eq(arg, "-w") || git_arg_is_long_option_or_abbreviation(arg, "--web")
+        }),
+        _ => false,
+    }
+}
+
+fn git_args_before_pathspec(args: &[String], start: usize) -> impl Iterator<Item = &str> {
+    args[start..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+}
+
+fn git_first_non_option_before_pathspec(args: &[String], start: usize) -> Option<&str> {
+    git_args_before_pathspec(args, start).find(|arg| !arg.starts_with('-'))
+}
+
+fn git_arg_eq(arg: &str, expected: &str) -> bool {
+    arg.eq_ignore_ascii_case(expected)
+}
+
+fn git_arg_starts_with(arg: &str, prefix: &str) -> bool {
+    arg.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn git_arg_is_paginate(arg: &str) -> bool {
+    git_arg_eq(arg, "-p") || git_arg_eq(arg, "--paginate")
+}
+
+fn git_arg_is_external_diff_option(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--ext-diff")
+        || git_arg_eq(arg, "--extcmd")
+        || git_arg_starts_with(arg, "--extcmd=")
+}
+
+fn git_subcommand_selects_transfer_program(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" => {
+            args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--upload-pack"))
+        }
+        "push" => args().any(|arg| {
+            git_arg_is_long_option_or_abbreviation(arg, "--receive-pack")
+                || git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        }),
+        "archive" => args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--exec")),
+        _ => false,
+    }
+}
+
+fn git_arg_is_clone_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--config")
+        || git_arg_is_template_process_control(arg)
+        || git_arg_eq(arg, "-u")
+        || git_arg_starts_with(arg, "-u")
+}
+
+fn git_arg_is_template_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--template")
+}
+
+fn git_arg_is_rebase_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        || arg
+            .strip_prefix('-')
+            .is_some_and(|options| !options.starts_with('-') && options.contains('x'))
+}
+
+fn git_arg_is_long_option_or_abbreviation(arg: &str, option: &str) -> bool {
+    let supplied_name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    supplied_name.len() > 2 && option.starts_with(supplied_name)
+}
+
+fn git_arg_selects_remote_helper(arg: &str) -> bool {
+    let endpoint = arg
+        .split_once('=')
+        .filter(|(name, _)| git_arg_is_long_option_or_abbreviation(name, "--remote"))
+        .map_or(arg, |(_, value)| value);
+    if endpoint
+        .split_once("::")
+        .is_some_and(|(transport, address)| {
+            git_remote_helper_transport_is_valid(transport) && !address.is_empty()
+        })
+    {
+        return true;
+    }
+
+    let Some((scheme, address)) = endpoint.split_once("://") else {
+        return false;
+    };
+    git_remote_helper_transport_is_valid(scheme)
+        && !address.is_empty()
+        && ![
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_remote_helper_transport_is_valid(transport: &str) -> bool {
+    let mut chars = transport.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn git_subcommand_selects_remote_helper(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let command_args = &args[subcommand_idx + 1..];
+    if subcommand == "archive" {
+        return git_archive_remote_selects_helper(command_args);
+    }
+
+    let scans_remote = match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" | "push" => true,
+        "remote" | "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| git_arg_eq(action, "add") || git_arg_eq(action, "set-url")),
+        _ => false,
+    };
+    scans_remote
+        && command_args.iter().enumerate().any(|(idx, arg)| {
+            git_arg_selects_remote_helper(arg)
+                && !git_helper_like_arg_is_inert_value(command_args, idx, subcommand)
+        })
+}
+
+fn git_helper_like_arg_is_inert_value(args: &[String], idx: usize, subcommand: &str) -> bool {
+    match (subcommand, args) {
+        ("clone", [source, _]) if idx == 1 => git_arg_is_known_safe_remote_url(source),
+        ("submodule", [action, source, _]) if idx == 2 && git_arg_eq(action, "add") => {
+            git_arg_is_known_safe_remote_url(source)
+        }
+        _ => false,
+    }
+}
+
+fn git_arg_is_known_safe_remote_url(arg: &str) -> bool {
+    let Some((scheme, address)) = arg.split_once("://") else {
+        return false;
+    };
+    !address.is_empty()
+        && [
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_archive_remote_selects_helper(args: &[String]) -> bool {
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx).map(String::as_str) {
+        if arg == "--" {
+            return false;
+        }
+        if let Some((name, value)) = arg.split_once('=')
+            && git_arg_is_long_option_or_abbreviation(name, "--remote")
+            && git_arg_selects_remote_helper(value)
+        {
+            return true;
+        }
+        if !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote") {
+            match args.get(idx + 1).map(String::as_str) {
+                Some(value) if git_arg_selects_remote_helper(value) => return true,
+                _ => {}
+            }
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    false
+}
+
+fn git_arg_opens_files_in_pager(arg: &str) -> bool {
+    if git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager") {
+        return true;
+    }
+    // `git grep -O[<pager>]` opens matches in a pager (external command), even
+    // when clustered behind other short flags (e.g. `-nO`). The scan is
+    // case-sensitive: `-o` is `--only-matching`, a read. Stop at the first
+    // value-consuming short option so its argument is not misread as flags.
+    let Some(short_run) = arg.strip_prefix('-').filter(|run| !run.starts_with('-')) else {
+        return false;
+    };
+    for ch in short_run.chars() {
+        match ch {
+            'O' => return true,
+            // Options whose value consumes the remainder of the run (or the
+            // next argument): `-A`/`-B`/`-C` (context), `-e`/`-f` (patterns),
+            // `-m` (max-count), and any glued `=value`.
+            'A' | 'B' | 'C' | 'e' | 'f' | 'm' | '=' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -1059,10 +2945,12 @@ fn strip_fd_merge_redirects(command: &str) -> String {
 
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_unquoted_single_ampersand(command: &str) -> bool {
+fn contains_unquoted_single_ampersand(command: &str, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -1076,7 +2964,7 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -1089,12 +2977,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     // This must consume the second '&' so `&&` is not later
                     // re-read as a lone trailing '&'.
@@ -1111,9 +2999,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
 }
 
 /// Detect an unquoted character in a shell command.
-fn contains_unquoted_char(command: &str, target: char) -> bool {
+fn contains_unquoted_char(command: &str, target: char, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax =
+        matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell);
 
     for ch in command.chars() {
         match quote {
@@ -1127,7 +3018,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -1140,12 +3031,12 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     _ if ch == target => return true,
                     _ => {}
@@ -1171,10 +3062,14 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
             r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
             safe_device_redirect_names_pattern()
         ))
-        .unwrap()
+        .expect("static safe-device redirect regex must compile")
     });
 
-    let safe = re.replace_all(command, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        re.replace_all(command, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Windows null device: strip `>nul`, `1>nul`, `2>nul`, `2>NUL`, and the
     // `\\.\nul` device form (case-insensitive) — the platform equivalent of the
     // `/dev/null` forms stripped above. A trailing non-boundary char (e.g.
@@ -1197,7 +3092,7 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
     };
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '>')
+    contains_unquoted_char(&safe, '>', dialect)
 }
 
 /// POSIX-dialect convenience wrapper for tests — the conservative default that
@@ -1210,7 +3105,7 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
-fn contains_unquoted_input_redirect(command: &str) -> bool {
+fn contains_unquoted_input_redirect(command: &str, dialect: ShellDialect) -> bool {
     // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
     // with word boundary enforcement.
     use regex::Regex;
@@ -1221,11 +3116,15 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
         Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
     });
 
-    let safe = command.replace("<<<", "").replace("<<", "");
-    let safe = re.replace_all(&safe, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        let safe = command.replace("<<<", "").replace("<<", "");
+        re.replace_all(&safe, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '<')
+    contains_unquoted_char(&safe, '<', dialect)
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -1290,10 +3189,155 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
         if next.is_ascii_alphanumeric()
             || matches!(
                 next,
-                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+                '_' | '{'
+                    | '('
+                    | '#'
+                    | '?'
+                    | '!'
+                    | '$'
+                    | '*'
+                    | '@'
+                    | '-'
+                    | '='
+                    | '+'
+                    | '^'
+                    | '~'
+                    | '['
+                    | '<'
             )
         {
             return true;
+        }
+    }
+
+    false
+}
+
+fn contains_unmodeled_shell_word_expansion(command: &str, dialect: ShellDialect) -> bool {
+    if command.contains("\\\n") || command.contains("\\\r\n") {
+        return true;
+    }
+
+    // cmd.exe expands `%NAME%` variables, can expand `!NAME!` variables when
+    // delayed expansion is enabled by host policy, and removes caret escapes
+    // before launching the executable. The policy does not model those
+    // transforms, so reject them before command identity or Git risk is accepted.
+    if shell_uses_windows_path_syntax(dialect) && command.contains(['%', '!', '^']) {
+        return true;
+    }
+
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut at_tilde_prefix = true;
+    let mut assignment_name_valid = true;
+    let mut assignment_name_len = 0usize;
+    let mut in_assignment_value = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
+                continue;
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
+                continue;
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '<' | '>') {
+                    at_tilde_prefix = true;
+                    assignment_name_valid = true;
+                    assignment_name_len = 0;
+                    in_assignment_value = false;
+                    continue;
+                }
+                if ch == '='
+                    && !in_assignment_value
+                    && assignment_name_valid
+                    && assignment_name_len > 0
+                {
+                    in_assignment_value = true;
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                if ch == ':' && in_assignment_value {
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
+                        continue;
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
+                        continue;
+                    }
+                    '$' if chars.peek().is_some_and(|next| matches!(*next, '\'' | '"')) => {
+                        return true;
+                    }
+                    // Parentheses participate in extended-glob syntax in
+                    // supported configurable shells such as ksh. Even when
+                    // the operator prefix is otherwise ordinary text, the
+                    // shell can replace the token after policy validation.
+                    // zsh EXTENDED_GLOB also gives unquoted `#` and `^`
+                    // pattern meaning, while infix `~` excludes a pattern.
+                    // Preserve leading and assignment-value `~` expansion.
+                    '{' | '}' | '(' | ')' | '*' | '?' | '[' => return true,
+                    '^' | '#' if dialect == ShellDialect::Posix => return true,
+                    '~' if dialect == ShellDialect::Posix && !at_tilde_prefix => return true,
+                    _ => {}
+                }
+                if !in_assignment_value {
+                    let valid_name_char = if assignment_name_len == 0 {
+                        ch.is_ascii_alphabetic() || ch == '_'
+                    } else {
+                        ch.is_ascii_alphanumeric()
+                            || ch == '_'
+                            || (ch == '+' && chars.peek().is_some_and(|next| *next == '='))
+                    };
+                    assignment_name_valid &= valid_name_char;
+                    assignment_name_len += 1;
+                }
+                at_tilde_prefix = false;
+            }
         }
     }
 
@@ -1324,6 +3368,10 @@ fn looks_like_path(candidate: &str) -> bool {
 
 fn shell_uses_windows_path_syntax(dialect: ShellDialect) -> bool {
     matches!(dialect, ShellDialect::WindowsCmd | ShellDialect::PowerShell)
+}
+
+fn shell_uses_single_quote_syntax(dialect: ShellDialect) -> bool {
+    matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
 }
 
 fn has_windows_drive_prefix(candidate: &str) -> bool {
@@ -1397,28 +3445,24 @@ enum RedirectionArgument<'a> {
     None,
 }
 
-fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
-    let Some(marker_idx) = token.find(['<', '>']) else {
-        return RedirectionArgument::None;
-    };
-    let prefix = token[..marker_idx].trim();
-    let mut rest = &token[marker_idx + 1..];
-    rest = rest.trim_start_matches(['<', '>']);
-    if let Some(after_amp) = rest.strip_prefix('&') {
-        let remaining = after_amp.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
-        if remaining.is_empty() {
-            return RedirectionArgument::FdOnly { prefix };
-        }
+fn parse_redirection_argument_at(
+    token: &str,
+    metadata: RedirectionMetadata,
+) -> RedirectionArgument<'_> {
+    let prefix = &token[..metadata.marker_idx];
+    let rest = &token[metadata.operator_end..];
+    if let Some(after_amp) = rest.strip_prefix('&')
+        && (after_amp == "-"
+            || (!after_amp.is_empty() && after_amp.chars().all(|c| c.is_ascii_digit())))
+    {
+        return RedirectionArgument::FdOnly { prefix };
     }
-    rest = rest.trim_start_matches('&');
-    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
+    if rest.is_empty() && !metadata.has_attached_word {
         RedirectionArgument::NeedsNextToken { prefix }
     } else {
         RedirectionArgument::Target {
             prefix,
-            target: trimmed,
+            target: rest,
         }
     }
 }
@@ -1436,7 +3480,7 @@ fn safe_device_redirect_names_pattern() -> String {
 
 fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
     let target = strip_wrapping_quotes(target).trim();
-    if SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
+    if matches!(dialect, ShellDialect::Posix) && SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
         return true;
     }
     // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
@@ -1448,18 +3492,23 @@ fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
         && (target.eq_ignore_ascii_case("nul") || target.eq_ignore_ascii_case(r"\\.\nul"))
 }
 
-/// Extract the basename from a command path, handling both Unix (`/`) and
-/// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
-fn command_basename(raw: &str) -> &str {
+/// Extract the basename using the shell dialect's path separators.
+/// Windows command dialects accept both `/` and `\`, while POSIX treats `\`
+/// as a literal that can escape the following character.
+fn command_basename_for_shell(raw: &str, dialect: ShellDialect) -> &str {
     let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
-    after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    if shell_uses_windows_path_syntax(dialect) {
+        after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    } else {
+        after_fwd
+    }
 }
 
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
-/// matching against allowlists and risk tables. On non-Windows platforms this
-/// is a no-op that returns the input unchanged.
-fn strip_windows_exe_suffix(name: &str) -> &str {
-    if cfg!(target_os = "windows") {
+/// matching against allowlists and risk tables. POSIX command dialects keep
+/// suffixes literal even when the host itself is Windows.
+fn strip_windows_exe_suffix_for_shell(name: &str, dialect: ShellDialect) -> &str {
+    if shell_uses_windows_path_syntax(dialect) {
         name.strip_suffix(".exe")
             .or_else(|| name.strip_suffix(".cmd"))
             .or_else(|| name.strip_suffix(".bat"))
@@ -1496,6 +3545,26 @@ fn command_names_equivalent(left: &str, right: &str) -> bool {
     false
 }
 
+fn command_names_equivalent_for_shell(left: &str, right: &str, dialect: ShellDialect) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    if shell_uses_windows_path_syntax(dialect) {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}")
+                || left_lower == format!("{right_lower}{ext}")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     let left = strip_wrapping_quotes(left).trim();
     let right = strip_wrapping_quotes(right).trim();
@@ -1512,7 +3581,12 @@ fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     command_names_equivalent(left, right)
 }
 
-fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+fn is_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+    dialect: ShellDialect,
+) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
         return false;
@@ -1535,7 +3609,7 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     // Callers lowercase the basename before it reaches here, so folding only
     // one side would leave an entry written as `Git` or `Docker` unable to
     // match anything.
-    command_names_equivalent(allowed, executable_base)
+    command_names_equivalent_for_shell(allowed, executable_base, dialect)
 }
 
 /// Decide whether a completed PowerShell token must be rejected by the bounded
@@ -1703,6 +3777,16 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
 fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
     let segments = split_powershell_pipeline_syntax(command)?;
     powershell_variables_are_simple(command).then_some(segments)
+}
+
+/// Return whether `command` fits the one canonical bounded PowerShell grammar.
+///
+/// Native PowerShell execution uses this to decide whether a setup statement
+/// can be prepended without rewriting a full script. Inputs outside this
+/// grammar must remain byte-for-byte unchanged so declarations, named blocks,
+/// and other PowerShell syntax keep their native `-Command` behavior.
+pub(crate) fn powershell_command_supports_statement_prelude(command: &str) -> bool {
+    split_simple_powershell_pipeline(command).is_some()
 }
 
 /// Accept only `$Name` and `$Name.Property` reads outside single-quoted
@@ -1996,31 +4080,14 @@ fn generic_segment_risk(
     }
 
     match base {
-        "git" => Some(
-            if args.first().is_some_and(|verb| {
-                matches!(
-                    verb.as_str(),
-                    "commit"
-                        | "push"
-                        | "reset"
-                        | "clean"
-                        | "rebase"
-                        | "merge"
-                        | "cherry-pick"
-                        | "revert"
-                        | "branch"
-                        | "checkout"
-                        | "switch"
-                        | "tag"
-                )
-            }) {
-                CommandRiskLevel::Medium
-            } else {
-                CommandRiskLevel::Low
-            },
-        ),
+        "git" => Some(if git_command_is_write(args) {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }),
         "npm" | "pnpm" | "yarn" => Some(
             if args.first().is_some_and(|verb| {
+                let verb = verb.to_ascii_lowercase();
                 matches!(
                     verb.as_str(),
                     "install" | "add" | "remove" | "uninstall" | "update" | "publish"
@@ -2033,6 +4100,7 @@ fn generic_segment_risk(
         ),
         "cargo" => Some(
             if args.first().is_some_and(|verb| {
+                let verb = verb.to_ascii_lowercase();
                 matches!(
                     verb.as_str(),
                     "add" | "remove" | "install" | "clean" | "publish"
@@ -2057,19 +4125,36 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix)
+    }
+
+    fn command_risk_level_for_posix_like_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command) {
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            // The body boundary cannot be proven, so the risk of the commands
+            // after it cannot be proven either.
+            return CommandRiskLevel::High;
+        };
+        for segment in segments {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(base_raw) = words.next() else {
+            let normalized = normalized_shell_command(&segment, dialect);
+            if normalized.has_ambiguous_redirection {
+                return CommandRiskLevel::High;
+            }
+            let words = normalized.words;
+            let Some(base_raw) = words.first() else {
                 continue;
             };
 
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
-            let base = strip_windows_exe_suffix(&base_owned);
+            let base_owned = command_basename_for_shell(base_raw, dialect).to_ascii_lowercase();
+            let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
 
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            let args: Vec<String> = words.iter().skip(1).cloned().collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
             match generic_segment_risk(base, &args, &joined_segment) {
@@ -2094,7 +4179,7 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         match dialect {
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                return self.command_risk_level(command);
+                return self.command_risk_level_for_posix_like_shell(command, dialect);
             }
             ShellDialect::None => return CommandRiskLevel::High,
             ShellDialect::PowerShell => {}
@@ -2111,15 +4196,16 @@ impl SecurityPolicy {
             let Some(base_raw) = words.next() else {
                 return CommandRiskLevel::High;
             };
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
+            let base_owned =
+                command_basename_for_shell(base_raw, ShellDialect::PowerShell).to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
                 return CommandRiskLevel::High;
             }
             let base = strip_powershell_executable_suffix(&base_owned);
             let arguments: Vec<&str> = words.collect();
-            let arguments_lower: Vec<String> = arguments
+            let arguments_cased: Vec<String> = arguments
                 .iter()
-                .map(|argument| argument.to_ascii_lowercase())
+                .map(|argument| (*argument).to_string())
                 .collect();
             if arguments
                 .iter()
@@ -2159,7 +4245,7 @@ impl SecurityPolicy {
                 None => {}
             }
 
-            match generic_segment_risk(base, &arguments_lower, &segment.to_ascii_lowercase()) {
+            match generic_segment_risk(base, &arguments_cased, &segment.to_ascii_lowercase()) {
                 Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
                 Some(CommandRiskLevel::Medium) => saw_medium = true,
                 Some(CommandRiskLevel::Low) => {}
@@ -2208,6 +4294,19 @@ impl SecurityPolicy {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
 
+        // Path confinement here is specific to Windows shell dialects, whose
+        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
+        // scanner cannot recognize. Run it before the allowlist so a path-shaped
+        // executable cannot be rejected as merely unknown before confinement
+        // reports the actual boundary violation. POSIX path policy is already
+        // enforced by that wrapper; running it again here would reject legitimate
+        // absolute arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
+        if shell_uses_windows_path_syntax(dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+        {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
         if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -2238,17 +4337,6 @@ impl SecurityPolicy {
             );
         }
 
-        // Path confinement here is specific to Windows shell dialects, whose
-        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
-        // scanner cannot recognize. POSIX path policy is already enforced by
-        // that wrapper; running it again here would reject legitimate absolute
-        // arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
-        if shell_uses_windows_path_syntax(dialect)
-            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
-        {
-            return Err(format!("Command blocked: forbidden path argument: {path}"));
-        }
-
         Ok(risk)
     }
 
@@ -2266,7 +4354,8 @@ impl SecurityPolicy {
                     let raw_executable =
                         strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
                             .trim();
-                    let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+                    let base_owned =
+                        command_basename_for_shell(raw_executable, dialect).to_ascii_lowercase();
                     let base = strip_powershell_executable_suffix(&base_owned);
                     !base.is_empty()
                         && !is_powershell_batch_file(&base_owned)
@@ -2281,25 +4370,27 @@ impl SecurityPolicy {
                 })
             }
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command)
+                self.is_command_explicitly_allowed(command, dialect)
             }
             ShellDialect::None => false,
         }
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
-        let segments = split_unquoted_segments(command);
+    fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+        // A split that refuses a heredoc proves no command is listed.
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            return false;
+        };
         for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let normalized = normalized_shell_command(segment, dialect);
+            if normalized.has_ambiguous_redirection {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -2311,7 +4402,7 @@ impl SecurityPolicy {
                 if allowed.is_empty() || allowed == "*" {
                     return false;
                 }
-                is_allowlist_entry_match(allowed, executable, base_cmd)
+                is_allowlist_entry_match(allowed, executable, base_cmd, dialect)
             });
 
             if !explicitly_listed {
@@ -2321,8 +4412,10 @@ impl SecurityPolicy {
 
         // At least one real command must be present.
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            normalized_shell_command(s.trim(), dialect)
+                .words
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -2380,7 +4473,8 @@ impl SecurityPolicy {
                 return false;
             }
 
-            let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+            let base_owned = command_basename_for_shell(raw_executable, ShellDialect::PowerShell)
+                .to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
                 return false;
             }
@@ -2423,13 +4517,31 @@ impl SecurityPolicy {
         // $(), heredocs, etc. in trusted environments.
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
-            return true;
+            // The opt-out skips syntax restrictions, but not a heredoc whose
+            // body boundary cannot be proven. The path and risk checks refuse
+            // that command for the same reason.
+            return split_unquoted_segments_checked(command, dialect).is_ok();
         }
 
         if command.contains('`')
             || contains_unquoted_shell_variable_expansion(command)
+            || contains_unmodeled_shell_word_expansion(command, dialect)
             || command.contains("<(")
             || command.contains(">(")
+        {
+            return false;
+        }
+
+        // POSIX subshells split into their own segments below, so `(git status)`
+        // would be checked as plain `git status`. Keep rejecting unquoted
+        // grouping syntax here so the segment split does not widen the strict
+        // allowlist; `$(`, `<(`, `>(`, and backticks are rejected above.
+        // `contains_unmodeled_shell_word_expansion` already rejects unquoted
+        // `(` and `)` as extended-glob syntax, so this duplicates that check on
+        // purpose: the allowlist must not rely on the glob rule staying broad.
+        if matches!(dialect, ShellDialect::Posix)
+            && (contains_unquoted_char(command, '(', dialect)
+                || contains_unquoted_char(command, ')', dialect))
         {
             return false;
         }
@@ -2441,7 +4553,7 @@ impl SecurityPolicy {
         if contains_unsafe_output_redirect_for_shell(command, dialect) {
             return false;
         }
-        if contains_unquoted_input_redirect(command) {
+        if contains_unquoted_input_redirect(command, dialect) {
             return false;
         }
 
@@ -2459,28 +4571,26 @@ impl SecurityPolicy {
         // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
+        if contains_unquoted_single_ampersand(&ampersand_check, dialect) {
             return false;
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
+        // An unreadable heredoc yields no segments, which must not read as
+        // "every segment is allowed".
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            return false;
+        };
         for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            // Strip inline redirections from the executable token, e.g.
-            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
-            // command name rather than the redirect target path.
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let normalized = normalized_shell_command(segment, dialect);
+            if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -2489,7 +4599,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd, dialect))
             {
                 return false;
             }
@@ -2498,7 +4608,7 @@ impl SecurityPolicy {
             // Both case-preserved and lowercased argument lists are provided:
             //   - `args_cased` for case-sensitive comparisons (e.g. git -C vs -c)
             //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
-            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args_cased: Vec<String> = words.iter().skip(1).cloned().collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args, &args_cased) {
                 return false;
@@ -2507,8 +4617,10 @@ impl SecurityPolicy {
 
         // At least one command must be present
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            normalized_shell_command(s.trim(), dialect)
+                .words
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -2516,18 +4628,30 @@ impl SecurityPolicy {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                // GNU/BSD find execution predicates allow arbitrary child commands.
+                !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
             }
             "git" => {
-                !args_cased.iter().any(|arg| arg == "-c")
+                !args_cased.iter().any(|arg| arg.starts_with("-c"))
+                    && !git_delegates_to_external_command(args_cased)
                     && !args.iter().any(|arg| {
-                        arg == "config"
+                        arg == "--config-env"
+                            || arg.starts_with("--config-env=")
+                            || arg == "--exec-path"
+                            || arg.starts_with("--exec-path=")
+                            || arg == "config"
                             || arg.starts_with("config.")
                             || arg == "alias"
                             || arg.starts_with("alias.")
                     })
             }
+            // `env` is also a command carrier. Its option, assignment, and
+            // child-command grammar varies across platforms, so accepting
+            // arguments here would let the nested executable bypass this
+            // allowlist and risk-classification boundary.
+            "env" => args.is_empty(),
             "python" | "python3" => !args
                 .iter()
                 .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
@@ -2598,6 +4722,11 @@ impl SecurityPolicy {
         dialect: ShellDialect,
         resolve_workspace: bool,
     ) -> Option<String> {
+        if split_unquoted_segments_checked(command, dialect).is_err() {
+            // Name the opener rather than a path. The shell wrapper refuses
+            // any `Some`, and guessing which later command runs is the bypass.
+            return Some("unreadable heredoc delimiter".into());
+        }
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -2671,24 +4800,29 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
+        for segment in split_unquoted_segments(command, dialect) {
+            let words = shell_words_after_env_assignments(&segment, dialect);
+            let Some(executable) = words.first() else {
                 continue;
             };
 
-            let executable_candidate = strip_wrapping_quotes(executable).trim();
-            let executable_without_redirect = executable_candidate
-                .find(['<', '>'])
-                .map_or(executable_candidate, |index| &executable_candidate[..index]);
+            let executable_redirect = executable
+                .redirection
+                .map_or(RedirectionArgument::None, |metadata| {
+                    parse_redirection_argument_at(&executable.text, metadata)
+                });
+
+            let executable_without_redirect = match executable_redirect {
+                RedirectionArgument::Target { prefix, .. }
+                | RedirectionArgument::NeedsNextToken { prefix }
+                | RedirectionArgument::FdOnly { prefix } => strip_wrapping_quotes(prefix).trim(),
+                RedirectionArgument::None => strip_wrapping_quotes(&executable.text).trim(),
+            };
             if !executable_has_explicit_path_allowlist(executable_without_redirect)
                 && let Some(blocked) = forbidden_non_redirect_candidate(executable_without_redirect)
             {
                 return Some(blocked);
             }
-
-            let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
             let mut next_is_redirect_target = false;
             // Cover inline forms like `cat</etc/passwd`.
             match executable_redirect {
@@ -2705,8 +4839,8 @@ impl SecurityPolicy {
                 RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
-            for token in words {
-                let candidate = strip_wrapping_quotes(token).trim();
+            for token in words.iter().skip(1) {
+                let candidate = strip_wrapping_quotes(&token.text).trim();
                 if candidate.is_empty() {
                     continue;
                 }
@@ -2726,7 +4860,12 @@ impl SecurityPolicy {
                     continue;
                 }
 
-                match parse_redirection_argument(candidate) {
+                let redirection = token
+                    .redirection
+                    .map_or(RedirectionArgument::None, |metadata| {
+                        parse_redirection_argument_at(&token.text, metadata)
+                    });
+                match redirection {
                     RedirectionArgument::Target { prefix, target } => {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
@@ -2922,8 +5061,9 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // The null device is always permitted regardless of workspace or
-        // forbidden-path config; the rest of /dev remains blocked as usual.
+        // The host null device is always permitted regardless of workspace or
+        // forbidden-path config (`/dev/null` on Unix, `nul` on Windows); the
+        // rest of /dev remains blocked as usual.
         if is_null_device(&expanded_path) {
             return true;
         }
@@ -2944,6 +5084,29 @@ impl SecurityPolicy {
                 .any(|root| expanded_path.starts_with(root));
 
             if in_workspace || in_allowed_root || in_read_only_root || in_write_only_root {
+                // Deny-before-allow when a `forbidden_paths` entry is at least
+                // as specific as the allowing root, so an explicit forbidden
+                // path nested under an allowed root (or the workspace) still
+                // blocks. A broad default forbidden root (e.g. `/home`) does
+                // not override a more specific operator allowlist entry.
+                let allow_depth = deepest_allow_depth(
+                    &self.workspace_dir,
+                    &[
+                        &self.allowed_roots,
+                        &self.allowed_roots_read_only,
+                        &self.allowed_roots_write_only,
+                    ],
+                    &expanded_path,
+                    PathMatchNamespace::Configured,
+                );
+                let forbidden_depth = deepest_forbidden_depth(
+                    &self.forbidden_paths,
+                    &expanded_path,
+                    PathMatchNamespace::Configured,
+                );
+                if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                    return false;
+                }
                 return true;
             }
 
@@ -2966,6 +5129,22 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: on Unix `/dev/null` is always readable even if
+        // the device node does not resolve; on Windows `nul` / `\\.\nul` are
+        // not canonicalizable paths. See `is_null_device`.
+        if is_null_device(resolved) {
+            return true;
+        }
+        // Keep the target in the same filesystem namespace as every policy
+        // prefix, even when a caller supplies an absolute but not yet fully
+        // resolved spelling. Failure to resolve (for example, a symlink cycle)
+        // must deny rather than fall back to a potentially aliased path.
+        let Some(resolved_path) = resolve_symlinked_path(resolved) else {
+            return false;
+        };
+        let resolved = resolved_path.as_path();
+
         // Universal POSIX device files: any operator running on Linux,
         // macOS, or BSD expects these to be readable. Adding them to
         // the per-agent config would be friction without security
@@ -2986,24 +5165,33 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
+
+        let allow_depth = deepest_allow_depth(
+            &workspace_root,
+            &[&self.allowed_roots, &self.allowed_roots_read_only],
+            resolved,
+            PathMatchNamespace::Resolved,
+        );
+
+        if allow_depth.is_some() {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies reads even inside the
+            // workspace or a read allowlist. A broad default forbidden root
+            // (e.g. `/home`) does not override a more specific allowlist entry.
+            let forbidden_depth = deepest_forbidden_depth(
+                &self.forbidden_paths,
+                resolved,
+                PathMatchNamespace::Resolved,
+            );
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
         }
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-        for root in &self.allowed_roots_read_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
+
         for root in &self.allowed_roots_write_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
+            if namespace_prefix_match_depth(root, resolved, PathMatchNamespace::Resolved).is_some()
+            {
                 return false;
             }
         }
@@ -3011,11 +5199,14 @@ impl SecurityPolicy {
         // Forbidden paths gate after the explicit allowlists so the
         // allowlists can coexist with broad default forbidden roots
         // such as `/home` and `/tmp`.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
+        if deepest_forbidden_depth(
+            &self.forbidden_paths,
+            resolved,
+            PathMatchNamespace::Resolved,
+        )
+        .is_some()
+        {
+            return false;
         }
         if !self.workspace_only {
             return true;
@@ -3023,37 +5214,118 @@ impl SecurityPolicy {
         false
     }
 
-    /// Return the canonical allowlisted root directory that authorizes reading
-    /// `resolved`: the workspace first, then read-write roots, then read-only
-    /// roots. Callers bind a directory-handle-scoped open (cap-std beneath/
-    /// no-follow) to this boundary instead of re-walking a pathname that could be
-    /// swapped between the readability check and the open. Returns `None` when no
-    /// bounded allowlist root contains the path (e.g. a fully permissive,
-    /// non-`workspace_only` policy, or a device path) — there is then no
-    /// confinement boundary to bind to. Assumes `resolved` is already canonical
-    /// and has passed [`Self::is_resolved_path_readable`].
-    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
-            return Some(workspace_root);
-        }
-        for root in self
-            .allowed_roots
-            .iter()
-            .chain(self.allowed_roots_read_only.iter())
-        {
+    fn configured_approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        let mut approved_roots = Vec::new();
+        for root in std::iter::once(&self.workspace_dir).chain(self.allowed_roots.iter()) {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return Some(canonical);
+            if resolved.starts_with(&canonical) && !approved_roots.contains(&canonical) {
+                approved_roots.push(canonical);
             }
         }
-        None
+        if include_read_only {
+            for root in &self.allowed_roots_read_only {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if resolved.starts_with(&canonical) && !approved_roots.contains(&canonical) {
+                    approved_roots.push(canonical);
+                }
+            }
+        }
+        approved_roots
+    }
+
+    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        // A non-workspace-only policy authorizes paths outside every configured
+        // root (subject to the ordinary forbidden-path checks). It therefore
+        // has no bounded discovery root; callers may continue searching for a
+        // parent-owned resource. The compatibility accessor below retains the
+        // configured-root result for handle-bound file delivery.
+        if !self.workspace_only {
+            return Vec::new();
+        }
+        self.configured_approved_roots(resolved, include_read_only)
+    }
+
+    /// Return every canonical bounded root that authorizes reading `resolved`.
+    ///
+    /// A path can be covered by overlapping grants, such as a workspace nested
+    /// in a broader explicit allowed root. Callers that discover a parent-owned
+    /// resource must consider every applicable boundary; choosing the first one
+    /// would make valid access depend on grant order. Returns an empty vector
+    /// when no bounded allowlist root contains the path (for example, a fully
+    /// permissive non-`workspace_only` policy or a device path). Assumes
+    /// `resolved` is already canonical and has passed
+    /// [`Self::is_resolved_path_readable`].
+    pub fn approved_read_roots(&self, resolved: &Path) -> Vec<PathBuf> {
+        self.approved_roots(resolved, true)
+    }
+
+    /// Return the first canonical configured root that authorizes reading
+    /// `resolved`.
+    ///
+    /// This compatibility accessor intentionally ignores `workspace_only` to
+    /// preserve the existing configured-root contract for handle-bound callers.
+    /// It is not the first value from [`Self::approved_read_roots`];
+    /// parent-resource discovery must use that plural accessor instead.
+    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
+        self.configured_approved_roots(resolved, true)
+            .into_iter()
+            .next()
+    }
+
+    /// Canonicalize a caller-supplied path into the same filesystem namespace
+    /// the policy prefixes live in, exactly as the internal readability and
+    /// allowlist checks do before they compare.
+    ///
+    /// Every accessor that takes a `resolved` path — `is_resolved_path_readable`,
+    /// `is_resolved_path_allowed`, `approved_read_root`, `approved_read_roots`,
+    /// `approved_write_roots` — assumes its input is already canonical. Callers
+    /// that authorize a request and then bind the granted operation to a root
+    /// MUST resolve the request once through this accessor and carry the
+    /// returned target into both the check and the operation. Feeding the raw
+    /// request spelling to `approved_read_root` while checking readability on a
+    /// separately resolved target lets an alias that resolves inside an
+    /// entitled root pass readability yet fall out of every configured root
+    /// (returning `None`/`Unconfined`), after which the operation would touch
+    /// the still-swappable raw path outside the boundary. Returns `None` when
+    /// the path cannot be resolved (a symlink cycle, or a target whose parents
+    /// do not exist); the caller MUST fail closed.
+    pub fn resolve_policy_target(&self, path: &Path) -> Option<PathBuf> {
+        // The host null device may not be canonicalizable (`/dev/null` on Unix
+        // when the device node does not resolve, `nul` on Windows). Return it
+        // as-is so callers that resolve before checking still see the
+        // exception instead of failing closed.
+        if is_null_device(path) {
+            return Some(path.to_path_buf());
+        }
+        resolve_symlinked_path(path)
+    }
+
+    /// Return every canonical bounded root that authorizes writing `resolved`.
+    ///
+    /// This intentionally excludes `allowed_roots_read_only`; callers use it
+    /// when a parent-owned resource may be discovered before a mutation.
+    /// Assumes `resolved` is already canonical and has passed
+    /// [`Self::is_resolved_path_allowed`].
+    pub fn approved_write_roots(&self, resolved: &Path) -> Vec<PathBuf> {
+        self.approved_roots(resolved, false)
     }
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: on Unix `/dev/null` is always writable even if
+        // the device node does not resolve; on Windows `nul` / `\\.\nul` are
+        // not canonicalizable paths. See `is_null_device`.
+        if is_null_device(resolved) {
+            return true;
+        }
+        // See `is_resolved_path_readable`: authorization compares the target,
+        // allow roots, and forbidden entries only after the same resolution
+        // step, and fails closed when no trustworthy target can be produced.
+        let Some(resolved_path) = resolve_symlinked_path(resolved) else {
+            return false;
+        };
+        let resolved = resolved_path.as_path();
+
         if is_null_device(resolved) {
             return true;
         }
@@ -3064,37 +5336,44 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
+
+        // Extra allowed roots and write-only cross-agent grants authorize this
+        // write path. `is_resolved_path_readable` intentionally does not include
+        // write-only roots because `AccessMode::Write` is one-way by design.
+        let allow_depth = deepest_allow_depth(
+            &workspace_root,
+            &[&self.allowed_roots, &self.allowed_roots_write_only],
+            resolved,
+            PathMatchNamespace::Resolved,
+        );
+
+        if allow_depth.is_some() {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies even inside the workspace or
+            // an allowed root, preventing symlink escapes and sensitive-directory
+            // access. A broad default forbidden root (e.g. `/home`) does not
+            // override a more specific operator allowlist entry.
+            let forbidden_depth = deepest_forbidden_depth(
+                &self.forbidden_paths,
+                resolved,
+                PathMatchNamespace::Resolved,
+            );
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
-        }
-
-        // Check extra allowed roots (e.g. shared skills directories) before
-        // forbidden checks so explicit allowlists can coexist with broad
-        // default forbidden roots such as `/home` and `/tmp`.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-
-        // Write-only cross-agent grants land here. The bot can write
-        // under these paths but `is_resolved_path_readable` does not
-        // see them — `AccessMode::Write` is one-way by design.
-        for root in &self.allowed_roots_write_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
         }
 
         // For paths outside workspace/allowlist, block forbidden roots to
         // prevent symlink escapes and sensitive directory access.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
+        if deepest_forbidden_depth(
+            &self.forbidden_paths,
+            resolved,
+            PathMatchNamespace::Resolved,
+        )
+        .is_some()
+        {
+            return false;
         }
 
         // When workspace_only is disabled the user explicitly opted out of
@@ -3444,11 +5723,7 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
-            allowed_tools: if risk_profile.allowed_tools.is_empty() {
-                None
-            } else {
-                Some(risk_profile.allowed_tools.clone())
-            },
+            allowed_tools: risk_profile.effective_allowed_tools(),
             excluded_tools: if risk_profile.excluded_tools.is_empty() {
                 None
             } else {
@@ -3458,6 +5733,7 @@ impl SecurityPolicy {
             always_ask: risk_profile.always_ask.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
+            sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
             tracker: PerSenderTracker::new(),
         }
@@ -3819,10 +6095,12 @@ mod tests {
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
+            deny_all_tools: false,
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            sandbox_image: None,
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
@@ -3893,12 +6171,16 @@ mod tests {
     }
 
     #[test]
-    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+    fn from_profiles_legacy_empty_allowed_tools_means_unrestricted() {
         use crate::schema::RiskProfileConfig;
         use std::path::Path;
 
+        // Both an omitted field (Default → empty) and an explicit
+        // `allowed_tools = []` deserialize to the same legacy state and must
+        // map to unrestricted — an empty list is NOT deny-all.
         let risk = RiskProfileConfig {
-            allowed_tools: Vec::new(),
+            allowed_tools: vec![],
+            deny_all_tools: false,
             ..RiskProfileConfig::default()
         };
 
@@ -3906,13 +6188,81 @@ mod tests {
 
         assert!(
             policy.allowed_tools.is_none(),
-            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
-             from allowed_tools = []; both map to no authorization constraint"
+            "legacy empty allowed_tools must map to unrestricted (None)"
         );
         assert!(
             policy.is_tool_allowed("filesystem__write_file"),
-            "empty risk-profile allowed_tools is unrestricted, not deny-all"
+            "legacy empty allowed_tools is unrestricted, not deny-all"
         );
+    }
+
+    #[test]
+    fn from_profiles_deny_all_tools_flag_means_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec![],
+            deny_all_tools: true, // explicit deny-all gate
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(
+            policy.allowed_tools,
+            Some(vec![]),
+            "deny_all_tools = true must map to Some(vec![]) (deny-all), not None (unrestricted)"
+        );
+        assert!(
+            !policy.is_tool_allowed("shell"),
+            "deny_all_tools denies built-in tools"
+        );
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "deny_all_tools also denies MCP-discovered tools — no auto-admit under deny-all"
+        );
+    }
+
+    #[test]
+    fn from_profiles_legacy_none_sentinel_means_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec![
+                RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+                RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            ],
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("filesystem__write_file"));
+    }
+
+    #[test]
+    fn from_profiles_nonempty_allowed_tools_preserves_closed_set() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec!["shell".into(), "memory_recall".into()],
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(
+            policy.allowed_tools.as_deref(),
+            Some(&["shell".to_string(), "memory_recall".to_string()][..]),
+            "nonempty allowed_tools preserves the explicit closed set"
+        );
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(policy.is_tool_allowed("memory_recall"));
+        assert!(!policy.is_tool_allowed("file_write"));
     }
 
     #[test]
@@ -4222,6 +6572,59 @@ mod tests {
     }
 
     #[test]
+    fn git_value_taking_global_options_do_not_hide_a_mutating_subcommand() {
+        // Regression for the approval-classification bypass where a value-taking
+        // git global option hid the real subcommand from the risk classifier.
+        //
+        // `--attr-source`, `-c`, and `--config-env` each take a *separate*
+        // following token as their value. Git consumes that token, so the real
+        // subcommand is the one after it. When the resolver skipped only the
+        // flag (not its value), a value that looks like a read verb hid the
+        // actual mutating subcommand and the write was classified Low instead of
+        // Medium, dropping the approval requirement.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            // The value (`log`/`HEAD`) resembles a read verb; the real
+            // subcommand `commit` mutates and must stay Medium.
+            "git --attr-source log commit",
+            "git --attr-source HEAD commit",
+            "git --attr-source=HEAD commit",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "value-taking global option must not hide the write subcommand: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_attr_source_read_stays_low() {
+        // The fix must not over-approximate: an ordinary read behind
+        // `--attr-source` stays Low so it is not needlessly gated.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git --attr-source HEAD status",
+            "git --attr-source=HEAD log",
+            "git --attr-source HEAD diff",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "ordinary read behind --attr-source should stay low: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn command_risk_high_for_dangerous_commands() {
         let p = SecurityPolicy {
             allowed_commands: vec!["rm".into()],
@@ -4526,6 +6929,756 @@ mod tests {
     }
 
     #[test]
+    fn shell_policy_normalizes_non_git_executable_and_arguments() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "find".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::Posix,));
+        assert!(!p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::WindowsCmd,));
+
+        assert!(!p.is_command_allowed("find . '-exec' echo"));
+        assert_eq!(p.forbidden_path_argument("cat './src/main.rs'"), None);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("../secret.txt".into())
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("..\\/secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn posix_policy_does_not_inherit_windows_executable_syntax() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Docker executes POSIX `sh` even on a Windows host. Backslashes escape
+        // the next character there, while cmd.exe treats them as path separators.
+        for command in [r"attacker\git status", "git.exe status"] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::Posix)
+                    .is_err(),
+                "POSIX must not treat {command:?} as allowlisted git"
+            );
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::WindowsCmd)
+                    .is_ok(),
+                "cmd.exe semantics must remain available for {command:?}"
+            );
+        }
+
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::Posix),
+            CommandRiskLevel::Low
+        );
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::WindowsCmd),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn git_archive_remote_and_output_writes_enforce_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git archive --format --remote=ext::helper HEAD",
+            "git archive --prefix --remote=ext::helper HEAD",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("archive helper remotes must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
+            "git archive --format --remote=https://example.invalid/repo HEAD",
+            "git archive --prefix --remote=https://example.invalid/repo HEAD",
+            "git archive -- --remote=ext::helper",
+        ] {
+            let risk = p
+                .validate_command_execution(command, false)
+                .expect("safe remotes and operands must remain allowed");
+            assert_eq!(risk, CommandRiskLevel::Low, "{command}");
+        }
+
+        for command in [
+            "git archive --output=./archive.tar HEAD",
+            "git archive --output ./archive.tar HEAD",
+            "git archive --out=./archive.tar HEAD",
+            "git archive -o ./archive.tar HEAD",
+            "git archive -o./archive.tar HEAD",
+            "git bundle create ./repo.bundle HEAD",
+            "git diff --output=./review-output.patch",
+            "git diff --output ./review-output.patch",
+            "git format-patch -1 HEAD",
+            "git format-patch --output-directory=./patches -1 HEAD",
+            "git format-patch --output-directory ./patches -1 HEAD",
+            "git format-patch -o ./patches -1 HEAD",
+            "git log --output=./review-output.log -1",
+            "git show --output ./review-output.txt HEAD",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git output-file options must require approval");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+
+            let risk = p
+                .validate_command_execution(command, true)
+                .expect("approved Git output-file options must remain available");
+            assert_eq!(risk, CommandRiskLevel::Medium, "{command}");
+        }
+
+        for command in [
+            "git archive HEAD",
+            "git archive -- --output=./archive.tar",
+            "git diff -- --output=./review-output.patch",
+            "git log -- --output=./review-output.log",
+            "git show -- --output=./review-output.txt",
+        ] {
+            let risk = p
+                .validate_command_execution(command, false)
+                .expect("output-looking operands after -- must remain allowed");
+            assert_eq!(risk, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
+    fn shell_environment_assignments_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into(), "env".into(), "ls".into(), "grep".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "ZC_ALIAS='!/usr/bin/true' git --config-env=alias.zcprobe=ZC_ALIAS zcprobe",
+            "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zcprobe GIT_CONFIG_VALUE_0='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_COUNT+=1 git zcprobe",
+            "GIT_CONFIG_KEY_0+=alias.zcprobe git zcprobe",
+            "GIT_CONFIG_VALUE_0+='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS+='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "GIT_CONFIG_NOGLOBAL=1 git zcprobe",
+            "GIT_CONFIG_NOSYSTEM=1 git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config >/dev/null git zcprobe",
+            ">/dev/null GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
+            "git -calias.zcprobe='!/usr/bin/true' zcprobe",
+            "git '-c' foo.bar=ENV status",
+            "git '-cfoo.bar=ENV' status",
+            "git '--config-env' foo.bar=ENV status",
+            "git '--config-env=foo.bar=ENV' status",
+            "git --config-env\\=foo.bar=ENV status",
+            "git --exec-path ./tools zcprobe",
+            "git --exec-path=./tools zcprobe",
+            "env GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "/usr/bin/env GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "env git status",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("command-scope Git process controls must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in [
+            "GIT_EXEC_PATH=./tools git zcprobe",
+            "GIT_SSH_COMMAND=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "GIT_SSH_COMMAND+=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "PATH=./tools:/usr/bin git zcprobe",
+            "PATH+=:./tools git zcprobe",
+            "PATH=./tools:/usr/bin ls",
+            "PATH+=:./tools ls",
+            "LD_PRELOAD=./tools/zcprobe.so ls",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("leading environment assignments must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        assert!(p.is_command_allowed("env"));
+        let env_only = p
+            .validate_command_execution("env", false)
+            .expect("bare env has no nested command to bypass policy");
+        assert_eq!(env_only, CommandRiskLevel::Low);
+
+        for command in [
+            "git difftool --no-prompt --extcmd=./helper -- file",
+            "git difftool --no-prompt -x ./helper -- file",
+            "git difftool --tool=vimdiff -- file",
+            "git difftool--helper --extcmd=./helper -- file",
+            "git mergetool --tool=vimdiff file",
+            "git mergetool--helper --tool=vimdiff file",
+            "git diff --ext-diff -- file",
+            "git diff --ext-d -- file",
+            "git diff --ext -- file",
+            "git log --ext-diff -1",
+            "git show --ext-diff --stat HEAD",
+            "git -p status",
+            "git --paginate status",
+            "git grep -O pattern",
+            "git grep -O./pager pattern",
+            "git grep --open-files-in-pager pattern",
+            "git grep --open-files-in-pager=./pager pattern",
+            "git grep --open-files-in-pag pattern",
+            "git grep --open-files-in-pag=./pager pattern",
+            "git help -w status",
+            "git help --web status",
+            "git help --we status",
+            "git --no-pager bisect run ./helper",
+            "git -C . submodule --quiet foreach './helper'",
+            "git submodule--helper foreach -- './helper'",
+            "git zcprobe",
+            "git fetch --upload-pack=./helper origin main",
+            "git fetch --upload-pack ./helper origin main",
+            "git ls-remote --upload-pack=./helper origin",
+            "git pull --upload-pack=./helper origin main",
+            "git pull --upload-pack ./helper origin main",
+            "git push --receive-pack=./helper origin main",
+            "git push --exec ./helper origin main",
+            "git archive --exec=./helper HEAD",
+            "git archive --exec ./helper HEAD",
+            "git clone --config core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --config=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --template=./hooks https://example.invalid/repo ./dst",
+            "git clone --template ./hooks https://example.invalid/repo ./dst",
+            "git init --template=./hooks ./dst",
+            "git init --template ./hooks ./dst",
+            "git rebase --exec=./helper main",
+            "git rebase --exec ./helper main",
+            "git rebase -x ./helper main",
+            "git rebase -x./helper main",
+            "git rebase -ix ./helper main",
+            "git clone -u ./helper ssh://example.invalid/repo ./dst",
+            "git clone -u./helper ssh://example.invalid/repo ./dst",
+            "git STATUS",
+            "git COMMIT -m test",
+            "git fetch --upl=./helper origin main",
+            "git pull --upl=./helper origin main",
+            "git push --rece=./helper origin main",
+            "git push --exe=./helper origin main",
+            "git archive --exe=./helper HEAD",
+            "git clone --conf=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --temp=./hooks https://example.invalid/repo ./dst",
+            "git init --temp=./hooks ./dst",
+            "git rebase --exe=./helper main",
+            "git ls-remote 'ext::sh -c true'",
+            "git fetch helper::payload",
+            "git clone ext::helper ./dst",
+            "git push ext::helper main",
+            "git remote add origin ext::helper",
+            "git ls-remote evil://host/repo",
+            "git fetch evil://host/repo",
+            "git clone evil://host/repo ./dst",
+            "git push evil://host/repo main",
+            "git clone -- ext::helper ./dst",
+            "git fetch -- ext::helper main",
+            "git ls-remote -- ext::helper",
+            "git push -- ext::helper main",
+            "git ls-remote 'evil://host/repo?x=y'",
+            "git clone 'ext::helper arg=value' ./dst",
+            "git ls-remote 1foo::payload",
+            "git ls-remote 1foo://host/repo",
+            "git clone --depth 1 ext::helper ./dst",
+            "git fetch --dep 1 ext::helper",
+            "git clone --bra main ext::helper ./dst",
+            "git remote add --mas main origin ext::helper",
+            "git submodule add --na origin ext::helper ./dst",
+            "git pull -s ours ext::helper",
+            "git pull --strategy ours ext::helper",
+            "git pull --jobs ext::helper",
+            "git pull -j ext::helper",
+            "git archive --format=tar --remote=ext::helper HEAD",
+            "git archive --for=tar --rem=ext::helper HEAD",
+            "git archive --remote=https://example.invalid/repo --remote=ext::helper HEAD",
+            "git archive --remote https://example.invalid/repo --remote ext::helper HEAD",
+            "git archive --remote -- --remote=ext::helper HEAD",
+            "git clone --server-option --remote=ext::helper https://example.invalid/repo dst",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git delegated-execution surfaces must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
+            "git 2>&1> /dev/null commit -m test",
+            "git <&0> /dev/null commit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("ambiguous packed redirections must fail closed");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        let status = p
+            .validate_command_execution("git status", false)
+            .expect("read-only Git status should remain allowed");
+        assert_eq!(status, CommandRiskLevel::Low);
+
+        for command in [
+            "git diff --stat",
+            "git diff --no-ext-diff --stat",
+            "git log --oneline -1",
+            "git show --stat --no-patch HEAD",
+            "git submodule status",
+            "git diff -- --ext-diff",
+            "git diff -- --ext-d",
+            "git diff -- --ext",
+            "git log -- --ext-diff",
+            "git submodule status foreach",
+            "git submodule status -- foreach",
+            "git bisect log run",
+            "git --no-pager status",
+            "git log -p -1",
+            "git grep -o pattern",
+            "git fetch origin main",
+            "git worktree list",
+            "git -C . worktree list --porcelain",
+            "git ls-remote origin",
+            "git clone https://example.invalid/repo ./dst",
+            "git clone git+ssh://example.invalid/repo ./dst",
+            "git clone ssh+git://example.invalid/repo ./dst",
+            "git diff -- ext::helper",
+            "git diff ext::helper",
+            "git status ext::helper",
+            "git grep -- --open-files-in-pag",
+            "git grep -- --open-files-in-pag=./pager",
+            "git help -- --we",
+            "git log -- --upload-pack=./helper",
+            "git clone https://example.invalid/repo ./dst::name",
+            "git clone https://example.invalid/repo ./evil://dst",
+            "git clone https://example.invalid/repo evil://dst",
+            "git submodule status ./evil://path",
+            "git submodule add https://example.invalid/repo evil://path",
+            "git archive -- --remote=ext::helper",
+            "git archive --remote=https://example.invalid/repo --remote=ssh://example.invalid/repo HEAD",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("read-only Git commands should remain allowed");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        let commit_denied = p
+            .validate_command_execution("git commit -m test", false)
+            .expect_err("Git write verbs still require approval");
+        assert!(
+            commit_denied.contains("medium-risk operation"),
+            "{commit_denied}"
+        );
+
+        for command in [
+            ">/dev/null git commit -m test",
+            "<<<payload git commit -m test",
+            "git -C . 2>&1 commit -m test",
+            "git -C . >/dev/null commit -m test",
+            "git -C . <<<payload commit -m test",
+            "git -C . <<< payload commit -m test",
+            r#"git -C . <<<" " commit -m test"#,
+            r#"git -C . <<<"" commit -m test"#,
+            r#"git -C . <<<'' commit -m test"#,
+            "git -C . <<<123 commit -m test",
+            r#"git -C . <<<"<" commit -m test"#,
+            r#"git -C . <<<">" commit -m test"#,
+            "git -C . <<<\\  commit -m test",
+            "git -C . commit -m test 2>&1",
+            "git -C . commit -m test >/dev/null",
+            "git -C . commit -m test <<<payload",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("redirections must not hide a Git write verb");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+        }
+
+        let commit_allowed = p
+            .validate_command_execution("git commit -m test", true)
+            .expect("runtime-approved Git write verb should remain allowed");
+        assert_eq!(commit_allowed, CommandRiskLevel::Medium);
+
+        let push_allowed = p
+            .validate_command_execution("git push origin main", true)
+            .expect("runtime-approved Git push to a configured remote should remain allowed");
+        assert_eq!(push_allowed, CommandRiskLevel::Medium);
+
+        let init_allowed = p
+            .validate_command_execution("git init ./dst", false)
+            .expect("plain Git init should remain allowed");
+        assert_eq!(init_allowed, CommandRiskLevel::Low);
+
+        let rebase_denied = p
+            .validate_command_execution("git rebase main", false)
+            .expect_err("Git rebase without an exec hook should still require approval");
+        assert!(rebase_denied.contains("medium-risk operation"));
+
+        let rebase_allowed = p
+            .validate_command_execution("git rebase main", true)
+            .expect("runtime-approved Git rebase without an exec hook should remain allowed");
+        assert_eq!(rebase_allowed, CommandRiskLevel::Medium);
+
+        for command in [
+            "git am ./change.mbox",
+            "git pull origin main",
+            "git -C . pull origin main",
+            "git worktree add ./dst HEAD",
+            "git -C . worktree add ./dst HEAD",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git mutations and lifecycle hooks must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+
+            let allowed = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved Git mutations should remain available");
+            assert_eq!(allowed, CommandRiskLevel::Medium, "{command}");
+        }
+
+        let global_option_commit_denied = p
+            .validate_command_execution("git -C . commit -m test", false)
+            .expect_err("Git write verbs behind global options still require approval");
+        assert!(
+            global_option_commit_denied.contains("medium-risk operation"),
+            "{global_option_commit_denied}"
+        );
+
+        let global_option_commit_allowed = p
+            .validate_command_execution("git -C . commit -m test", true)
+            .expect("runtime-approved Git write verb behind global options should remain allowed");
+        assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn git_read_verb_mutating_args_are_gated_at_the_enforcement_boundary() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Read-by-default verbs that mutate via an argument must require
+        // approval instead of staying Low.
+        for command in [
+            "git fsck --lost-found",
+            "git fsck --lost",
+            "git fsck --l",
+            "git diff --output=/tmp/out",
+            "git diff --output /tmp/out",
+            "git -C . log --output=/tmp/out",
+            "git show --output=/tmp/out",
+            "git whatchanged --output=/tmp/out",
+            "git diff-tree --output=/tmp/out HEAD",
+            "git diff-index --output=/tmp/out HEAD",
+            "git diff-files --output=/tmp/out",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git read verbs that mutate via arguments must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutating Git read verb should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
+
+        // Plain reads and look-alike options stay Low.
+        for command in [
+            "git fsck",
+            "git diff --output-indicator-new=+ HEAD",
+            "git diff -O/tmp/order HEAD",
+            "git whatchanged --stat",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("plain Git reads should remain allowed without approval");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        // `git grep -O` / `--open-files-in-pager` runs a pager (external
+        // command), even clustered behind other short flags; it must be
+        // rejected outright, not merely gated.
+        for command in [
+            "git grep -O foo",
+            "git grep -Ovim foo",
+            "git grep -nO foo",
+            "git grep --open-files-in-pager=sh foo",
+        ] {
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("Git grep pager execution must be rejected even with approval");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        // `-o` is `--only-matching` (a read) and stays allowed and Low; the
+        // pager scan is case-sensitive and stops at value-consuming flags.
+        for command in ["git grep -o needle", "git grep -no needle"] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("git grep --only-matching should remain a read");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
+    fn git_index_and_worktree_mutations_require_approval() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Verbs that mutate the index or working tree. These stay command-
+        // allowed but must require approval rather than classifying Low.
+        for command in [
+            "git add .",
+            "git add -A",
+            "git rm --cached secret",
+            "git mv a b",
+            "git restore src/main.rs",
+            "git restore --staged src/main.rs",
+            "git apply patch.diff",
+            "git stash",
+            "git stash push -m wip",
+            "git -C . add .",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("index/working-tree mutations must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutation should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_literal_backslash_executable_is_not_allowlist_match() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            r#""g\it" status"#,
+            r#"'foo\git' status"#,
+            r#"'git>helper' status"#,
+            r#""git<helper" status"#,
+            r#""FOO=bar" git status"#,
+            r#"FOO\=bar git status"#,
+            r#"git\" status"#,
+            r#"\"git status"#,
+            r#""git\"" status"#,
+            r#"'git ' status"#,
+            r#"' git' status"#,
+            "git\\  status",
+            r#"'git '>/dev/null status"#,
+            r#"' git'>/dev/null status"#,
+            r#"'2'>/dev/null git status"#,
+            r#"\2>/dev/null git status"#,
+            "git\\ >/dev/null status",
+        ] {
+            let result = p.validate_command_execution(command, false);
+            assert!(result.is_err(), "{command}: {result:?}");
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_unmodeled_shell_expansions_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            concat!("git -C . com\\", "\n", "mit -m test"),
+            "git -C {.,commit} -m test",
+            "git -C . $'commit' -m test",
+            "git -C . $\"commit\" -m test",
+            "git -C . $=verb -m test",
+            "git -C . $+verb -m test",
+            "git -C . $^verb -m test",
+            "git -C . $~verb -m test",
+            "git -C . \"$[2+3]\" -m test",
+            "git -C . \"$<\" -m test",
+            "git -C . com* -m test",
+            "git -C . @(commit) -m test",
+            "git -C . +(commit) -m test",
+            "git -C . !(status) -m test",
+            "git -C . ^status -m test",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("unmodeled shell expansion must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in ["git -C . com#mit -m test", "git -C . crates~status -m test"] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("zsh extended glob must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in [
+            "git -C ~/repo status",
+            "FOO=~/repo git status",
+            "FOO=x:~/repo git status",
+        ] {
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+        }
+
+        for command in ["echo C#", "echo file~backup"] {
+            assert!(contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::WindowsCmd,
+            ));
+        }
+        assert!(contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::WindowsCmd,
+        ));
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::Posix,
+        ));
+    }
+
+    #[test]
+    fn windows_backslash_executable_is_not_normalized_to_allowlisted_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution_for_shell(
+                "c\\at ./src/main.rs",
+                false,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("Windows path separators must not become allowlisted command text");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_single_quotes_remain_literal_executable_text() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("g'i't.exe status", false)
+            .expect_err("cmd.exe single quotes must not normalize to an allowlisted executable");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cmd_expansions_cannot_hide_git_write_verbs() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git %ZC_GIT_VERB%",
+            "git !ZC_GIT_VERB!",
+            "git co^mmit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("cmd.exe transformations must fail closed before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_command_blocks_high_risk_via_wildcard() {
         // Wildcard allows the command through is_command_allowed, but
         // block_high_risk_commands still rejects it because "*" does not
@@ -4732,6 +7885,217 @@ mod tests {
         assert!(!p.is_path_allowed(&tp_sys_sub("root/.bashrc")));
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
+    }
+
+    // ── deny-before-allow with most-specific-match wins ─────────────────
+    //
+    // `forbidden_paths` must apply even when a path also falls under the
+    // workspace or an allowed root. Specificity (matched path-component
+    // depth) breaks ties so a narrow explicit forbidden entry beats a broad
+    // allowed root, while a narrow allowed root still beats a broad *default*
+    // forbidden root such as `/home`.
+
+    #[test]
+    fn forbidden_overrides_allow_specificity_rules() {
+        // Forbidden deeper than allow => deny.
+        assert!(forbidden_overrides_allow(Some(4), Some(3)));
+        // Equal depth => deny (explicit forbidden at the allow boundary wins).
+        assert!(forbidden_overrides_allow(Some(3), Some(3)));
+        // Broad forbidden shallower than a specific allow => allow.
+        assert!(!forbidden_overrides_allow(Some(1), Some(3)));
+        // Forbidden with no competing allow => deny.
+        assert!(forbidden_overrides_allow(Some(2), None));
+        // No forbidden match => allow.
+        assert!(!forbidden_overrides_allow(None, Some(3)));
+        assert!(!forbidden_overrides_allow(None, None));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forbidden_path_nested_under_allowed_root_is_denied() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        // The allowed root itself and non-forbidden children remain allowed.
+        assert!(p.is_path_allowed("/home/me/project/main.rs"));
+        // The explicit, more-specific forbidden subtree is denied even though
+        // it falls under an allowed_roots entry (the reported repro).
+        assert!(!p.is_path_allowed("/home/me/project/secrets/key.txt"));
+        assert!(!p.is_path_allowed("/home/me/project/secrets"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn allowed_root_more_specific_than_broad_default_forbidden_still_allows() {
+        // Default forbidden paths include broad roots like `/home`. An operator
+        // allowlist that is more specific than that broad root must still work.
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_path_allowed("/home/me/project/main.rs"));
+        // A sibling under the broad forbidden `/home` that is NOT under the
+        // allowlist is still denied.
+        assert!(!p.is_path_allowed("/home/me/other/file.txt"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forbidden_path_nested_in_workspace_is_denied() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: true,
+            forbidden_paths: vec!["/srv/ws/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_path_allowed("/srv/ws/notes.md"));
+        assert!(!p.is_path_allowed("/srv/ws/secrets/token"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_allowed_honors_forbidden_under_allowed_root() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/home/me/project/main.rs")));
+        assert!(!p.is_resolved_path_allowed(Path::new("/home/me/project/secrets/key.txt")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_allowed_narrow_allow_beats_broad_default_forbidden() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/home/me/project/main.rs")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_readable_honors_forbidden_under_allowed_root() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_readable(Path::new("/home/me/project/main.rs")));
+        assert!(!p.is_resolved_path_readable(Path::new("/home/me/project/secrets/key.txt")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_readable_narrow_allow_beats_broad_default_forbidden() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_readable(Path::new("/home/me/project/main.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_write_denies_forbidden_symlink_alias_with_missing_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let project = real_root.join("project");
+        let secrets = project.join("secrets");
+        let public = project.join("public");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let alias = tmp.path().join("alias");
+        symlink(&real_root, &alias).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![project.clone()],
+            forbidden_paths: vec![alias.join("project/secrets").display().to_string()],
+            ..SecurityPolicy::default()
+        };
+
+        let denied = secrets.join("new-key.txt");
+        assert!(
+            !denied.exists(),
+            "the create target must remain non-existent"
+        );
+        let resolved_denied = resolve_symlinked_path(&denied).unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved_denied),
+            "a forbidden alias must deny the equivalent canonical create target"
+        );
+
+        let allowed = resolve_symlinked_path(&public.join("new-note.txt")).unwrap();
+        assert!(
+            policy.is_resolved_path_allowed(&allowed),
+            "a sibling beneath the canonical allowed root must remain writable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_read_denies_forbidden_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let project = real_root.join("project");
+        let secrets = project.join("secrets");
+        let public = project.join("public");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(secrets.join("key.txt"), b"secret").unwrap();
+        std::fs::write(public.join("note.txt"), b"public").unwrap();
+
+        let alias = tmp.path().join("alias");
+        symlink(&real_root, &alias).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots_read_only: vec![project],
+            forbidden_paths: vec![alias.join("project/secrets").display().to_string()],
+            ..SecurityPolicy::default()
+        };
+
+        let denied = secrets.join("key.txt").canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_readable(&denied),
+            "a forbidden alias must deny the equivalent canonical read target"
+        );
+
+        let allowed = public.join("note.txt").canonicalize().unwrap();
+        assert!(
+            policy.is_resolved_path_readable(&allowed),
+            "a sibling beneath the canonical read-only root must remain readable"
+        );
     }
 
     #[test]
@@ -5200,16 +8564,55 @@ mod tests {
             Posix
         ));
 
-        // /dev/null stays safe under BOTH dialects; a real file and a non-bare
-        // `nul`-prefixed name stay blocked under both.
+        // POSIX device paths are safe only for the POSIX shell. A real file and
+        // a non-bare `nul`-prefixed name stay blocked under both dialects.
         assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", Posix));
-        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret 2>out.txt", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret >nul.txt", WindowsCmd));
         assert!(contains_unsafe_output_redirect_for_shell(
             "echo secret >nul.txt",
             WindowsCmd
         ));
+    }
+
+    #[test]
+    fn windows_cmd_operator_and_device_redirects_are_fail_closed() {
+        use ShellDialect::{Posix, WindowsCmd};
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, WindowsCmd)
+                    .is_err(),
+                "cmd.exe must reject policy-hidden operator or POSIX device redirect: {command}"
+            );
+        }
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, Posix)
+                    .is_ok(),
+                "POSIX must retain quoted, escaped, and safe-device behavior: {command}"
+            );
+        }
     }
 
     #[test]
@@ -5277,15 +8680,34 @@ mod tests {
 
     #[test]
     fn redirect_helper_unit_tests() {
-        assert!(!contains_unquoted_input_redirect("cat << 'EOF'"));
-        assert!(!contains_unquoted_input_redirect("cat <<< 'hello'"));
-        assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
-        assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
-        assert!(!contains_unquoted_input_redirect("cat</dev/null"));
-        // Input redirect word→non-word bypass (same fix as output redirects)
-        assert!(contains_unquoted_input_redirect("cat</dev/null.secret"));
+        assert!(!contains_unquoted_input_redirect(
+            "cat << 'EOF'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat <<< 'hello'",
+            ShellDialect::Posix
+        ));
         assert!(contains_unquoted_input_redirect(
-            "cat </dev/zero/etc/passwd"
+            "cat < /etc/passwd",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "echo 'a<b'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat</dev/null",
+            ShellDialect::Posix
+        ));
+        // Input redirect word→non-word bypass (same fix as output redirects)
+        assert!(contains_unquoted_input_redirect(
+            "cat</dev/null.secret",
+            ShellDialect::Posix
+        ));
+        assert!(contains_unquoted_input_redirect(
+            "cat </dev/zero/etc/passwd",
+            ShellDialect::Posix
         ));
         assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
         assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
@@ -5335,13 +8757,26 @@ mod tests {
     #[test]
     fn command_argument_injection_blocked() {
         let p = default_policy();
-        // find -exec is a common bypass
-        assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
-        assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
+        for command in [
+            "find . -exec rm -rf '{}' +",
+            "find / -ok cat '{}' ';'",
+            "find . -execdir git commit '{}' +",
+            "find . -okdir env GIT_CONFIG_GLOBAL=./zc-config git zcprobe '{}' ';'",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("find command carriers must fail before child execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
         // git config/alias can execute commands
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
         assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        assert!(!p.is_command_allowed("git --config-env=alias.st=ZC_ALIAS status"));
         // Legitimate commands should still work
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
@@ -5379,10 +8814,10 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
-        assert!(p.is_command_allowed("FOO=bar ls"));
-        assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
+        // Per-invocation environment changes can alter executable resolution or
+        // command behavior before the allowlist and risk model see it.
+        assert!(!p.is_command_allowed("FOO=bar ls"));
+        assert!(!p.is_command_allowed("LANG=C grep pattern file"));
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
@@ -5643,15 +9078,31 @@ mod tests {
     #[test]
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
 
         assert_eq!(
-            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            posix("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
         );
 
         // Single-quoted variant of the same shape.
         assert_eq!(
-            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            posix("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_ignores_quoted_redirection_markers() {
+        let p = unix_forbidden_path_policy();
+
+        assert_eq!(
+            p.forbidden_path_argument("cat 'literal>' --file=/etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -5672,68 +9123,900 @@ mod tests {
     #[test]
     fn forbidden_path_argument_allows_safe_device_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
-        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("ls missing 2>/dev/null"), None);
+        assert_eq!(posix("ls missing 2> /dev/null"), None);
+        assert_eq!(posix("echo hi >/dev/stdout"), None);
+        assert_eq!(posix("echo hi > /dev/stdout"), None);
+        assert_eq!(posix("echo err 1>/dev/stderr"), None);
+        assert_eq!(posix("echo err 1> /dev/stderr"), None);
+        assert_eq!(posix("cat </dev/zero"), None);
+        assert_eq!(posix("cat < /dev/zero"), None);
+        // Bare-argument device classification is host-gated BENEATH the
+        // dialect: the harmless-device carve-out for a bare `/dev/null`
+        // argument exists only on Unix hosts, so pinning Posix does not
+        // unify this case. Assert both arms so the split stays visible.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+        assert_eq!(posix("cat /dev/null"), None);
+        #[cfg(target_os = "windows")]
+        assert_eq!(posix("cat /dev/null"), Some("/dev/null".into()));
+        assert_eq!(posix("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(posix("cat> /dev/null"), None);
+        assert_eq!(posix("cat ./safe.txt>&2"), None);
     }
 
     #[test]
     fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("echo hi >/etc/passwd"), Some("/etc/passwd".into()));
+        assert_eq!(posix("echo hi > /etc/passwd"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi > /etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            posix("echo hi >/dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            posix("echo hi > /dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            posix("cat </dev/zero/etc/passwd"),
             Some("/dev/zero/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            posix("echo hi >/dev/null/../../etc/passwd"),
             Some("/dev/null/../../etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            posix("cat</dev/null /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            posix("cat /etc/passwd>/dev/null"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            posix("cat /etc/passwd> /dev/null"),
             Some("/etc/passwd".into())
+        );
+        assert_eq!(posix("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
+        assert_eq!(
+            posix("grep --file=/etc/passwd>/dev/null root"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    /// POSIX command substitution, process substitution, subshells, and
+    /// backticks close with a character that is not whitespace. The scanner
+    /// must end the inner command there instead of gluing `)` or `` ` `` onto
+    /// the last word, which turned `$(cmd 2>/dev/null)` into a blocked
+    /// `/dev/null)` redirect target.
+    #[test]
+    fn forbidden_path_argument_allows_safe_devices_inside_posix_substitutions() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for command in [
+            "x=$(echo a 2>/dev/null)",
+            "x=$(echo a 2>/dev/null); echo \"$x\"",
+            "x=\"$(echo a 2>/dev/null)\"",
+            "echo \"$(ls 2>/dev/null)\" \"$(ls 2> /dev/null)\"",
+            "x=$(echo $(echo a 2>/dev/null) 2>/dev/null)",
+            "x=$(cat </dev/null)",
+            "x=$(cat</dev/null)",
+            "(echo a 2>/dev/null)",
+            "(cd sub && ls 2>/dev/null) | wc -l",
+            "(echo a) 2>/dev/null",
+            "x=`echo a 2>/dev/null`",
+            "echo \"`echo a 2>/dev/null`\"",
+            "diff <(sort a 2>/dev/null) <(sort b 2>/dev/null)",
+            "for b in $(which -a zeroclaw 2>/dev/null); do echo $b; done",
+            "find . \\( -name a -o -name b \\) 2>/dev/null",
+            "echo $((1 + 2)) 2>/dev/null",
+            "grep -E '(a|b)' file 2>/dev/null",
+            "echo ')' 2>/dev/null",
+            // A command substitution inside arithmetic uses ordinary shell
+            // syntax, so its quoted heredoc body is data, not a command.
+            "echo \"$(( $(cat <<'EOF' | wc -l\n/etc/passwd\nEOF\n) + 1 ))\"",
+            "x=\"$(case a in a) echo a 2>/dev/null;; esac)\"",
+            // Heredoc bodies stay data, including with more text after the
+            // delimiter and several heredocs on one line.
+            "cat <<'EOF' | wc -l\n/etc/passwd\nEOF",
+            "cat <<A - <<B\n/etc/passwd\nA\n/etc/shadow\nB",
+            "cat <<-EOF\n\t/etc/passwd\n\tEOF",
+            "cat <<\"E F\"\n/etc/passwd\nE F",
+            // Delimiter quote removal follows the shell: inside double quotes
+            // a backslash before an ordinary character stays, before `$`
+            // it goes, and a backslash-newline joins the word either way.
+            "cat <<\"E\\OF\"\n/etc/passwd\nE\\OF",
+            "cat <<\"E\\$F\"\n/etc/passwd\nE$F",
+            "cat <<E\\\nOF\n/etc/passwd\nEOF",
+            // A trailing backslash joins the next line into the delimiter, so
+            // the line after it is body, not a command. Bash warns that it
+            // wanted `Ehello` and never runs a command placed after that line.
+            "cat <<E\\\n/etc/passwd\nEpasswd",
+            // An escaped space or metacharacter is part of the delimiter word.
+            "cat <<E\\ OF\n/etc/passwd\nE OF",
+            "cat <<$EOF\necho 'https://example.invalid\n$EOF",
+            "cat <<\"E\\\" F\"\necho 'https://example.invalid\nE\" F",
+            "cat <<E\\;OF\n/etc/passwd\nE;OF",
+            // A heredoc opened inside a substitution reads its body there; the
+            // outer heredoc's body starts after the line the substitution
+            // closes on. A subshell shares the enclosing heredoc queue.
+            "cat <<A $(cat <<B\n/etc/passwd\nB\n)\n/etc/shadow\nA",
+            "echo \"$(cat <<OUT $(cat <<IN\n/etc/passwd\nIN\n)\n/etc/shadow\nOUT\n)\"",
+            "cat <<A && (echo s\n/etc/passwd\nA\necho t)",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+        }
+    }
+
+    /// Splitting at substitution boundaries must expose the inner command to
+    /// the scan, never hide it: lookalike devices and forbidden paths inside a
+    /// substitution stay blocked and are reported without the closing `)`.
+    #[test]
+    fn forbidden_path_argument_scans_inside_posix_substitutions() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for (command, blocked) in [
+            ("x=$(echo a 2>/dev/nullx)", "/dev/nullx"),
+            (
+                "x=$(echo a 2>/dev/null/../../etc/passwd)",
+                "/dev/null/../../etc/passwd",
+            ),
+            ("x=$(cat /etc/passwd)", "/etc/passwd"),
+            ("x=$(cat /etc/passwd 2>/dev/null)", "/etc/passwd"),
+            // Double quotes do not stop command substitution, so the inner
+            // command is scanned too.
+            ("x=\"$(cat /etc/passwd)\"", "/etc/passwd"),
+            ("echo \"`cat /etc/shadow`\"", "/etc/shadow"),
+            ("x=`cat /etc/passwd`", "/etc/passwd"),
+            ("(cat /etc/passwd)", "/etc/passwd"),
+            ("(echo a) >/etc/passwd", "/etc/passwd"),
+            ("diff <(cat /etc/passwd) b", "/etc/passwd"),
+            ("x=$(echo $(cat /etc/passwd))", "/etc/passwd"),
+            // Unbalanced or `case`-style closers are boundaries, not hiding
+            // places.
+            ("case x in a) cat /etc/passwd;; esac", "/etc/passwd"),
+            ("echo a) cat /etc/passwd", "/etc/passwd"),
+            // Arithmetic `<<` is a shift, not a heredoc that swallows the rest.
+            ("echo $((8 << 1)); cat /etc/passwd", "/etc/passwd"),
+            ("echo $((8<<1))\ncat /etc/passwd\n1", "/etc/passwd"),
+            // A `)` that bash does not treat as the substitution's closer must
+            // not end it early. Closing early would restore the outer double
+            // quote and hide the rest of the command inside one argument.
+            (
+                "echo \"$(case x in x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            ("echo $(case x in x) cat /etc/passwd;; esac)", "/etc/passwd"),
+            (
+                "echo \"$(case x in (x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(case x in a) (cd a) ;; x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(if true; then case x in x) cat /etc/passwd;; esac; fi)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"`case x in x) cat /etc/passwd;; esac`\"",
+                "/etc/passwd",
+            ),
+            ("echo \"$(echo ${x/)/y}; cat /etc/passwd)\"", "/etc/passwd"),
+            ("echo \"${x:-$(cat /etc/passwd)}\"", "/etc/passwd"),
+            (
+                "echo \"$(echo a # comment )\ncat /etc/passwd\n)\"",
+                "/etc/passwd",
+            ),
+            // The heredoc delimiter is one word; the rest of its line and every
+            // command after the terminator are still scanned.
+            (
+                "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<'EOF' | wc -l\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<EOF >out\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<'EOF' /etc/passwd\nhello\nEOF", "/etc/passwd"),
+            (
+                "cat <<A - <<B\none\nA\ntwo\nB\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<-EOF\n\thello\n\tEOF\ncat /etc/passwd", "/etc/passwd"),
+            // A delimiter that is not a plain word opens no heredoc.
+            ("cat <<$(echo E)\nE\ncat /etc/passwd", "/etc/passwd"),
+            // A backslash does not continue a comment past its newline.
+            ("cat \"$(echo ok # \\\n)\" /etc/passwd", "/etc/passwd"),
+            ("echo ok # \\\ncat /etc/passwd", "/etc/passwd"),
+            // Inside double quotes a backslash before an ordinary character is
+            // part of the delimiter, so the body ends at `E\OF`, not `EOF`.
+            (
+                "cat <<\"E\\OF\"\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<\"E\\$F\"\nhello\nE$F\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // A backslash-newline inside the delimiter joins it into one word.
+            ("cat <<E\\\nOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            // An escaped space or metacharacter stays inside the delimiter.
+            // Stopping at it made a terminator that never matches, so the
+            // trailing command was skipped as body.
+            ("cat <<E\\ OF\nhello\nE OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\ \\ OF\nhello\nE  OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E\\\tOF\nhello\nE\tOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E\\;OF\nhello\nE;OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\|OF\nhello\nE|OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\&OF\nhello\nE&OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\<OF\nhello\nE<OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\>OF\nhello\nE>OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\(OF\nhello\nE(OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\)OF\nhello\nE)OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\#OF\nhello\nE#OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\\"OF\nhello\nE\"OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E\\'OF\nhello\nE'OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\$OF\nhello\nE$OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\`OF\nhello\nE`OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\\\OF\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E\\\\\\ OF\nhello\nE\\ OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<\"E\\\nOF\"\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // Each command substitution has its own heredoc queue, so an inner
+            // newline starts only the inner heredoc. A shared queue started the
+            // outer one first and skipped the trailing command.
+            (
+                "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A $(cat <<B\nb\nB\n)\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A `cat <<B\nb\nB\n`\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A <(cat <<B\nb\nB\n)\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A - $(cat <<B\nb\nB\n) <<C\na\nA\nc\nC\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<A $(echo x\n)\na\nA\ncat /etc/passwd", "/etc/passwd"),
+            // A subshell is not a substitution: its newline starts the
+            // enclosing heredoc, so the body ends inside the subshell.
+            (
+                "cat <<A && (echo s\na\nA\necho t)\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<A && (echo s\na\nA\ncat /etc/passwd)", "/etc/passwd"),
+            // An inner heredoc whose substitution closes before a newline has
+            // no body inside it and is dropped, so the lines after are scanned.
+            ("echo \"$(cat <<B)\"\ncat /etc/passwd\nB", "/etc/passwd"),
+            // An expansion the scanner cannot model (`$(...)`) opens no
+            // heredoc, so the following lines stay scanned.
+            // A bare `$` in a delimiter is literal. Opening no heredoc let the
+            // quote in the body swallow the trailing read.
+            (
+                "cat <<$EOF\necho 'https://example.invalid\n$EOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E$HOME\necho 'https://example.invalid\nE$HOME\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `$"..."` depends on the locale catalog, so its terminator cannot
+            // be proven. The body is still data through the end of the command.
+            // Parsing it lets the quote swallow the following path.
+            // `\"` inside a double-quoted delimiter is part of the word.
+            (
+                "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `<<''` ends at the next completely blank line. A quote in that
+            // body is data, so it cannot swallow the command after the blank.
+            (
+                "cat <<''\necho 'https://example.invalid\n\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `<<-` strips leading tabs before comparing the terminator. A
+            // tab-only line ends `<<-''`; leaving the tab in the comparison
+            // never matches and hides the following command.
+            (
+                "cat <<-''\necho 'https://example.invalid\n\t\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
+                "unreadable heredoc delimiter",
+            ),
+            // At top level the unproven body has no frame to close it. The
+            // opener line stays data, and the lines after it are scanned
+            // without treating a quote in the body as syntax.
+            (
+                "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\ncat /etc/passwd",
+                "unreadable heredoc delimiter",
+            ),
+            // A leading backslash is quote removal, so the terminator is
+            // `EOF`, not `\EOF`.
+            ("cat <<\\EOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<$(echo EOF)\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+        ] {
+            assert_eq!(posix(command), Some(blocked.into()), "{command}");
+        }
+    }
+
+    /// `cmd.exe` has no `$(...)` or backtick substitution, so those characters
+    /// stay ordinary word characters under the Windows command dialect.
+    #[test]
+    fn windows_cmd_does_not_split_posix_substitution_syntax() {
+        assert_eq!(
+            split_unquoted_segments("echo `a` $(b)", ShellDialect::WindowsCmd),
+            vec!["echo `a` $(b)".to_string()]
+        );
+    }
+
+    #[test]
+    fn posix_segments_split_at_substitution_boundaries() {
+        let split = |command: &str| split_unquoted_segments(command, ShellDialect::Posix);
+        // Segments are returned in the order they end: inner commands first.
+        assert_eq!(split("x=$(echo a)"), vec!["echo a", "x=$()"]);
+        assert_eq!(split("x=\"$(echo a)\""), vec!["echo a", "x=\"$()\""]);
+        assert_eq!(split("x=`echo a`"), vec!["echo a", "x=``"]);
+        assert_eq!(split("(echo a) && b"), vec!["echo a", "b"]);
+        assert_eq!(split("diff <(a) >(b)"), vec!["a", "b", "diff <() >()"]);
+        assert_eq!(split("x=$(a $(b) c) d"), vec!["b", "a $() c", "x=$() d"]);
+        assert_eq!(split("x=$(a; b)"), vec!["a", "b", "x=$()"]);
+        // Confirmed `$((...))` arithmetic runs no command, so its text is not
+        // a segment, and its `<<` is a shift rather than a heredoc.
+        assert_eq!(split("echo $((1 << 2))"), vec!["echo $()"]);
+        assert_eq!(split("echo $(( (a + b) / 2 ))"), vec!["echo $()"]);
+        // Without `))` right after the second `(`'s match, bash runs a
+        // subshell, so the text is scanned as commands.
+        assert_eq!(split("x=$((echo a) )"), vec!["echo a", "x=$()"]);
+        assert_eq!(split("x=$((a)+(b))"), vec!["a", "+", "b", "x=$()"]);
+        // A bare `((` is scanned as commands: dash runs it as subshells.
+        assert_eq!(split("((echo a))"), vec!["echo a"]);
+        // Unbalanced input keeps every word: an unterminated substitution
+        // still flushes the command around it, and a stray `)` is a boundary.
+        // Because the model diverged from the shell's, the flat split that
+        // ignores substitutions is checked as well.
+        assert_eq!(
+            split("cat a $(echo b"),
+            vec!["echo b", "cat a $()", "cat a $(echo b"]
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>&2"),
-            Some("/etc/passwd".into())
+            split("cat a `echo b"),
+            vec!["echo b", "cat a ``", "cat a `echo b"]
+        );
+        assert_eq!(split("echo a) b"), vec!["echo a", "b", "echo a) b"]);
+        // A balanced command gets no flat split, including a trailing `esac`
+        // and an empty `case`.
+        assert_eq!(
+            split("case x in x) a;; esac"),
+            vec!["case x in x", "a", "esac"]
         );
         assert_eq!(
-            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
+            split("x=$(case x in esac)"),
+            vec!["case x in esac", "x=$()"]
+        );
+        // Quoted and escaped parentheses and backticks are literal.
+        assert_eq!(split("echo '$(a)' '`b`'"), vec!["echo '$(a)' '`b`'"]);
+        assert_eq!(
+            split("echo \\$\\(a\\) \\`b\\`"),
+            vec!["echo \\$\\(a\\) \\`b\\`"]
+        );
+        assert_eq!(split("echo \"(a)\""), vec!["echo \"(a)\""]);
+        // A quote inside a substitution does not leak into the outer word.
+        assert_eq!(
+            split("x=\"$(echo \")\")\""),
+            vec!["echo \")\"", "x=\"$()\""]
+        );
+        // `case` pattern terminators end a segment inside the substitution
+        // without closing it; `esac` lets the next `)` close it again.
+        assert_eq!(
+            split("x=\"$(case a in a) b;; esac)\""),
+            vec!["case a in a", "b", "esac", "x=\"$()\""]
+        );
+        // Inside `${...}`, `(` and `)` are literal, but `$(` still nests.
+        assert_eq!(split("x=$(echo ${y/)/z})"), vec!["echo ${y/)/z}", "x=$()"]);
+        assert_eq!(
+            split("echo \"${y:-$(b)}\""),
+            vec!["b", "echo \"${y:-$()}\""]
+        );
+        // A comment's `)` does not close the substitution, and the comment
+        // ends at the newline. Mid-word `#` and `${#x}` are not comments.
+        assert_eq!(split("x=$(a # c )\nb\n)"), vec!["a # c )", "b", "x=$()"]);
+        assert_eq!(split("x=$(a#b) ${#y}"), vec!["a#b", "x=$() ${#y}"]);
+        // A command substitution inside arithmetic recognizes heredocs again.
+        assert_eq!(
+            split("echo $(( $(cat <<'E'\n)\nE\n) + 1 ))"),
+            vec!["cat <<'E'", "echo $()"]
+        );
+        // The heredoc delimiter is one word, and the body starts at the next
+        // newline, so the rest of the line is its own segment.
+        assert_eq!(
+            split("cat <<'E' | wc -l\nbody\nE\nnext"),
+            vec!["cat <<'E'", "wc -l", "next"]
+        );
+        // An inner heredoc's body is read inside its substitution, and the
+        // outer heredoc's body starts after the line the substitution closes on.
+        assert_eq!(
+            split("cat <<A $(cat <<B\nb\nB\n)\na\nA\nnext"),
+            vec!["cat <<B", "cat <<A $()", "next"]
+        );
+        // A comment ends at its newline even after a trailing backslash.
+        assert_eq!(
+            split("x=\"$(a # c \\\n)\" b"),
+            vec!["a # c \\", "x=\"$()\" b"]
+        );
+        // An escaped space is part of the delimiter, not the end of the word.
+        assert_eq!(
+            split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
+            vec!["cat <<E\\ OF", "wc -l", "next"]
+        );
+        // `$"..."` is locale-dependent, so the split refuses rather than
+        // guessing which of the following lines are commands.
+        assert!(
+            split_unquoted_segments_checked("cat <<$\"EOF\"\nbody\nEOF\nnext", ShellDialect::Posix)
+                .is_err()
+        );
+    }
+
+    /// Commands inside substitutions and subshells carry their own risk.
+    #[test]
+    fn command_risk_level_sees_commands_inside_posix_substitutions() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            "x=$(rm -rf ./build)",
+            "x=\"$(rm -rf ./build)\"",
+            "x=`rm -rf ./build`",
+            "echo \"`rm -rf ./build`\"",
+            "(rm -rf ./build)",
+            "echo ok && (cd sub; rm -rf ./build)",
+            "diff <(rm -rf ./build) b",
+            "echo \"$(case x in x) rm -rf ./build;; esac)\"",
+            "echo $(case x in x) rm -rf ./build;; esac)",
+            "echo \"$(echo ${x/)/y}; rm -rf ./build)\"",
+            "echo \"$(echo a # )\nrm -rf ./build\n)\"",
+            // An apostrophe in a comment is not a quote, so it cannot swallow
+            // the next line's command.
+            "ls # don't\nrm -rf ./build",
+            "ls # don't; rm -rf ./build",
+            "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; rm -rf ./build",
+            "cat <<'EOF' | wc -l\nhello\nEOF\nrm -rf ./build",
+            "echo ok # \\\nrm -rf ./build",
+            "cat <<\"E\\OF\"\nhello\nE\\OF\nrm -rf ./build",
+            "cat <<E\\\nOF\nhello\nEOF\nrm -rf ./build",
+            "cat <<E\\ OF\nhello\nE OF\nrm -rf ./build",
+            "cat <<E\\;OF\nhello\nE;OF\nrm -rf ./build",
+            "cat <<E\\|OF\nhello\nE|OF\nrm -rf ./build",
+            "cat <<E\\(OF\nhello\nE(OF\nrm -rf ./build",
+            "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; rm -rf ./build",
+            "cat <<A && (echo s\na\nA\necho t)\nrm -rf ./build",
+            "echo \"$(cat <<$'EOF'\nhello\nEOF\n)\"; rm -rf ./build",
+            "cat <<$'E\\x4fF'\nhello\nEOF\nrm -rf ./build",
+            "cat <<$'E\\101F'\nhello\nEAF\nrm -rf ./build",
+            concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\nrm -rf ./build"),
+            concat!("cat <<$'E", r"\501", "F'\nhello\nEAF\nrm -rf ./build"),
+            "cat <<$EOF\necho 'https://example.invalid\n$EOF\nrm -rf ./build",
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\0",
+                "F'\nhello\nE\n)\"; rm -rf ./build"
+            ),
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\0",
+                "F'X\nhello\nEX\n)\"; rm -rf ./build"
+            ),
+            // `$"..."` is not a proven delimiter, so its body is scanned too.
+            "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
+            "cat <<''\necho 'https://example.invalid\n\nrm -rf ./build",
+            "cat <<-''\necho 'https://example.invalid\n\t\nrm -rf ./build",
+            "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; rm -rf ./build",
+            "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\nrm -rf ./build",
+            "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
+            "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
+            "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::High,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            p.command_risk_level("x=$(git rev-parse HEAD 2>/dev/null)"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    /// Where the scanner and the shell disagree on which `)` or backtick ends
+    /// a substitution, the scan restores the enclosing double quote over text
+    /// the shell runs. In each command here, bash runs the forbidden command
+    /// (dash runs it too, or rejects the whole script).
+    #[test]
+    fn posix_substitution_closers_follow_the_shell() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // A lone `&`, `coproc`, and `time -p` leave the next word in
+            // command position, so its `case` pattern `)` does not close.
+            "echo \"$(echo \"$(true & case x in x) wc -l /etc/passwd;; esac)\")\"",
+            "echo \"$(true&case x in x) wc -l /etc/passwd;; esac)\"",
+            "echo \"$(coproc case x in x) wc -l /etc/passwd;; esac)\"",
+            "echo \"$(time -p case x in x) wc -l /etc/passwd;; esac)\"",
+            // An empty `case` is closed by its `esac`, so the next `)` closes
+            // the substitution.
+            "echo \"$(case x in esac)\"; wc -l /etc/passwd",
+            // `case` inside arithmetic is a name, not a statement, so it does
+            // not hold the real closer open.
+            "echo \"$($((case x in (x) echo a)))\"; wc -l /etc/passwd",
+            // The next unescaped backtick closes a backtick substitution, even
+            // inside a comment, a quote, or a `(` opened within it.
+            "echo \"`#x`\"\necho `wc -l /etc/passwd`",
+            "echo `echo 'a`; wc -l /etc/passwd #'`",
+            "x=\"`x=1 (case x in x) echo a)`\"; wc -l /etc/passwd",
+            // A heredoc opened inside backticks ends with them.
+            "echo `cat <<EOF`\nwc -l /etc/passwd\nEOF",
+            // Dash runs `((...))` as nested subshells, not arithmetic.
+            "((wc -l /etc/passwd))",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command}");
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+        }
+        // An unterminated `case` in backticks: the shell reports the error
+        // when it runs the substitution, then runs the rest.
+        assert_eq!(
+            risk.command_risk_level("x=\"`x=1 (case x in x) git status)`\"; rm -rf ./build"),
+            CommandRiskLevel::High
+        );
+        // Balanced, valid commands are not refused by the closer rules.
+        for command in [
+            "case x in esac",
+            "x=$(case x in esac)",
+            "case x in x) echo a;; esac",
+            "echo \"`echo a`\" `date`",
+            "true & case x in x) echo a;; esac",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+            assert!(risk.is_command_allowed(command), "{command}");
+        }
+    }
+
+    /// `$((...))` whose second `(` closes right before `)` is arithmetic in
+    /// both bash and dash, so its text names no file and runs no command.
+    /// Substitutions inside it still run and are still scanned. Any other
+    /// `$((` or a bare `((` is scanned as commands.
+    #[test]
+    fn posix_confirmed_arithmetic_is_not_a_command() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for command in [
+            "echo \"$(( total / count ))\"",
+            "echo $((10 / 2))",
+            "echo $(( (a + b) / 2 ))",
+            "x=$(( $(wc -l < input.txt) / 2 ))",
+            // Separators inside the expression do not end a command there.
+            "echo \"$(( total /\n count ))\"",
+            "echo $(( a / 2 || b / 2 ))",
+            "echo $(( a / 2 && b / 2 ))",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "{command}"
+            );
+        }
+        for command in [
+            "echo $(( $(wc -l < /etc/passwd) / 2 ))",
+            "echo \"$(( `wc -l < /etc/passwd` / 2 ))\"",
+            // Bash reads these as command substitutions holding a subshell.
+            "x=$((cat /etc/passwd) )",
+            "x=$((true) ; cat /etc/passwd)",
+            "x=\"$((true)|cat /etc/passwd)\"",
+            "((cat /etc/passwd))",
+            // Unconfirmed text keeps every separated command.
+            "x=$((true) ; cat /etc/passwd\n)",
+            "x=$((true) && cat /etc/passwd)",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command}");
+        }
+    }
+
+    /// Heredoc forms whose body boundary differs between shells, or that
+    /// neither split can bound, are refused rather than guessed.
+    #[test]
+    fn ambiguous_heredoc_boundaries_are_refused() {
+        let p = unix_forbidden_path_policy();
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // Bash ends a body inside `$(` at `EOF)`, then runs the rest.
+            "x=$(cat <<EOF\nhello\nEOF); wc -l /etc/passwd",
+            "echo \"$(cat <<EOF\nhello\nEOF)\"; wc -l /etc/passwd",
+            // Bash shifts inside `((`, so the next line runs. Dash reads a
+            // subshell with a heredoc whose body is that line.
+            "((x=8<<1))\nwc -l /etc/passwd\n1",
+            "(( x = 8 << 1 ))\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::Posix),
+                Some("unreadable heredoc delimiter".into()),
+                "{command}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command}");
+        }
+        // A heredoc in a spaced subshell means the same to both shells.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "( (cat <<EOF\nhello\nEOF\n) )\nwc -l /etc/passwd",
+                ShellDialect::Posix
+            ),
             Some("/etc/passwd".into())
         );
+    }
+
+    /// `$'...'` heredoc delimiters mean different things to bash and dash, the
+    /// usual `sh`. Bash expands them (bytewise, with NUL truncation) before
+    /// matching the terminator. Dash has no `$'...'` and ends `<<$'EOF'` at a
+    /// literal `$EOF` line. Either model hides commands from the other shell,
+    /// so the delimiter is unproven and the command is refused.
+    #[test]
+    fn ansi_c_heredoc_delimiters_are_refused() {
+        let p = unix_forbidden_path_policy();
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // Dash ends the body at `$EOF` and runs the next line.
+            "cat <<$'EOF'\nx\n$EOF\nwc -l /etc/passwd\nEOF",
+            // Bash ends at `X` (the NUL truncates the quoted part, escaped
+            // quote included), not `BX`.
+            concat!(
+                "echo \"$(cat <<$'",
+                r"\0A\'B",
+                "'X\nhello\nX\nwc -l /etc/passwd\nBX\n)\"\n)\""
+            ),
+            // Bash builds bytes, so this ends at `EéF`, not `EÃ©F`.
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\xc3\xa9",
+                "F'\nhello\nEéF\nwc -l /etc/passwd\nEÃ©F\n)\"\n)\""
+            ),
+            "cat <<$'E\\101F'\nhello\nEAF\nwc -l /etc/passwd",
+            "cat <<E$'O'F\nhello\nEOF\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::Posix),
+                Some("unreadable heredoc delimiter".into()),
+                "{command}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command}");
+        }
+    }
+
+    /// The body of an unquoted heredoc is expanded, so a line ending in an odd
+    /// number of backslashes continues onto the next one. Bash compares the
+    /// joined line, stripping `<<-` tabs while it is still empty. Dash skips
+    /// lines that are exactly `\` at the start of a line and compares the
+    /// next physical line alone. Each case was run in bash 3.2 through 5.3
+    /// and dash 0.5.12.
+    #[test]
+    fn heredoc_terminators_follow_line_continuation() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        // Bash joins these into the terminator and runs the next line; dash
+        // reads on. The shells disagree, so the command is refused.
+        for command in [
+            "cat <<EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nE\\\nO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<EOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            // A backslash-newline in the delimiter is removed before the word
+            // is read, so `<<E\<newline>OF` is the unquoted delimiter `EOF`.
+            // The body still joins. Counting that backslash as quoting waited
+            // for the later physical `EOF` and skipped the read bash runs
+            // after the joined line. The closing text after that `EOF` also
+            // rebalanced the substitution, so no fallback ran.
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<E\\\nOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            "cat <<EOF\nE\\\n\\\nOF\nwc -l /etc/passwd\nEOF",
+            // Bash strips the tab before an empty continuation and ends at
+            // `EOF`; dash does not skip a tab-indented `\` line.
+            "cat <<-EOF\n\t\\\nEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\t\\\n\tEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\\\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+        ] {
+            assert_eq!(
+                posix(command),
+                Some("unreadable heredoc delimiter".into()),
+                "{command:?}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high:?}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command:?}");
+        }
+        // Both shells end at a terminator after lines that are exactly `\`,
+        // with `<<-` tabs stripped from it, and run the read that follows.
+        for command in [
+            "cat <<-EOF\n\\\n\tEOF\nwc -l /etc/passwd",
+            "cat <<EOF\n\\\nEOF\nwc -l /etc/passwd",
+            "cat <<EOF\n\\\n\\\nEOF\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command:?}");
+        }
+        // Both shells read on past a physical `EOF` that continues a line, so
+        // the quote in the real body is data and the read after it runs.
+        assert_eq!(
+            posix("cat <<EOF\nbody \\\nEOF\necho 'x\nEOF\nwc -l /etc/passwd #'"),
+            Some("/etc/passwd".into())
+        );
+        // No join: the whole read is body in both shells.
+        for command in [
+            // Quoted delimiters leave backslash-newlines literal. A
+            // continuation inside an otherwise quoted word is still quoting,
+            // so the body does not join and the read stays data.
+            "cat <<'EOF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"EOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\\EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<E\\\n'OF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            // An even number of backslashes is an escaped backslash.
+            "cat <<EOF\nEO\\\\\nF\nwc -l /etc/passwd\nEOF",
+            // `<<-` strips tabs only at the start of the logical line.
+            "cat <<-EOF\n\tEO\\\n\tF\nwc -l /etc/passwd\nEOF",
+            // A continued line that does not spell the terminator.
+            "cat <<EOF\nE\\\n OF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\n \\\nEOF\nwc -l /etc/passwd\nEOF",
+        ] {
+            assert_eq!(posix(command), None, "{command:?}");
+        }
+    }
+
+    /// The strict allowlist decision for grouping and substitution syntax is
+    /// unchanged: segment splitting must not turn a previously rejected
+    /// `(git status)` into an accepted one.
+    #[test]
+    fn strict_allowlist_still_rejects_posix_grouping_and_substitution() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("git status 2>/dev/null"));
+        // Escaped and quoted parentheses are literal, not grouping syntax.
+        assert!(p.is_command_allowed("find . \\( -name a -o -name b \\)"));
+        assert!(p.is_command_allowed("grep -E '(a|b)' file"));
+        for command in [
+            "(git status)",
+            "(git status 2>/dev/null)",
+            "(git status) 2>/dev/null",
+            "git status && (git log)",
+            "x=$(git status)",
+            "git status `git log`",
+            "git status )",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+        }
+    }
+
+    /// The dialect divergence that broke the host-defaulting tests on Windows,
+    /// pinned as intended behavior: under `cmd.exe` the safe null device is
+    /// `nul`, while `/dev/null` is an ordinary forbidden-prefix path, and a
+    /// bare leading-slash redirect target is rooted on the current drive
+    /// rather than being workspace-relative.
+    #[test]
+    fn forbidden_path_argument_windows_cmd_classifies_devices_by_dialect() {
+        let p = unix_forbidden_path_policy();
+        let windows_cmd =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::WindowsCmd);
+
+        // Host-independent dialect facts: the cmd.exe null device is safe,
+        // and a drive-relative form fails closed on every host because it
+        // resolves against a per-drive current directory.
+        assert_eq!(windows_cmd("dir missing 2>nul"), None);
+        assert_eq!(windows_cmd("dir missing 2> nul"), None);
+        assert_eq!(
+            windows_cmd("type C:relative.txt"),
+            Some("C:relative.txt".into())
+        );
+
+        // The `/dev/null` classification under the Windows dialect is
+        // host-gated, not dialect-gated: on a Windows host a bare leading
+        // slash is rooted on the current drive and fails closed, while on
+        // POSIX hosts the Unix device path remains acceptable. Assert both
+        // arms so the split stays visible instead of surprising the next
+        // host-defaulting caller.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            windows_cmd("dir missing 2>/dev/null"),
+            Some("/dev/null".into())
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(windows_cmd("dir missing 2>/dev/null"), None);
     }
 
     // ── Edge cases: path traversal ──────────────────────────
@@ -5889,16 +10172,16 @@ mod tests {
     fn expired_success_is_evicted_when_budget_is_read() {
         let tracker = PerSenderTracker::new();
         assert!(tracker.record_within("expired-sender", 1));
-        {
+        let after_window = {
             let buckets = tracker.buckets.lock();
             let action_tracker = buckets.get("expired-sender").expect("sender bucket");
-            let mut state = action_tracker.state.lock();
-            state.committed[0] = Instant::now()
-                .checked_sub(ACTION_WINDOW + Duration::from_secs(1))
-                .expect("test timestamp");
-        }
+            let state = action_tracker.state.lock();
+            state.committed[0]
+                .checked_add(ACTION_WINDOW + Duration::from_secs(1))
+                .expect("test timestamp")
+        };
 
-        assert!(!tracker.is_exhausted("expired-sender", 1));
+        assert!(!tracker.is_exhausted_at("expired-sender", 1, after_window));
         assert!(!tracker.buckets.lock().contains_key("expired-sender"));
     }
 
@@ -5980,7 +10263,7 @@ mod tests {
             "forbidden paths must be blocked even when workspace_only=false"
         );
         assert!(
-            !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
+            !p.is_resolved_path_allowed(Path::new("/var/zeroclaw-forbidden-test/nonexistent.sock")),
             "forbidden /var must be blocked even when workspace_only=false"
         );
 
@@ -6023,6 +10306,7 @@ mod tests {
 
     // ── is_resolved_path_readable: read-only allowlist + POSIX devs ──
 
+    #[cfg(unix)]
     #[test]
     fn readable_includes_posix_device_files() {
         // /dev/null and friends are universally-readable system paths
@@ -6038,6 +10322,301 @@ mod tests {
                 "POSIX device file {device} must be readable"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_write_check_preserves_symlinks_to_the_null_device() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let null_alias = tmp.path().join("null-alias");
+        symlink("/dev/null", &null_alias).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(policy.is_resolved_path_readable(Path::new("/dev/null")));
+        assert!(policy.is_resolved_path_allowed(Path::new("/dev/null")));
+        // Both reads and writes retain the longstanding resolved-target
+        // exception for POSIX devices.
+        assert!(policy.is_resolved_path_readable(&null_alias));
+        assert!(
+            policy.is_resolved_path_allowed(&null_alias),
+            "a symlink to the null device must retain write authorization"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolved_path_checks_allow_the_windows_null_device() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from(r"C:\\workspace"),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        for spelling in ["nul", "NUL", "Nul", r"\\.\nul", r"\\.\NUL"] {
+            let device = Path::new(spelling);
+            assert!(
+                policy.is_path_allowed(spelling),
+                "native null device {spelling:?} must be allowed"
+            );
+            assert!(
+                policy.is_resolved_path_readable(device),
+                "native null device {spelling:?} must be readable before resolution"
+            );
+            assert!(
+                policy.is_resolved_path_allowed(device),
+                "native null device {spelling:?} must be writable before resolution"
+            );
+            assert_eq!(
+                policy.resolve_policy_target(device),
+                Some(device.to_path_buf()),
+                "native null device {spelling:?} is not canonicalizable and is returned as-is"
+            );
+        }
+    }
+
+    /// On Windows, `/dev/null` is the ordinary file `\dev\null` on the current
+    /// drive, not the null device. With workspace confinement disabled, an
+    /// explicit operator deny on `/dev` must still reject it (for example a
+    /// native PowerShell `Get-Content '/dev/null'` cron job), while native
+    /// `NUL` stays usable and a POSIX-dialect `2>/dev/null` redirect keeps its
+    /// separate, dialect-aware exception.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_dev_null_is_an_ordinary_file_under_explicit_deny() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from(r"C:\workspace"),
+            workspace_only: false,
+            forbidden_paths: vec!["/dev".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            !policy.is_path_allowed("/dev/null"),
+            "/dev/null is an ordinary file on Windows and must honor the explicit /dev deny"
+        );
+        assert!(
+            policy
+                .forbidden_path_argument_for_shell(
+                    "Get-Content '/dev/null'",
+                    ShellDialect::PowerShell
+                )
+                .is_some(),
+            "a native PowerShell read of /dev/null must be rejected under the explicit deny"
+        );
+
+        for spelling in ["NUL", "nul", r"\\.\NUL"] {
+            let device = Path::new(spelling);
+            assert!(policy.is_path_allowed(spelling), "{spelling:?}");
+            assert!(
+                policy.is_resolved_path_readable(device),
+                "{spelling:?} read"
+            );
+            assert!(
+                policy.is_resolved_path_allowed(device),
+                "{spelling:?} write"
+            );
+        }
+
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("ls missing 2>/dev/null", ShellDialect::Posix),
+            None,
+            "POSIX /dev/null redirects keep their dialect-aware exception on Windows"
+        );
+    }
+
+    /// On Unix, `nul`, `NUL`, and `\\.\nul` are ordinary filenames, not the
+    /// null device. The Windows discard spelling must not short-circuit
+    /// filesystem authorization: an alias with one of those names is resolved
+    /// like any other path and denied when its target is forbidden or outside
+    /// every allowed root. `/dev/null` and its aliases stay usable.
+    #[cfg(unix)]
+    #[test]
+    fn unix_foreign_null_spellings_get_no_filesystem_exception() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let workspace = root.join("ws");
+        let secret_dir = workspace.join("secret");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = secret_dir.join("key");
+        let outside = outside_dir.join("key");
+        let notes = workspace.join("notes.txt");
+        for file in [&secret, &outside, &notes] {
+            std::fs::write(file, "x").unwrap();
+        }
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            // The forbidden directory sits inside the workspace, so every
+            // alias below is lexically in-workspace: only resolution of the
+            // alias to its target can deny it. `/dev` is forbidden to show
+            // the `/dev/null` exception survives a forbidden parent.
+            forbidden_paths: vec![secret_dir.to_string_lossy().into_owned(), "/dev".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Control: an ordinary in-workspace alias is authorized, so the
+        // denials below come from the target, not from the fixture location.
+        let ok_alias = workspace.join("ok-alias");
+        symlink(&notes, &ok_alias).unwrap();
+        assert!(policy.is_resolved_path_readable(&ok_alias));
+        assert!(policy.is_resolved_path_allowed(&ok_alias));
+
+        for (name, target) in [
+            ("nul", &secret),
+            ("NUL", &outside),
+            (r"\\.\nul", &secret),
+            (r"\\.\NUL", &outside),
+        ] {
+            let alias = workspace.join(name);
+            symlink(target, &alias).unwrap();
+            assert_eq!(
+                policy.resolve_policy_target(&alias),
+                Some(target.clone()),
+                "{name:?} is an ordinary Unix filename and must resolve to its target"
+            );
+            assert!(
+                !policy.is_resolved_path_readable(&alias),
+                "{name:?} alias to {target:?} must not be readable"
+            );
+            assert!(
+                !policy.is_resolved_path_allowed(&alias),
+                "{name:?} alias to {target:?} must not be writable"
+            );
+        }
+
+        // A bare foreign spelling gains nothing from its name: it is resolved
+        // against the process CWD (never returned raw) and, because that CWD
+        // is outside this workspace, authorization is denied.
+        for name in ["nul", "NUL", r"\\.\nul"] {
+            let bare = Path::new(name);
+            let target = policy.resolve_policy_target(bare);
+            assert_ne!(
+                target.as_deref(),
+                Some(bare),
+                "{name:?} must not be returned as an unresolved device spelling"
+            );
+            assert!(
+                target.as_deref().is_none_or(Path::is_absolute),
+                "{name:?} must resolve to an absolute target or fail closed, got {target:?}"
+            );
+            assert!(!policy.is_resolved_path_readable(bare), "{name:?} read");
+            assert!(!policy.is_resolved_path_allowed(bare), "{name:?} write");
+        }
+
+        // `/dev/null` and an alias to it remain usable even though `/dev` is
+        // forbidden.
+        let null_alias = workspace.join("null-alias");
+        symlink("/dev/null", &null_alias).unwrap();
+        for device in [Path::new("/dev/null"), null_alias.as_path()] {
+            assert!(policy.is_resolved_path_readable(device), "{device:?} read");
+            assert!(policy.is_resolved_path_allowed(device), "{device:?} write");
+        }
+    }
+
+    /// The generic null-device exception is host-native. On Unix, `/dev/null`
+    /// is always allowed: before filesystem resolution, even when `/dev` is
+    /// forbidden, with or without workspace confinement. On Windows it is an
+    /// ordinary file (see `windows_dev_null_is_an_ordinary_file_under_explicit_deny`).
+    /// Shell redirects stay dialect-aware on every host: a POSIX
+    /// `2>/dev/null` and a `cmd.exe` `2>nul` both pass their own scans.
+    #[test]
+    fn null_device_exception_is_host_native() {
+        let confined = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            forbidden_paths: vec!["/dev".into(), "/etc".into()],
+            ..SecurityPolicy::default()
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Same shape as the Windows regression: no workspace confinement,
+            // an explicit operator deny on `/dev`. Unix `/dev/null` still wins.
+            let unconfined = SecurityPolicy {
+                workspace_dir: PathBuf::from("/workspace"),
+                workspace_only: false,
+                forbidden_paths: vec!["/dev".into()],
+                ..SecurityPolicy::default()
+            };
+            let dev_null = Path::new("/dev/null");
+            for policy in [&confined, &unconfined] {
+                assert!(
+                    policy.is_path_allowed("/dev/null"),
+                    "/dev/null must always be allowed on Unix, even with /dev forbidden"
+                );
+                assert!(
+                    policy.is_resolved_path_readable(dev_null),
+                    "/dev/null must stay readable before filesystem resolution"
+                );
+                assert!(
+                    policy.is_resolved_path_allowed(dev_null),
+                    "/dev/null must stay writable before filesystem resolution"
+                );
+                assert_eq!(
+                    policy.resolve_policy_target(dev_null),
+                    Some(dev_null.to_path_buf()),
+                    "/dev/null must be returned as-is, not resolved and re-checked"
+                );
+            }
+        }
+
+        // The exception is exact. These sit outside the workspace under the
+        // forbidden `/dev` prefix and must not match the null device.
+        for spelling in ["/dev/zero", "/dev/null/extra", "/dev/null.txt"] {
+            assert!(
+                !confined.is_path_allowed(spelling),
+                "non-null path {spelling:?} must not inherit the null-device exception"
+            );
+            assert!(
+                !confined.is_resolved_path_allowed(Path::new(spelling)),
+                "non-null path {spelling:?} must not be writable via the null-device exception"
+            );
+        }
+
+        // Redirect safety is decided by the shell dialect, not the host's
+        // filesystem exception, so these hold on every host.
+        let policy = &confined;
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("ls missing 2>/dev/null", ShellDialect::Posix),
+            None,
+            "POSIX /dev/null redirect must be allowed on every host"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_for_shell(
+                "ls missing 2>/dev/null",
+                ShellDialect::Posix,
+            ),
+            None,
+            "workspace scan must not re-block a POSIX /dev/null redirect"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("dir missing 2>nul", ShellDialect::WindowsCmd),
+            None,
+            "cmd.exe nul redirect must be allowed on every host"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("dir missing 2>NUL", ShellDialect::WindowsCmd),
+            None
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_for_shell(
+                r"dir missing 2>\\.\nul",
+                ShellDialect::WindowsCmd,
+            ),
+            None,
+            "workspace scan must not re-block a cmd.exe \\\\.\\\\nul redirect"
+        );
     }
 
     #[test]
@@ -6579,6 +11158,41 @@ mod tests {
                 .as_deref(),
             Some(r"link\secret.txt"),
             "PowerShell backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::WindowsCmd,
+                )
+                .as_deref(),
+            Some(r"link\secret.txt"),
+            "cmd.exe backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::Posix,
+                )
+                .as_deref(),
+            None,
+            "POSIX backslash escapes must retain their existing tokenization"
+        );
+
+        // PowerShell single quotes preserve a path with spaces as one argument.
+        // The path guard must inspect that complete path before the shell resolves
+        // the in-workspace symlink.
+        symlink(&outside, workspace.join("link dir")).unwrap();
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat 'link dir\secret.txt'",
+                    ShellDialect::PowerShell,
+                )
+                .as_deref(),
+            Some(r"link dir\secret.txt"),
+            "PowerShell quoted paths must retain symlink-boundary checks"
         );
 
         // A DANGLING symlink (its target directory does not exist yet) still
@@ -7561,37 +12175,90 @@ mod tests {
     }
 
     #[test]
-    fn approved_read_root_returns_workspace_for_contained_paths() {
+    fn approved_read_roots_returns_every_applicable_boundary() {
         let ws = tempfile::tempdir().unwrap();
         let ws_canon = ws.path().canonicalize().unwrap();
         let policy = SecurityPolicy {
             workspace_dir: ws.path().to_path_buf(),
             ..SecurityPolicy::default()
         };
-        // A path inside the workspace binds to the canonical workspace root.
+        // A path inside the workspace is bounded by its canonical workspace root.
+        assert_eq!(
+            policy.approved_read_roots(&ws_canon.join("sub").join("a.txt")),
+            vec![ws_canon.clone()]
+        );
         assert_eq!(
             policy.approved_read_root(&ws_canon.join("sub").join("a.txt")),
             Some(ws_canon.clone())
         );
-        // A path outside every allowlist has no bounded root.
+        // A path outside every allowlist has no bounded roots.
         let outside = tempfile::tempdir().unwrap();
         let outside_canon = outside.path().canonicalize().unwrap();
-        assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
+        assert!(
+            policy
+                .approved_read_roots(&outside_canon.join("x"))
+                .is_empty()
+        );
     }
 
     #[test]
-    fn approved_read_root_honors_read_only_allowlist() {
-        let ws = tempfile::tempdir().unwrap();
-        let ro = tempfile::tempdir().unwrap();
-        let ro_canon = ro.path().canonicalize().unwrap();
+    fn unrestricted_policy_has_no_discovery_boundary_but_preserves_handle_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = workspace.path().canonicalize().unwrap();
         let policy = SecurityPolicy {
-            workspace_dir: ws.path().to_path_buf(),
-            allowed_roots_read_only: vec![ro.path().to_path_buf()],
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let path = workspace_canon.join("nested").join("file.txt");
+
+        assert!(policy.approved_read_roots(&path).is_empty());
+        assert!(policy.approved_write_roots(&path).is_empty());
+        assert_eq!(policy.approved_read_root(&path), Some(workspace_canon));
+    }
+
+    #[test]
+    fn approved_read_roots_include_overlapping_readable_grants() {
+        let parent = tempfile::tempdir().unwrap();
+        let nested_workspace = parent.path().join("workspace");
+        std::fs::create_dir(&nested_workspace).unwrap();
+        let parent_canon = parent.path().canonicalize().unwrap();
+        let workspace_canon = nested_workspace.canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: nested_workspace,
+            allowed_roots: vec![parent.path().to_path_buf()],
+            allowed_roots_read_only: vec![parent.path().to_path_buf()],
             ..SecurityPolicy::default()
         };
         assert_eq!(
-            policy.approved_read_root(&ro_canon.join("doc.pdf")),
-            Some(ro_canon.clone())
+            policy.approved_read_roots(&workspace_canon.join("doc.pdf")),
+            vec![workspace_canon, parent_canon]
+        );
+    }
+
+    #[test]
+    fn approved_write_roots_exclude_read_only_parent_grants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let child = parent.path().join("writable-child");
+        std::fs::create_dir(&child).unwrap();
+        let parent_canon = parent.path().canonicalize().unwrap();
+        let child_canon = child.canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![child.clone()],
+            allowed_roots_read_only: vec![parent.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy.approved_read_roots(&child_canon.join("file")),
+            vec![child_canon.clone(), parent_canon]
+        );
+        assert_eq!(
+            policy.approved_write_roots(&child_canon.join("file")),
+            vec![child_canon]
         );
     }
 

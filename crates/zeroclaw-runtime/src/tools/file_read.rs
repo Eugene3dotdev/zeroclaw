@@ -89,7 +89,7 @@ impl Tool for FileReadTool {
         let is_base64 = args.get("encoding").and_then(|v| v.as_str()) == Some("base64");
         let mut result = self.read_path(args).await?;
         if !self.persistent_writes && result.success && !is_base64 {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
         }
         Ok(result)
     }
@@ -1307,7 +1307,9 @@ mod tests {
 
         let mut agent = Agent::builder()
             .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![file_read_tool],
+            ))
             .memory(make_memory())
             .observer(make_observer())
             .tool_dispatcher(Box::new(NativeToolDispatcher))

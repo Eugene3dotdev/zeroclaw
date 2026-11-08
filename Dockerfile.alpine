@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:595398b0081eacda8e1c4c5b97b76cd1020e4d58a8ebcb4843b9bca1e79e7436
+ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:e44c87c7dd212720eb00469aeac89504ca2be77b8f0d6dbffb30665d5fcc59e1
 # >>> end generated:base-arg-node-alpine <<<
 # >>> generated:base-arg-rust-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.96-alpine3.23@sha256:14b9b5f47dcc6644d0f0c1b35a2c2c5d0124f67159aaee28a348627523459b55
+ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.98-alpine3.23@sha256:94a43bda4fd9b71fa3a74621c0982a646f83c7d1a3ba52bb4b7ddfd76d4dca93
 # >>> end generated:base-arg-rust-alpine <<<
 # >>> generated:base-arg-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_ALPINE=alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+ARG ZEROCLAW_BASE_ALPINE=alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 # >>> end generated:base-arg-alpine <<<
 
 FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_NODE_ALPINE} AS web-node
@@ -36,21 +36,35 @@ WORKDIR /app
 ARG TARGETARCH
 ARG CARGO_ZIGBUILD_VERSION=0.23.0
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,whatsapp-web"
 # >>> end generated:docker-features-arg <<<
+
+# No `.git` in the build context (`.dockerignore`); the commit is passed in here.
+ARG ZEROCLAW_BUILD_ID=""
+ENV ZEROCLAW_BUILD_ID=${ZEROCLAW_BUILD_ID}
 
 RUN apk add --no-cache build-base perl pkgconfig zig \
     && cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
 
 COPY Cargo.toml Cargo.lock ./
+# Root path patches need their genuine source during dependency prefetch.
+COPY vendor/ vendor/
+# The optional WASM plugin host generates bindings from the repository-owned
+# WIT contract during compilation. Keep it in this persistent builder before
+# both the dependency prefetch and the real source build.
+COPY wit/ wit/
 COPY --parents crates/*/Cargo.toml ./
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
+COPY --parents tests/fixtures/*/Cargo.toml ./
 COPY --parents crates/zeroclaw-macros/src/ ./
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+# apps/zerorelay: workspace member with lib+bin targets; not shipped in the
+# server image, but Cargo must be able to load its manifest during pre-fetch.
+COPY apps/zerorelay/Cargo.toml apps/zerorelay/Cargo.toml
 COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
-RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
@@ -59,6 +73,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > apps/tauri/build.rs \
     && echo "fn main() {}" > apps/zerocode/src/main.rs \
     && echo "fn main() {}" > apps/zerocode/build.rs \
+    && echo "fn main() {}" > apps/zerorelay/src/main.rs \
+    && echo "" > apps/zerorelay/src/lib.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "" > xtask/src/lib.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
@@ -66,11 +82,19 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
+    && mkdir -p crates/zeroclaw-plugins/examples \
+    && echo "fn main() {}" > crates/zeroclaw-plugins/examples/sign_manifest.rs \
     && for d in crates/*/tests/fixtures/*/; do \
         [ -f "${d}Cargo.toml" ] || continue; \
         mkdir -p "${d}src"; \
         printf '' > "${d}src/lib.rs"; \
     done \
+    && for d in tests/fixtures/*/; do \
+        [ -f "${d}Cargo.toml" ] || continue; \
+        mkdir -p "${d}src"; \
+        printf '' > "${d}src/lib.rs"; \
+    done \
+    && echo "fn main() {}" > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs \
     && for d in crates/*/; do \
         [ "$d" = "crates/zeroclaw-macros/" ] && continue; \
         mkdir -p "${d}src"; \
@@ -142,7 +166,7 @@ RUN for binary in zeroclaw zerocode; do \
 
 FROM ${ZEROCLAW_BASE_ALPINE} AS runtime
 
-RUN apk add --no-cache bash ca-certificates curl git tzdata \
+RUN apk add --no-cache bash 'ca-certificates>=20261020-r0' curl git tzdata \
     && mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /app/zerocode /usr/local/bin/zerocode

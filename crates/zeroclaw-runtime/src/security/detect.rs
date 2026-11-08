@@ -1,9 +1,21 @@
 //! Auto-detection of available security features
 
 use crate::security::traits::Sandbox;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
+use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
+
+/// Extra filesystem roots beyond the primary workspace that a sandbox should
+/// also grant access to, mirroring `SecurityPolicy`'s allowed-roots tiers
+/// (`allowed_roots`, `allowed_roots_read_only`, `allowed_roots_write_only`).
+/// Backends that build per-path rulesets (Landlock and macOS Seatbelt)
+/// consume this; others ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxExtraRoots {
+    pub read_write: Vec<PathBuf>,
+    pub read_only: Vec<PathBuf>,
+    pub write_only: Vec<PathBuf>,
+}
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
 const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
@@ -17,43 +29,84 @@ const SEATBELT_DESCRIPTION: &str = "macOS Seatbelt sandbox (built-in sandbox-exe
 pub struct SandboxPosture {
     pub requested_backend: &'static str,
     pub active_backend: &'static str,
-    pub active_description: &'static str,
+    pub active_description: String,
     pub fallback: bool,
 }
 
-/// Inspect sandbox backend selection without constructing a sandbox instance.
+/// Inspect sandbox backend selection without returning a usable sandbox.
+///
+/// This does not enforce anything, but on Linux it is **not** a minimal or
+/// side-effect-free probe: `landlock_available` reaches
+/// `LandlockSandbox::with_roots`, which builds the full ruleset execution will
+/// use — opening every configured path and emitting the same DEBUG/WARN
+/// diagnostics for absent, unopenable, or unenforceable roots. That is
+/// deliberate. Deciding availability from a cheaper probe is what let posture
+/// report a backend as active while every subsequent spawn failed; validating
+/// through the real construction keeps the two answers in step.
+///
+/// The ruleset is dropped without `restrict_self`, so the calling process is
+/// never confined.
 #[must_use]
 pub fn sandbox_posture(
     sandbox: &SandboxConfig,
-    runtime_kind: &str,
+    runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> SandboxPosture {
     let requested_backend = sandbox_backend_name(&sandbox.backend);
     if matches!(sandbox.backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
-        return sandbox_posture_result(requested_backend, "none", NOOP_DESCRIPTION);
+        let active = runtime_fallback_backend(runtime_kind);
+        return sandbox_posture_result(requested_backend, active.name(), active.description());
     }
 
-    let active_backend =
-        configured_backend_selection(&sandbox.backend, runtime_kind, workspace_dir);
+    let (active_backend, _) =
+        configured_backend_selection(&sandbox.backend, runtime_kind, workspace_dir, extra_roots);
 
     sandbox_posture_result(
         requested_backend,
         active_backend.name(),
-        active_backend.description(),
+        firejail_args_description(active_backend, &sandbox.firejail_args)
+            .unwrap_or_else(|| active_backend.description()),
     )
+}
+
+/// When Firejail is the active backend and its configured `firejail_args`
+/// would be rejected, the posture says so (and that commands are blocked)
+/// rather than describing Firejail as if those arguments applied.
+fn firejail_args_description(
+    active_backend: SelectedSandboxBackend,
+    firejail_args: &[String],
+) -> Option<String> {
+    if !matches!(active_backend, SelectedSandboxBackend::Firejail) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        super::firejail::FirejailSandbox::validate_extra_args(firejail_args)
+            .err()
+            .map(|error| firejail_args_rejected_description(&error))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = firejail_args;
+        None
+    }
 }
 
 fn sandbox_posture_result(
     requested_backend: &'static str,
     active_backend: &'static str,
-    active_description: &'static str,
+    active_description: String,
 ) -> SandboxPosture {
     SandboxPosture {
         requested_backend,
         active_backend,
         active_description,
+        // An explicit `backend = "docker"` on the Docker runtime is honored by
+        // the runtime container itself, so it is not a fallback.
         fallback: !matches!(requested_backend, "auto" | "none")
-            && active_backend != requested_backend,
+            && active_backend != requested_backend
+            && !(requested_backend == "docker" && active_backend == "docker-runtime"),
     }
 }
 
@@ -64,6 +117,11 @@ enum SelectedSandboxBackend {
     Firejail,
     Bubblewrap,
     Docker,
+    /// No additional sandbox wrapper is constructed, but containment is not
+    /// lost: `runtime.kind = "docker"` already runs every command inside the
+    /// runtime container. Distinct from `None` so posture reporting does not
+    /// describe this state as application-layer-only.
+    DockerRuntime,
     SandboxExec,
 }
 
@@ -75,18 +133,22 @@ impl SelectedSandboxBackend {
             Self::Firejail => "firejail",
             Self::Bubblewrap => "bubblewrap",
             Self::Docker => "docker",
+            Self::DockerRuntime => "docker-runtime",
             Self::SandboxExec => "sandbox-exec",
         }
     }
 
-    fn description(self) -> &'static str {
+    fn description(self) -> String {
         match self {
-            Self::None => NOOP_DESCRIPTION,
-            Self::Landlock => LANDLOCK_DESCRIPTION,
-            Self::Firejail => FIREJAIL_DESCRIPTION,
-            Self::Bubblewrap => BUBBLEWRAP_DESCRIPTION,
-            Self::Docker => DOCKER_DESCRIPTION,
-            Self::SandboxExec => SEATBELT_DESCRIPTION,
+            Self::None => NOOP_DESCRIPTION.to_string(),
+            Self::Landlock => LANDLOCK_DESCRIPTION.to_string(),
+            Self::Firejail => FIREJAIL_DESCRIPTION.to_string(),
+            Self::Bubblewrap => BUBBLEWRAP_DESCRIPTION.to_string(),
+            Self::Docker => DOCKER_DESCRIPTION.to_string(),
+            Self::DockerRuntime => crate::i18n::get_required_cli_string(
+                "cli-security-status-sandbox-description-docker-runtime",
+            ),
+            Self::SandboxExec => SEATBELT_DESCRIPTION.to_string(),
         }
     }
 
@@ -104,30 +166,89 @@ impl SelectedSandboxBackend {
 
 fn configured_backend_selection(
     backend: &SandboxBackend,
-    runtime_kind: &str,
+    runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+) -> (SelectedSandboxBackend, Option<String>) {
+    let mut rejection = None;
+    let selected = configured_backend_selection_with(backend, runtime_kind, |selected| {
+        let (available, reason) = probe_requested_backend(selected, workspace_dir, extra_roots);
+        if !available && rejection.is_none() {
+            rejection = reason;
+        }
+        available
+    });
+    (selected, rejection)
+}
+
+fn configured_backend_selection_with(
+    backend: &SandboxBackend,
+    runtime_kind: RuntimeKind,
+    mut is_available: impl FnMut(SelectedSandboxBackend) -> bool,
 ) -> SelectedSandboxBackend {
     if matches!(backend, SandboxBackend::Auto) {
-        return detect_best_backend(runtime_kind, workspace_dir);
+        return detect_best_backend_with(runtime_kind, is_available);
+    }
+
+    if matches!(backend, SandboxBackend::Docker) && matches!(runtime_kind, RuntimeKind::Docker) {
+        return SelectedSandboxBackend::DockerRuntime;
     }
 
     SelectedSandboxBackend::from_config(backend)
-        .filter(|selected| sandbox_backend_available(*selected, workspace_dir))
-        .unwrap_or(SelectedSandboxBackend::None)
+        .filter(|selected| sandbox_backend_compatible_with_runtime(*selected, runtime_kind))
+        .filter(|selected| is_available(*selected))
+        .unwrap_or_else(|| runtime_fallback_backend(runtime_kind))
 }
 
-fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> SelectedSandboxBackend {
-    let skip_docker = runtime_kind == "native";
+fn runtime_fallback_backend(runtime_kind: RuntimeKind) -> SelectedSandboxBackend {
+    if matches!(runtime_kind, RuntimeKind::Docker) {
+        SelectedSandboxBackend::DockerRuntime
+    } else {
+        SelectedSandboxBackend::None
+    }
+}
+
+fn sandbox_backend_compatible_with_runtime(
+    selected: SelectedSandboxBackend,
+    runtime_kind: RuntimeKind,
+) -> bool {
+    !(matches!(selected, SelectedSandboxBackend::Docker)
+        && matches!(runtime_kind, RuntimeKind::Docker))
+}
+
+fn auto_backend_compatible_with_runtime(
+    selected: SelectedSandboxBackend,
+    runtime_kind: RuntimeKind,
+) -> bool {
+    sandbox_backend_compatible_with_runtime(selected, runtime_kind)
+        && !(matches!(selected, SelectedSandboxBackend::Docker)
+            && matches!(runtime_kind, RuntimeKind::Native))
+}
+
+fn detect_best_backend(
+    runtime_kind: RuntimeKind,
+    workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+) -> SelectedSandboxBackend {
+    detect_best_backend_with(runtime_kind, |selected| {
+        sandbox_backend_available(selected, workspace_dir, extra_roots)
+    })
+}
+
+fn detect_best_backend_with(
+    runtime_kind: RuntimeKind,
+    mut is_available: impl FnMut(SelectedSandboxBackend) -> bool,
+) -> SelectedSandboxBackend {
     #[cfg(target_os = "linux")]
     {
         #[cfg(feature = "sandbox-landlock")]
         {
-            if sandbox_backend_available(SelectedSandboxBackend::Landlock, workspace_dir) {
+            if is_available(SelectedSandboxBackend::Landlock) {
                 return SelectedSandboxBackend::Landlock;
             }
         }
 
-        if sandbox_backend_available(SelectedSandboxBackend::Firejail, workspace_dir) {
+        if is_available(SelectedSandboxBackend::Firejail) {
             return SelectedSandboxBackend::Firejail;
         }
     }
@@ -136,30 +257,78 @@ fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> Sele
     {
         #[cfg(feature = "sandbox-bubblewrap")]
         {
-            if sandbox_backend_available(SelectedSandboxBackend::Bubblewrap, workspace_dir) {
+            if is_available(SelectedSandboxBackend::Bubblewrap) {
                 return SelectedSandboxBackend::Bubblewrap;
             }
         }
 
-        if sandbox_backend_available(SelectedSandboxBackend::SandboxExec, workspace_dir) {
+        if is_available(SelectedSandboxBackend::SandboxExec) {
             return SelectedSandboxBackend::SandboxExec;
         }
     }
 
-    if !skip_docker && sandbox_backend_available(SelectedSandboxBackend::Docker, workspace_dir) {
+    if auto_backend_compatible_with_runtime(SelectedSandboxBackend::Docker, runtime_kind)
+        && is_available(SelectedSandboxBackend::Docker)
+    {
         return SelectedSandboxBackend::Docker;
     }
 
-    SelectedSandboxBackend::None
+    runtime_fallback_backend(runtime_kind)
+}
+
+/// Probe the explicitly requested backend and, when it refuses, return the
+/// explanation it produced. Only bubblewrap can explain itself today, so the
+/// other backends keep the generic fallback warning. The reason comes from the
+/// same probe that decided availability: re-probing on the failure path would
+/// run the launcher a second time, without a timeout, and could disagree with
+/// the first result.
+fn probe_requested_backend(
+    backend: SelectedSandboxBackend,
+    workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+) -> (bool, Option<String>) {
+    if matches!(backend, SelectedSandboxBackend::Bubblewrap) {
+        return bubblewrap_availability();
+    }
+    (
+        sandbox_backend_available(backend, workspace_dir, extra_roots),
+        None,
+    )
+}
+
+#[cfg(all(
+    feature = "sandbox-bubblewrap",
+    any(target_os = "linux", target_os = "macos")
+))]
+fn bubblewrap_availability() -> (bool, Option<String>) {
+    match super::bubblewrap::BubblewrapSandbox::probe() {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    }
+}
+
+#[cfg(not(all(
+    feature = "sandbox-bubblewrap",
+    any(target_os = "linux", target_os = "macos")
+)))]
+fn bubblewrap_availability() -> (bool, Option<String>) {
+    (
+        false,
+        Some("the bubblewrap backend is not compiled for this build".to_string()),
+    )
 }
 
 fn sandbox_backend_available(
     backend: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> bool {
     match backend {
         SelectedSandboxBackend::None => true,
-        SelectedSandboxBackend::Landlock => landlock_available(workspace_dir),
+        // Containment comes from the runtime container itself; there is no
+        // host-side wrapper to probe.
+        SelectedSandboxBackend::DockerRuntime => true,
+        SelectedSandboxBackend::Landlock => landlock_available(workspace_dir, extra_roots),
         SelectedSandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
             {
@@ -213,12 +382,18 @@ fn seatbelt_available() -> bool {
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
-fn landlock_available(workspace_dir: Option<&Path>) -> bool {
-    super::landlock::LandlockSandbox::with_workspace(workspace_dir.map(Path::to_path_buf)).is_ok()
+fn landlock_available(workspace_dir: Option<&Path>, extra_roots: &SandboxExtraRoots) -> bool {
+    super::landlock::LandlockSandbox::with_roots(
+        workspace_dir.map(Path::to_path_buf),
+        extra_roots.read_write.clone(),
+        extra_roots.read_only.clone(),
+        extra_roots.write_only.clone(),
+    )
+    .is_ok()
 }
 
 #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
-fn landlock_available(_workspace_dir: Option<&Path>) -> bool {
+fn landlock_available(_workspace_dir: Option<&Path>, _extra_roots: &SandboxExtraRoots) -> bool {
     false
 }
 
@@ -236,8 +411,9 @@ fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
 
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
-    runtime_kind: &str,
+    runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> Arc<dyn Sandbox> {
     let backend = &sandbox.backend;
 
@@ -247,23 +423,59 @@ pub fn create_sandbox(
     }
 
     match backend {
-        SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir)
-        }
+        SandboxBackend::Auto | SandboxBackend::None => detect_best_sandbox(
+            runtime_kind,
+            workspace_dir,
+            extra_roots,
+            &sandbox.image,
+            &sandbox.firejail_args,
+        ),
         requested => {
-            let selected = configured_backend_selection(requested, runtime_kind, workspace_dir);
-            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
-                return sandbox;
+            let (selected, unavailable_reason) =
+                configured_backend_selection(requested, runtime_kind, workspace_dir, extra_roots);
+            if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
+                if matches!(requested, SandboxBackend::Docker) {
+                    log_docker_sandbox_redundant_with_docker_runtime();
+                } else {
+                    log_requested_backend_unavailable_with_docker_runtime(selected_backend_label(
+                        requested,
+                    ));
+                }
+                return Arc::new(super::traits::NoopSandbox);
             }
-            log_requested_backend_unavailable(selected_backend_label(requested));
+            if let Some(built) = create_selected_sandbox(
+                selected,
+                workspace_dir,
+                extra_roots,
+                &sandbox.image,
+                &sandbox.firejail_args,
+            ) {
+                return built;
+            }
+            log_requested_backend_unavailable(
+                selected_backend_label(requested),
+                unavailable_reason,
+            );
             Arc::new(super::traits::NoopSandbox)
         }
     }
 }
 
-fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
-    let selected = detect_best_backend(runtime_kind, workspace_dir);
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
+fn detect_best_sandbox(
+    runtime_kind: RuntimeKind,
+    workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+    image: &str,
+    firejail_args: &[String],
+) -> Arc<dyn Sandbox> {
+    let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
+    if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
+        log_auto_backend_selection(selected, runtime_kind);
+        return Arc::new(super::traits::NoopSandbox);
+    }
+    if let Some(sandbox) =
+        create_selected_sandbox(selected, workspace_dir, extra_roots, image, firejail_args)
+    {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -272,35 +484,134 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
     Arc::new(super::traits::NoopSandbox)
 }
 
+#[cfg(target_os = "macos")]
+struct FailedSeatbeltSandbox {
+    error: std::io::Error,
+}
+
+#[cfg(target_os = "macos")]
+impl Sandbox for FailedSeatbeltSandbox {
+    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            self.error.kind(),
+            format!("Seatbelt initialization failed: {}", self.error),
+        ))
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &str {
+        "sandbox-exec"
+    }
+
+    fn description(&self) -> &str {
+        "Seatbelt initialization failed; commands are blocked"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn firejail_args_rejected_description(error: &std::io::Error) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-security-status-sandbox-description-firejail-args-rejected",
+        &[("reason", &error.to_string())],
+    )
+}
+
+/// Firejail was selected but its configured `firejail_args` were rejected.
+/// Running the command without them would present configured hardening as
+/// active when it is not, and running it unsandboxed would drop the sandbox
+/// altogether, so every command is refused with the reason instead.
+#[cfg(target_os = "linux")]
+struct RejectedFirejailArgsSandbox {
+    error: std::io::Error,
+    description: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Sandbox for RejectedFirejailArgsSandbox {
+    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            self.error.kind(),
+            self.error.to_string(),
+        ))
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &str {
+        "firejail"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_firejail_sandbox(firejail_args: &[String]) -> Option<Arc<dyn Sandbox>> {
+    match super::firejail::FirejailSandbox::with_args(firejail_args) {
+        Ok(sandbox) => Some(Arc::new(sandbox)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            Some(Arc::new(RejectedFirejailArgsSandbox {
+                description: firejail_args_rejected_description(&error),
+                error,
+            }))
+        }
+        Err(_) => None,
+    }
+}
+
 fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+    image: &str,
+    firejail_args: &[String],
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
+        // The runtime container owns containment; no wrapper is constructed.
+        SelectedSandboxBackend::DockerRuntime => None,
         SelectedSandboxBackend::Landlock => {
             #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
             {
-                super::landlock::LandlockSandbox::with_workspace(
+                super::landlock::LandlockSandbox::with_roots(
                     workspace_dir.map(Path::to_path_buf),
+                    extra_roots.read_write.clone(),
+                    extra_roots.read_only.clone(),
+                    extra_roots.write_only.clone(),
                 )
                 .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
                 .ok()
             }
             #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
             {
+                // This Landlock branch does not consume extra roots when its
+                // feature/platform implementation is unavailable.
+                let _ = extra_roots;
                 None
             }
         }
         SelectedSandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
             {
-                super::firejail::FirejailSandbox::new()
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                create_firejail_sandbox(firejail_args)
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = firejail_args;
                 None
             }
         }
@@ -324,12 +635,9 @@ fn create_selected_sandbox(
         }
         SelectedSandboxBackend::Docker => {
             let result = if let Some(ws) = workspace_dir {
-                super::docker::DockerSandbox::with_workspace(
-                    super::docker::DockerSandbox::default_image(),
-                    ws.to_path_buf(),
-                )
+                super::docker::DockerSandbox::with_workspace(image.to_string(), ws.to_path_buf())
             } else {
-                super::docker::DockerSandbox::new()
+                super::docker::DockerSandbox::with_image(image.to_string())
             };
             result
                 .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
@@ -338,9 +646,19 @@ fn create_selected_sandbox(
         SelectedSandboxBackend::SandboxExec => {
             #[cfg(target_os = "macos")]
             {
-                super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir)
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                let result = super::seatbelt::SeatbeltSandbox::with_roots(
+                    workspace_dir,
+                    &extra_roots.read_write,
+                    &extra_roots.read_only,
+                    &extra_roots.write_only,
+                );
+                // Once Seatbelt is selected, initialization failure must block
+                // execution rather than trigger the unsandboxed fallback.
+                let sandbox: Arc<dyn Sandbox> = match result {
+                    Ok(sandbox) => Arc::new(sandbox),
+                    Err(error) => Arc::new(FailedSeatbeltSandbox { error }),
+                };
+                Some(sandbox)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -362,29 +680,73 @@ fn selected_backend_label(backend: &SandboxBackend) -> &'static str {
     }
 }
 
-fn log_requested_backend_unavailable(label: &'static str) {
+fn log_requested_backend_unavailable(label: &'static str, reason: Option<String>) {
+    let detail = match reason {
+        Some(reason) => format!(
+            "{label} requested but not available ({reason}), falling back to application-layer"
+        ),
+        None => {
+            format!("{label} requested but not available, falling back to application-layer")
+        }
+    };
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        &format!("{label} requested but not available, falling back to application-layer")
+        &detail
     );
 }
 
-fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: &str) {
+fn log_requested_backend_unavailable_with_docker_runtime(label: &'static str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        &format!(
+            "{label} requested but not available; Docker runtime container isolation remains active"
+        )
+    );
+}
+
+fn log_docker_sandbox_redundant_with_docker_runtime() {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "Docker sandbox skipped: runtime.kind = \"docker\" already runs commands in a container; \
+         a nested Docker sandbox would double-wrap the command"
+    );
+}
+
+fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: RuntimeKind) {
     match selected {
         SelectedSandboxBackend::None => {
-            if runtime_kind == "native" {
+            if matches!(runtime_kind, RuntimeKind::Native) {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
                 );
             }
+            if matches!(runtime_kind, RuntimeKind::Docker) {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "No additional sandbox backend available; Docker runtime still provides container isolation"
+                );
+            } else {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "No sandbox backend available, using application-layer security"
+                );
+            }
+        }
+        SelectedSandboxBackend::DockerRuntime => {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "No sandbox backend available, using application-layer security"
+                "Docker runtime provides container isolation; no additional sandbox wrapper needed"
             );
         }
         SelectedSandboxBackend::Landlock => {
@@ -463,10 +825,197 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_seatbelt_preserves_error_and_rejects_repeated_commands() {
+        let sandbox = FailedSeatbeltSandbox {
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "policy unavailable"),
+        };
+        assert!(!sandbox.is_available());
+        assert_eq!(sandbox.name(), "sandbox-exec");
+        let initialization_error = sandbox.check_initialization().unwrap_err();
+        assert_eq!(
+            initialization_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            initialization_error.to_string(),
+            "Seatbelt initialization failed: policy unavailable"
+        );
+        for _ in 0..2 {
+            let mut command = std::process::Command::new("/bin/echo");
+            command.arg("must not run");
+            let error = sandbox.wrap_command(&mut command).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Seatbelt initialization failed: policy unavailable")
+            );
+            assert_eq!(command.get_program(), "/bin/echo");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_factory_keeps_resolution_failures_confined() {
+        if !Path::new(super::super::seatbelt::SANDBOX_EXEC_PATH).is_file() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let cycle = fixture.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let extra_roots = SandboxExtraRoots {
+            read_only: vec![cycle],
+            ..SandboxExtraRoots::default()
+        };
+        // With Bubblewrap disabled, macOS auto-selection chooses Seatbelt.
+        let backends = [
+            SandboxBackend::SandboxExec,
+            #[cfg(not(feature = "sandbox-bubblewrap"))]
+            SandboxBackend::Auto,
+        ];
+        for backend in backends {
+            let mut config = SandboxConfig {
+                enabled: Some(true),
+                backend,
+                firejail_args: Vec::new(),
+                ..SandboxConfig::default()
+            };
+            let sandbox = create_sandbox(
+                &config,
+                RuntimeKind::Native,
+                Some(fixture.path()),
+                &extra_roots,
+            );
+            assert_eq!(sandbox.name(), "sandbox-exec");
+            assert!(!sandbox.is_available());
+            assert!(sandbox.check_initialization().is_err());
+            let mut command = std::process::Command::new("/bin/echo");
+            let error = sandbox.wrap_command(&mut command).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Seatbelt root symlink limit exceeded")
+            );
+
+            config.enabled = Some(false);
+            let disabled = create_sandbox(
+                &config,
+                RuntimeKind::Native,
+                Some(fixture.path()),
+                &extra_roots,
+            );
+            assert_eq!(disabled.name(), "none");
+            assert!(disabled.check_initialization().is_ok());
+            assert!(disabled.wrap_command(&mut command).is_ok());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_factory_still_wraps_valid_roots() {
+        if !Path::new(super::super::seatbelt::SANDBOX_EXEC_PATH).is_file() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let config = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::SandboxExec,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+        let sandbox = create_sandbox(
+            &config,
+            RuntimeKind::Native,
+            Some(fixture.path()),
+            &SandboxExtraRoots::default(),
+        );
+        assert_eq!(sandbox.name(), "sandbox-exec");
+        assert!(sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        sandbox.wrap_command(&mut command).unwrap();
+        assert_eq!(
+            command.get_program(),
+            super::super::seatbelt::SANDBOX_EXEC_PATH
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_firejail_with_rejected_args_blocks_commands_instead_of_dropping_them() {
+        // The args are checked before Firejail is probed, so this
+        // holds whether or not firejail is installed.
+        let sandbox = create_selected_sandbox(
+            SelectedSandboxBackend::Firejail,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+            &[
+                "--net=none".to_string(),
+                "--profile=/tmp/weaker.profile".to_string(),
+            ],
+        )
+        .expect("rejected firejail_args must not fall back to no sandbox");
+        assert_eq!(sandbox.name(), "firejail");
+        assert!(!sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        let error = sandbox.wrap_command(&mut command).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--profile"), "{error}");
+        assert_eq!(command.get_program(), "/bin/echo");
+        assert!(sandbox.check_initialization().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firejail_posture_reports_rejected_args() {
+        let rejected = firejail_args_description(
+            SelectedSandboxBackend::Firejail,
+            &["--ignore=noroot".to_string()],
+        )
+        .expect("rejected args are reported");
+        let reason = super::super::firejail::FirejailSandbox::validate_extra_args(&[
+            "--ignore=noroot".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            rejected,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-security-status-sandbox-description-firejail-args-rejected",
+                &[("reason", &reason)],
+            )
+        );
+        assert!(rejected.contains("--ignore"), "{rejected}");
+        assert_eq!(
+            firejail_args_description(
+                SelectedSandboxBackend::Firejail,
+                &["--net=none".to_string()]
+            ),
+            None
+        );
+        assert_eq!(
+            firejail_args_description(
+                SelectedSandboxBackend::Landlock,
+                &["--ignore=noroot".to_string()]
+            ),
+            None,
+            "firejail_args only matter when Firejail is the active backend"
+        );
+    }
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("", None);
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+            &[],
+        );
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -477,8 +1026,14 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+        );
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -488,8 +1043,14 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
-        let posture = sandbox_posture(&sandbox_cfg, "", None);
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+        );
         assert_eq!(posture.requested_backend, "none");
         assert_eq!(posture.active_backend, "none");
         assert!(!posture.fallback);
@@ -501,8 +1062,14 @@ mod tests {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+        );
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -512,7 +1079,13 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native", None);
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+            &[],
+        );
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -522,8 +1095,14 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
-        let posture = sandbox_posture(&sandbox_cfg, "native", None);
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
         assert_ne!(posture.active_backend, "docker");
     }
 
@@ -533,9 +1112,20 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
-        let posture = sandbox_posture(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
 
         assert_eq!(posture.active_backend, sandbox.name());
     }
@@ -548,10 +1138,295 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         assert!(sandbox.is_available());
+    }
+
+    #[test]
+    fn docker_runtime_auto_selection_skips_available_docker_backend() {
+        let selected = detect_best_backend_with(RuntimeKind::Docker, |backend| {
+            matches!(backend, SelectedSandboxBackend::Docker)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::DockerRuntime);
+    }
+
+    #[test]
+    fn docker_runtime_auto_selection_reports_runtime_containment_when_nothing_available() {
+        let selected = detect_best_backend_with(RuntimeKind::Docker, |_| false);
+
+        assert_eq!(selected, SelectedSandboxBackend::DockerRuntime);
+    }
+
+    #[test]
+    fn native_runtime_auto_selection_reports_none_when_nothing_available() {
+        let selected = detect_best_backend_with(RuntimeKind::Native, |_| false);
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+    }
+
+    #[test]
+    fn native_runtime_auto_selection_skips_available_docker_backend() {
+        let selected = detect_best_backend_with(RuntimeKind::Native, |backend| {
+            matches!(backend, SelectedSandboxBackend::Docker)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+    }
+
+    #[test]
+    fn non_docker_runtime_auto_selection_can_use_available_docker_backend() {
+        let selected = detect_best_backend_with(RuntimeKind::Cloudflare, |backend| {
+            matches!(backend, SelectedSandboxBackend::Docker)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::Docker);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_auto_selection_keeps_a_coding_cli_capable_backend() {
+        // bubblewrap declares `coding_cli_unsupported_reason`, so auto-selecting
+        // it ahead of firejail rejects coding CLI commands that previously ran.
+        // Selection must keep the capable backend until it can consult backend
+        // capabilities, not just reachability.
+        let selected = detect_best_backend_with(RuntimeKind::Native, |backend| {
+            matches!(
+                backend,
+                SelectedSandboxBackend::Bubblewrap | SelectedSandboxBackend::Firejail
+            )
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::Firejail);
+    }
+
+    #[test]
+    fn only_bubblewrap_explains_its_own_rejection() {
+        for backend in [SandboxBackend::Firejail, SandboxBackend::Landlock] {
+            let (_, reason) = configured_backend_selection(
+                &backend,
+                RuntimeKind::Native,
+                None,
+                &SandboxExtraRoots::default(),
+            );
+
+            assert!(
+                reason.is_none(),
+                "{backend:?} must keep the generic warning"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "sandbox-bubblewrap"))]
+    #[test]
+    fn bubblewrap_missing_from_the_build_reports_that_reason() {
+        let (selected, reason) = configured_backend_selection(
+            &SandboxBackend::Bubblewrap,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+        let reason = reason.expect("a build without bubblewrap must explain the rejection");
+        assert!(reason.contains("not compiled"), "{reason}");
+    }
+
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[test]
+    fn bubblewrap_launcher_probe_failure_explains_the_rejection() {
+        // The launcher probe resolves `bwrap` from this process's PATH, so
+        // isolate the test the same way the bootstrap capture tests do: re-run
+        // only this test in a child whose PATH cannot contain a launcher.
+        let test_name = std::thread::current()
+            .name()
+            .expect("named lib test")
+            .to_owned();
+        const CHILD: &str = "ZEROCLAW_TEST_BWRAP_PROBE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test_name.as_str()) {
+            let empty_path = tempfile::TempDir::new().expect("tempdir");
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("lib test executable"))
+                    .args(["--exact", &test_name, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, &test_name)
+                    .env("PATH", empty_path.path())
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .expect("run isolated bubblewrap probe test");
+            assert!(
+                output.status.success(),
+                "isolated bubblewrap probe failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let (selected, reason) = configured_backend_selection(
+            &SandboxBackend::Bubblewrap,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+        let reason = reason.expect("a failed launcher probe must explain the rejection");
+        assert!(reason.to_lowercase().contains("bwrap"), "{reason}");
+    }
+
+    #[test]
+    fn explicit_docker_backend_creates_no_extra_wrapper_on_docker_runtime() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Docker,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            RuntimeKind::Docker,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(sandbox.name(), "none");
+    }
+
+    #[test]
+    fn explicit_docker_posture_reports_runtime_containment_on_docker_runtime() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Docker,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Docker,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(posture.requested_backend, "docker");
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert_eq!(
+            posture.active_description,
+            crate::i18n::get_required_cli_string(
+                "cli-security-status-sandbox-description-docker-runtime"
+            )
+        );
+        assert!(
+            !posture.fallback,
+            "Docker runtime honors the requested containment; it is not a fallback"
+        );
+    }
+
+    #[test]
+    fn disabled_optional_sandbox_still_reports_docker_runtime_containment() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Docker,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(posture.requested_backend, "auto");
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert!(!posture.fallback);
+    }
+
+    #[test]
+    fn absent_optional_sandbox_still_reports_docker_runtime_containment() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::None,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Docker,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(posture.requested_backend, "none");
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert!(!posture.fallback);
+    }
+
+    #[test]
+    fn unavailable_explicit_backend_falls_back_to_docker_runtime_containment() {
+        let selected = configured_backend_selection_with(
+            &SandboxBackend::SandboxExec,
+            RuntimeKind::Docker,
+            |_| false,
+        );
+
+        assert_eq!(selected, SelectedSandboxBackend::DockerRuntime);
+        let posture =
+            sandbox_posture_result("sandbox-exec", selected.name(), selected.description());
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert!(posture.fallback);
+    }
+
+    #[test]
+    fn docker_runtime_auto_posture_never_reports_application_layer_only() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+
+        let posture = sandbox_posture(
+            &sandbox_cfg,
+            RuntimeKind::Docker,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        // Depending on the host an OS-native backend may be active, but the
+        // posture must never degrade to "none" (containment is not lost) nor
+        // nest a second Docker layer.
+        assert_ne!(posture.active_backend, "none");
+        assert_ne!(posture.active_backend, "docker");
+        assert!(!posture.fallback);
+    }
+
+    #[test]
+    fn only_docker_sandbox_conflicts_with_docker_runtime() {
+        assert!(!sandbox_backend_compatible_with_runtime(
+            SelectedSandboxBackend::Docker,
+            RuntimeKind::Docker,
+        ));
+        assert!(sandbox_backend_compatible_with_runtime(
+            SelectedSandboxBackend::Docker,
+            RuntimeKind::Native,
+        ));
+        assert!(sandbox_backend_compatible_with_runtime(
+            SelectedSandboxBackend::SandboxExec,
+            RuntimeKind::Docker,
+        ));
     }
 
     #[test]

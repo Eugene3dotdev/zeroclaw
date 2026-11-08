@@ -1,8 +1,7 @@
 import type { ApprovalDecision, WsMessage } from '../types/api';
-import { getToken } from './auth';
+import { AUTH_EVENTS, getToken, isReauthPending } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
-import { generateUUID } from './uuid';
 
 export type WsMessageHandler = (msg: WsMessage) => void;
 export type WsOpenHandler = () => void;
@@ -12,6 +11,11 @@ export type WsErrorHandler = (ev: Event) => void;
 export interface WebSocketClientOptions {
   /** Agent alias to bind this socket to (required by the gateway). */
   agentAlias: string;
+  /** Conversation to resume or create. The gateway keys persisted history by
+   * this id, so the caller owns it (see `lib/chatSessions`) rather than the
+   * socket inventing one — that is what lets one agent hold several
+   * independent conversations. */
+  sessionId: string;
   /** Base URL override. Defaults to current host with ws(s) protocol. */
   baseUrl?: string;
   /** Delay in ms before attempting reconnect. Doubles on each failure up to maxReconnectDelay. */
@@ -25,19 +29,33 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
-const SESSION_ID_KEY_PREFIX = 'zeroclaw_session_id';
+/** The gateway closed a signed-in session's socket: the session expired or was signed out. */
+export const WS_CLOSE_SESSION_ENDED = 4401;
+/** The gateway closed a signed-in session's socket: its access was removed. */
+export const WS_CLOSE_ACCESS_LOST = 4403;
 
-/** Return a stable session ID for the given agent alias, persisted in
- * localStorage. Each agent gets its own session so parallel conversations
- * don't collide. */
-export function getOrCreateSessionId(agentAlias: string): string {
-  const key = `${SESSION_ID_KEY_PREFIX}.${agentAlias}`;
-  let id = localStorage.getItem(key);
-  if (!id) {
-    id = generateUUID();
-    localStorage.setItem(key, id);
+/**
+ * Route a socket close under dashboard sign-in. Returns true when the socket
+ * must wait for `AUTH_EVENTS.resumed` instead of reconnecting on a timer:
+ *
+ * - 4401: the session the socket was opened under ended. The auth layer
+ *   re-reads the current session first, since an early re-auth may already
+ *   have replaced it, and prompts only if there is none.
+ * - 4403: the session lost access to this socket.
+ * - any code while a re-auth is pending: every attempt would be refused.
+ *
+ * Other closes (1001 when the gateway reloads, network drops) reconnect.
+ */
+export function routeSessionClose(code: number): boolean {
+  if (code === WS_CLOSE_SESSION_ENDED) {
+    window.dispatchEvent(new Event(AUTH_EVENTS.sessionEnded));
+    return true;
   }
-  return id;
+  if (code === WS_CLOSE_ACCESS_LOST) {
+    window.dispatchEvent(new Event(AUTH_EVENTS.accessLost));
+    return true;
+  }
+  return isReauthPending();
 }
 
 export class WebSocketClient {
@@ -45,6 +63,9 @@ export class WebSocketClient {
   private currentDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
+  // Stopped by a session close code. Reconnecting would only be refused, so
+  // the socket waits for the auth layer to report a usable session again.
+  private haltedForAuth = false;
 
   public onMessage: WsMessageHandler | null = null;
   public onOpen: WsOpenHandler | null = null;
@@ -52,6 +73,7 @@ export class WebSocketClient {
   public onError: WsErrorHandler | null = null;
 
   private readonly agentAlias: string;
+  private readonly sessionId: string;
   private readonly baseUrl: string;
   private readonly reconnectDelay: number;
   private readonly maxReconnectDelay: number;
@@ -59,6 +81,7 @@ export class WebSocketClient {
 
   constructor(options: WebSocketClientOptions) {
     this.agentAlias = options.agentAlias;
+    this.sessionId = options.sessionId;
     let defaultBase: string;
     if (isTauri() && apiOrigin) {
       // In Tauri, derive ws URL from the gateway origin.
@@ -77,13 +100,14 @@ export class WebSocketClient {
   /** Open the WebSocket connection. */
   connect(): void {
     this.intentionallyClosed = false;
+    this.haltedForAuth = false;
     this.clearReconnectTimer();
+    window.addEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
 
     const token = getToken();
-    const sessionId = getOrCreateSessionId(this.agentAlias);
     const params = new URLSearchParams();
     if (token) params.set('token', token);
-    params.set('session_id', sessionId);
+    params.set('session_id', this.sessionId);
     params.set('agent', this.agentAlias);
     const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
 
@@ -107,6 +131,11 @@ export class WebSocketClient {
 
     this.ws.onclose = (ev: CloseEvent) => {
       this.onClose?.(ev);
+      if (this.intentionallyClosed) return;
+      if (routeSessionClose(ev.code)) {
+        this.haltedForAuth = true;
+        return;
+      }
       this.scheduleReconnect();
     };
 
@@ -139,7 +168,9 @@ export class WebSocketClient {
   /** Close the connection without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;
+    this.haltedForAuth = false;
     this.clearReconnectTimer();
+    window.removeEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -154,6 +185,12 @@ export class WebSocketClient {
   // ---------------------------------------------------------------------------
   // Reconnection logic
   // ---------------------------------------------------------------------------
+
+  private readonly handleAuthResumed = (): void => {
+    if (!this.haltedForAuth || this.intentionallyClosed) return;
+    this.currentDelay = this.reconnectDelay;
+    this.connect();
+  };
 
   private scheduleReconnect(): void {
     if (this.intentionallyClosed || !this.autoReconnect) return;

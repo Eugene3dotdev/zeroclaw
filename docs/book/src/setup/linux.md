@@ -40,17 +40,46 @@ Homebrew-on-Linux installs follow Homebrew's service path convention, your works
 
 ### NixOS
 
-A multi-instance NixOS module is shipped in-tree. See [NixOS](./nixos.md).
+The upstream flake provides the ZeroClaw CLI. With Nix and flakes enabled:
 
-### A note on `cargo binstall` and `nix run`
+```sh
+nix run github:zeroclaw-labs/zeroclaw -- --version
+```
 
-Neither works yet. `cargo binstall zeroclaw` resolves crate metadata from
-crates.io, but ZeroClaw is not published there (`publish = false`), so there is
-nothing for it to fetch; `nix run github:zeroclaw-labs/zeroclaw` does not launch
-the agent because the flake exposes only a dev toolchain, not a runnable package
-([#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987)). `install.sh`
-already does what `binstall` would (download a prebuilt release binary), so it
-remains the supported one-liner.
+See [NixOS](./nixos.md) for source builds, the Nixpkgs package, and the
+multi-instance NixOS service module. For prebuilt binaries, use the installer
+described above.
+
+### CLI-only build (servers)
+
+For a server that only runs agents and channels, install the CLI-only build:
+the standard features without the dashboard and the web gateway.
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh -s -- --cli-only
+```
+
+</div>
+
+It builds from source, so the installer sets up Rust when it is missing. In a
+CLI-only build:
+
+- `zeroclaw gateway` and `zeroclaw desktop` say that the dashboard needs the
+  standard build, and `zeroclaw status` shows the web UI as not included.
+- Channels that receive webhooks, such as `webhook` and Lark, keep their own
+  listeners.
+- To update and stay CLI-only, re-run the installer with `--cli-only`.
+  Releases publish only the standard build, so `zeroclaw update` stops and
+  explains the choice. `zeroclaw update --standard` switches to the standard
+  build, which adds the dashboard and web gateway; the daemon then starts the
+  gateway, by default on `127.0.0.1:42617` with pairing required.
+- There is no gateway pairing for remote clients. Run zerocode on the server
+  over SSH, or connect with an OIDC token; see
+  [Remote setup](../zerocode/remote.md#bearer-token-required-for-every-connection).
 
 ## System dependencies
 
@@ -126,7 +155,18 @@ sudo usermod -aG gpio,spi,i2c $USER
 
 ## Update
 
-Re-run the installer, it detects the existing install and upgrades in place:
+Standard release updates carry the native adapters for both minimal and full
+tool settings. Full stays the default for new and existing installations,
+including configurations without `[tools]`. Minimal, eleven tools in Chat and
+eight in Code/ACP, is opt-in through `optional = []`. Explicit selections are
+preserved; named entries select individual extras. Full preserves existing
+integration prerequisites and
+permission gates. Plain Cargo-default source builds, including a Homebrew formula
+that uses only those defaults, can still omit adapters. See
+[minimal/full tools and build recovery](../tools/overview.md#builds-and-upgrade-path).
+
+Re-run the installer, it detects the existing install and upgrades in place
+(add `--cli-only` for a [CLI-only build](#cli-only-build-servers)):
 
 <div class="os-tabs-src">
 

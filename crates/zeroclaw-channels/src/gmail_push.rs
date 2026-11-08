@@ -166,10 +166,12 @@ impl GmailPushChannel {
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
+        let http = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            Client::builder().timeout(Duration::from_secs(30)),
+            "channel.gmail_push",
+        )
+        .build()
+        .expect("failed to build HTTP client");
         Self {
             config,
             alias: alias.into(),
@@ -1079,6 +1081,42 @@ mod tests {
         };
 
         assert_eq!(extract_body_text(&msg), "Hello");
+    }
+
+    #[test]
+    fn extract_body_text_walks_nested_multipart_parts() {
+        let plain_b64 = BASE64
+            .encode(b"Nested plain text")
+            .replace('+', "-")
+            .replace('/', "_")
+            .replace('=', "");
+        let msg = GmailMessage {
+            id: "msg-nested".into(),
+            thread_id: String::new(),
+            snippet: "fallback".into(),
+            payload: Some(MessagePayload {
+                headers: Vec::new(),
+                body: None,
+                parts: vec![MessagePart {
+                    mime_type: "multipart/alternative".into(),
+                    body: None,
+                    parts: vec![MessagePart {
+                        mime_type: "text/plain".into(),
+                        body: Some(MessageBody {
+                            data: Some(plain_b64),
+                            size: 17,
+                        }),
+                        parts: Vec::new(),
+                        filename: String::new(),
+                    }],
+                    filename: String::new(),
+                }],
+                mime_type: "multipart/mixed".into(),
+            }),
+            internal_date: "0".into(),
+        };
+
+        assert_eq!(extract_body_text(&msg), "Nested plain text");
     }
 
     #[test]
