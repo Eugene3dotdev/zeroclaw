@@ -68,7 +68,7 @@ class ReleaseAttestationContractTest(unittest.TestCase):
         self.assertEqual(self.sbom.count("format: spdx-json"), 1)
         self.assertEqual(self.sbom.count("format: cyclonedx-json"), 1)
         self.assertIn("name: release-sboms", self.sbom)
-        self.assertIn("build-desktop-windows, sbom]", self.publish)
+        self.assertIn("build-desktop-linux, sbom]", self.publish)
         self.assertIn("name: release-sboms", self.publish)
         sequence = ("Collect release assets", "id: attest_payloads")
         offsets = [self.publish.index(marker) for marker in sequence]
