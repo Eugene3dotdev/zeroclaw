@@ -3767,17 +3767,21 @@ mod tests {
 
         let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
         let sink = Arc::clone(&received);
+        // Fork: direct Anthropic construction is policy-blocked, so the
+        // decision turn runs on a `custom` chat-completions slot; the body
+        // still carries `model` and the optional `temperature` under test.
         let app = Router::new().route(
-            "/v1/messages",
+            "/v1/chat/completions",
             post(move |Json(body): Json<serde_json::Value>| {
                 let sink = Arc::clone(&sink);
                 async move {
                     sink.lock().unwrap().push(body);
                     Json(serde_json::json!({
-                        "id": "msg_heartbeat", "type": "message", "role": "assistant",
-                        "content": [{"type": "text", "text": "[]"}],
-                        "model": "claude-opus-5-5", "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                        "id": "chatcmpl-heartbeat", "object": "chat.completion",
+                        "model": "claude-opus-5-5",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "[]"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                     }))
                 }
             }),
@@ -3799,11 +3803,12 @@ mod tests {
             let provider = config
                 .providers
                 .models
-                .ensure("anthropic", "heartbeat")
-                .expect("anthropic provider slot");
-            provider.api_key = Some("sk-ant-fixture".to_string());
+                .ensure("custom", "heartbeat")
+                .expect("custom provider slot");
+            provider.api_key = Some("fixture-key".to_string());
             provider.model = Some("claude-opus-5-5".to_string());
-            provider.uri = Some(format!("http://{addr}"));
+            provider.uri = Some(format!("http://{addr}/v1"));
+            provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
             provider.temperature = configured;
             config.memory.backend = "none".to_string();
             config.memory.auto_save = false;
@@ -3817,7 +3822,7 @@ mod tests {
             config.agents.insert(
                 "ops".to_string(),
                 AliasedAgentConfig {
-                    model_provider: "anthropic.heartbeat".into(),
+                    model_provider: "custom.heartbeat".into(),
                     risk_profile: "heartbeat-profile".into(),
                     ..Default::default()
                 },

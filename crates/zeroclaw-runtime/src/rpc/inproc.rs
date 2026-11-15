@@ -1375,8 +1375,9 @@ mod tests {
         {
             let provider = providers
                 .models
-                .ensure("openai", "test-provider")
-                .expect("`openai` slot must exist");
+                // Fork: direct OpenAI construction is policy-blocked.
+                .ensure("custom", "test-provider")
+                .expect("`custom` slot must exist");
             provider.api_key = Some("test-key".into());
             provider.model = Some("test-model".into());
             provider.uri = Some("http://127.0.0.1:1".into());
@@ -1386,7 +1387,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: "openai.test-provider".into(),
+                model_provider: "custom.test-provider".into(),
                 risk_profile: "test-profile".into(),
                 ..Default::default()
             },

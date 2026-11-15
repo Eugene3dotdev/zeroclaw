@@ -39746,7 +39746,7 @@ mod tests {
             let (rehydrated, release_rehydrated) = sessions.set_test_prompt_rehydration_pause();
             let prompt_handle = dispatcher.spawn_handle();
             let prompt_sid = sid.clone();
-            let prompt = zeroclaw_spawn::spawn!(async move {
+            let mut prompt = zeroclaw_spawn::spawn!(async move {
                 prompt_handle
                     .handle_session_prompt(&json!({
                         "session_id": prompt_sid,
@@ -39796,9 +39796,20 @@ mod tests {
             );
 
             release_registration.notify_one();
-            tokio::time::timeout(std::time::Duration::from_secs(1), rehydrated.notified())
-                .await
-                .expect("prompt must publish the rehydrated incarnation");
+            // Fork: the assertion is ordering (publish before removal), not
+            // latency. Under the repeated parallel run, durable reload and agent
+            // construction can exceed the original 1 s, so wait within
+            // TEST_PAUSE_DEADLINE; a prompt that returns before the pause (a
+            // refused recheck or a failed rehydrate) reports its own result.
+            within_test_deadline("the reaped prompt to publish its rehydrated incarnation", async {
+                tokio::select! {
+                    () = rehydrated.notified() => {}
+                    early = &mut prompt => panic!(
+                        "{method}: prompt returned before publishing the rehydrated incarnation: {early:?}"
+                    ),
+                }
+            })
+            .await;
             let published_generation = sessions
                 .get_generation(&sid)
                 .await
@@ -49614,7 +49625,7 @@ mod tests {
                 let (entered, release, _) = sessions.set_test_gated_op_pause();
                 let mut overrides = json!({"temperature":0.99});
                 if model_change {
-                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model_provider"] = json!("custom.test-provider");
                     overrides["model"] = json!("configured-model");
                 }
                 let params = json!({"session_id":sid,"overrides":overrides});
@@ -49700,7 +49711,7 @@ mod tests {
                 let (entered, release, _) = sessions.set_test_gated_op_pause();
                 let mut overrides = json!({"temperature":0.99});
                 if model_change {
-                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model_provider"] = json!("custom.test-provider");
                     overrides["model"] = json!("configured-model");
                 }
                 let params = json!({"session_id":sid,"overrides":overrides});
