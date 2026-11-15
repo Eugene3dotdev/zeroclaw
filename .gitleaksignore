@@ -1,0 +1,5 @@
+# Reviewed gitleaks false positives (TEO-1391). Both are the RFC 6455 sample
+# WebSocket nonce (base64 of "the sample nonce") in the Sec-WebSocket-Key
+# header of upstream test handshakes, not credentials.
+7666a52abfd9af821e6efa9dd7e318b2116ae803:crates/zeroclaw-gateway/tests/relay_dashboard_ingress.rs:generic-api-key:266
+a11a5ce5b4238d4766fbe7d07efef055a75532c2:crates/zeroclaw-gateway/src/dashboard_core.rs:generic-api-key:3857
