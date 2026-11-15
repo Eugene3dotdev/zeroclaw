@@ -3480,14 +3480,18 @@ mod tests {
         let base = test_config(&tmp).await;
         const ALIAS: &str = "probe_temperature_case";
 
+        // Fork: direct Anthropic construction is policy-blocked, so the probe
+        // runs on a `custom` chat-completions slot; the body still carries
+        // `model` and the optional `temperature` under test.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/messages"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_probe", "type": "message", "role": "assistant",
-                "content": [{ "type": "text", "text": "OK" }],
-                "model": "claude-opus-5-5", "stop_reason": "end_turn",
-                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                "id": "chatcmpl-probe", "object": "chat.completion",
+                "model": "claude-opus-5-5",
+                "choices": [{ "index": 0, "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "OK" } }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
             })))
             .mount(&server)
             .await;
@@ -3496,15 +3500,14 @@ mod tests {
         for configured in [None, Some(0.4)] {
             let mut saved = (*base).clone();
             {
-                let entry = saved.providers.models.ensure("anthropic", ALIAS).unwrap();
-                entry.api_key = Some("sk-ant-fixture".to_string());
+                let entry = saved.providers.models.ensure("custom", ALIAS).unwrap();
+                entry.api_key = Some("fixture-key".to_string());
                 entry.model = Some("claude-opus-5-5".to_string());
-                entry.uri = Some(server.uri());
+                entry.uri = Some(format!("{}/v1", server.uri()));
+                entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
                 entry.temperature = configured;
             }
-            let probe = tool
-                .probe_model(&saved, &format!("anthropic.{ALIAS}"))
-                .await;
+            let probe = tool.probe_model(&saved, &format!("custom.{ALIAS}")).await;
             assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
 
             let requests = server

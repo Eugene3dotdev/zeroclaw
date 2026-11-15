@@ -2062,8 +2062,10 @@ mod tests {
             let provider = config
                 .providers
                 .models
-                .ensure("openai", "test-provider")
-                .expect("`openai` slot must exist");
+                // Fork: direct OpenAI construction is policy-blocked; the
+                // `custom` slot speaks the same chat wire the mock serves.
+                .ensure("custom", "test-provider")
+                .expect("`custom` slot must exist");
             provider.api_key = Some("test-key".into());
             provider.model = Some("test-model".into());
             provider.uri = Some(model_uri.to_string());
@@ -2074,7 +2076,7 @@ mod tests {
                 alias.into(),
                 AliasedAgentConfig {
                     enabled: true,
-                    model_provider: "openai.test-provider".into(),
+                    model_provider: "custom.test-provider".into(),
                     risk_profile: "test-profile".into(),
                     runtime_profile: "test-runtime".into(),
                     ..Default::default()
