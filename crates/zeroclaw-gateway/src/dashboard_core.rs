@@ -5334,18 +5334,23 @@ mod tests {
         }
         // Nothing they did resolved it: the tool has not run, so the model
         // has had no second request for this turn.
+        // Fork: the `custom` provider streams first and, against this JSON
+        // mock, retries once without streaming, so the opening request can
+        // arrive twice. Count the follow-up that carries the tool's result
+        // (`call_fixture`) instead, which only a resolved approval sends.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let asked = fixture
+        let resolved = fixture
             ._model
             .received_requests()
             .await
             .unwrap_or_default()
             .iter()
             .filter(|request| {
-                String::from_utf8_lossy(&request.body).contains("please read the note")
+                let body = String::from_utf8_lossy(&request.body);
+                body.contains("please read the note") && body.contains("call_fixture")
             })
             .count();
-        assert_eq!(asked, 1, "the approval is still alice's to answer");
+        assert_eq!(resolved, 0, "the approval is still alice's to answer");
 
         // Alice answers it herself, and her turn ends.
         let end = deny_and_finish(&mut socket, &request_id).await;
