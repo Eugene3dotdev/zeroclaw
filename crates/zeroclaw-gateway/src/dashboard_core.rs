@@ -2070,6 +2070,10 @@ mod tests {
             provider.model = Some("test-model".into());
             provider.uri = Some(model_uri.to_string());
             provider.wire_api = Some(WireApi::ChatCompletions);
+            // Fork: `openai` advertised native tools; `custom` defaults to the
+            // prompt-guided protocol, which neither sends `tools` nor reads
+            // the mock's `tool_calls`.
+            provider.native_tools = Some(true);
         }
         for alias in ["support", "other"] {
             config.agents.insert(
